@@ -10,7 +10,7 @@ from identity_provider_server.app import create_app
 DATA_DIR = str(Path(__file__).parent.parent / "data")
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture()
 def client():
     app = create_app(DATA_DIR, host="127.0.0.1", port=5000)
     app.config["TESTING"] = True

@@ -255,12 +255,7 @@ The `idp_entity_id` and `Location` in the metadata are derived from `--host` and
 | `flask` >=3.0,<4.0 | HTTP server and routing |
 | `lxml` >=5.0,<6.0 | XML construction for SAML documents |
 | `signxml` >=4.0,<5.0 | XML digital signature (xmldsig) |
-
-Optional dependencies:
-
-| Package | Role |
-|---------|------|
-| `bcrypt` >=4.0,<5.0 | Password hashing (install via `pip install -e ".[bcrypt]"`) |
+| `bcrypt` >=4.0,<6.0 | Password hashing and verification |
 
 Dev dependencies (installed via `pip install -e ".[dev]"`): `pytest`, `pytest-cov`, `ruff`, `mypy`
 

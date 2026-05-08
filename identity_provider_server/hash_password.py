@@ -26,7 +26,7 @@ def main() -> None:
     try:
         import bcrypt
     except ImportError:
-        print("Error: bcrypt is not installed. Run: pip install bcrypt", file=sys.stderr)
+        print("Error: bcrypt is not installed. Run: pip install identity-provider-server", file=sys.stderr)
         sys.exit(1)
 
     if args.password:

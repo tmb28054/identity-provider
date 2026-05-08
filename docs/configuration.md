@@ -51,7 +51,7 @@ Then use the output in `users.json`:
 }
 ```
 
-Bcrypt requires the optional `bcrypt` dependency: `pip install -e ".[bcrypt]"`.
+Bcrypt is installed automatically with the server.
 
 Plaintext passwords are still supported for backward compatibility but are not recommended for any shared environment.
 

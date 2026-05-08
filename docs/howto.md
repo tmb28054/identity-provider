@@ -48,7 +48,7 @@ idp-hash-password "mypassword"
 idp-hash-password --rounds 14
 ```
 
-Requires the bcrypt extra: `pip install -e ".[bcrypt]"`
+Requires the bcrypt package (installed automatically with the server).
 
 ---
 

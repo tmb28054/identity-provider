@@ -10,10 +10,8 @@
 ```bash
 git clone <repo>
 cd identity-provider-server
-pip install -e .              # runtime dependencies only
+pip install -e .              # runtime dependencies (includes bcrypt)
 pip install -e ".[dev]"       # also installs pytest, pytest-cov, ruff, mypy
-pip install -e ".[bcrypt]"    # adds bcrypt password hashing support
-pip install -e ".[all]"       # everything (dev + bcrypt)
 ```
 
 Or use the Makefile:

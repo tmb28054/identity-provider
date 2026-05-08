@@ -45,12 +45,8 @@ def _check_password(stored: str, provided: str) -> bool:
     comparison to avoid timing attacks.
     """
     if stored.startswith("$2b$"):
-        try:
-            import bcrypt
-            return bcrypt.checkpw(provided.encode(), stored.encode())
-        except ImportError:
-            logger.warning("bcrypt not installed — cannot verify hashed password")
-            return False
+        import bcrypt
+        return bcrypt.checkpw(provided.encode(), stored.encode())
     # Plaintext fallback — constant-time comparison
     return hmac.compare_digest(stored, provided)
 

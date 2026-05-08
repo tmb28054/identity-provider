@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `InResponseTo="_dummy"` removed from SAML Response (was non-compliant for IdP-initiated flows).
 - Plaintext password comparison now uses constant-time `hmac.compare_digest`.
 - Metadata `SingleSignOnService Location` is now derived from the configured host/port.
-- `bcrypt` is an optional dependency (`pip install -e ".[bcrypt]"`).
+- `bcrypt` is now a required dependency (previously optional).
 
 ### Removed
 - Hardcoded `http://localhost:5000` entity ID — now dynamic based on CLI arguments.
