@@ -1,0 +1,10 @@
+data/idp.key
+data/users.json
+*.egg-info/
+__pycache__/
+*.pyc
+.venv/
+.coverage
+.env
+.mypy_cache/
+.ruff_cache/
