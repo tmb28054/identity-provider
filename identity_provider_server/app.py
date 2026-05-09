@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import logging
 import os
+import random
 import secrets
 import time
 from collections import defaultdict
@@ -17,14 +19,102 @@ from .saml_builder import ACS_URL, build_saml_response
 logger = logging.getLogger(__name__)
 
 LOGIN_FORM = """
-<!doctype html><title>AWS Login</title>
-<form method="post">
-  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-  <input name="username" placeholder="Username" required><br>
-  <input name="password" placeholder="Password" type="password" required><br>
-  <button type="submit">Sign in</button>
-  {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
-</form>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AWS Login</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f4f6f9;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+    }
+    .card {
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+      padding: 2rem;
+      width: 100%;
+      max-width: 380px;
+    }
+    h1 { font-size: 1.4rem; margin-bottom: 1.5rem; color: #232f3e; }
+    label { display: block; font-size: 0.85rem; color: #555; margin-bottom: 0.3rem; }
+    input[type="text"], input[type="password"] {
+      width: 100%;
+      padding: 0.6rem 0.75rem;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      font-size: 0.95rem;
+      margin-bottom: 1rem;
+    }
+    input:focus { outline: none; border-color: #0073bb; box-shadow: 0 0 0 2px rgba(0,115,187,0.2); }
+    .challenge {
+      background: #f0f4f8;
+      border: 1px solid #d5dce6;
+      border-radius: 4px;
+      padding: 0.75rem;
+      margin-bottom: 1rem;
+      text-align: center;
+    }
+    .challenge-question {
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: #232f3e;
+      margin-bottom: 0.5rem;
+    }
+    .challenge-label {
+      font-size: 0.75rem;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    button {
+      width: 100%;
+      padding: 0.7rem;
+      background: #0073bb;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      font-size: 1rem;
+      cursor: pointer;
+    }
+    button:hover { background: #005a94; }
+    .error { color: #d13212; font-size: 0.85rem; margin-bottom: 1rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>AWS Console Login</h1>
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    <form method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="challenge_hash" value="{{ challenge_hash }}">
+
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username" required autofocus>
+
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" required>
+
+      <div class="challenge">
+        <div class="challenge-label">Human verification</div>
+        <div class="challenge-question">{{ challenge_question }}</div>
+      </div>
+      <label for="challenge_answer">Your answer</label>
+      <input type="text" id="challenge_answer" name="challenge_answer"
+             placeholder="Type the answer" required autocomplete="off">
+
+      <button type="submit">Sign in</button>
+    </form>
+  </div>
+</body>
+</html>
 """
 
 SAML_POST = """
@@ -46,6 +136,7 @@ def _check_password(stored: str, provided: str) -> bool:
     """
     if stored.startswith("$2b$"):
         import bcrypt
+
         return bcrypt.checkpw(provided.encode(), stored.encode())
     # Plaintext fallback — constant-time comparison
     return hmac.compare_digest(stored, provided)
@@ -68,6 +159,42 @@ class _RateLimiter:
 
     def record(self, key: str) -> None:
         self._attempts[key].append(time.time())
+
+
+def _generate_challenge(secret: str) -> tuple[str, str, str]:
+    """Generate a math challenge and its signed hash.
+
+    Returns (question_text, correct_answer, challenge_hash).
+    The hash is HMAC(secret, answer) so the server can verify without storing state.
+    """
+    ops = [
+        ("+", lambda a, b: a + b),
+        ("-", lambda a, b: a - b),
+        ("×", lambda a, b: a * b),
+    ]
+    op_symbol, op_func = random.choice(ops)
+    a = random.randint(1, 20)
+    b = random.randint(1, 12)
+
+    # Ensure subtraction doesn't go negative
+    if op_symbol == "-" and a < b:
+        a, b = b, a
+
+    answer = str(op_func(a, b))
+    question = f"What is {a} {op_symbol} {b}?"
+    challenge_hash = hmac.new(
+        secret.encode(), answer.encode(), hashlib.sha256
+    ).hexdigest()
+
+    return question, answer, challenge_hash
+
+
+def _verify_challenge(secret: str, answer: str, expected_hash: str) -> bool:
+    """Verify a challenge answer against its signed hash."""
+    computed = hmac.new(
+        secret.encode(), answer.strip().encode(), hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(computed, expected_hash)
 
 
 def _load_users(data: Path) -> dict[str, Any]:
@@ -116,6 +243,11 @@ def create_app(
         """Generate a CSRF token tied to the app secret."""
         return secrets.token_hex(32)
 
+    def _make_challenge() -> tuple[str, str]:
+        """Generate a challenge question and its verification hash."""
+        question, _answer, challenge_hash = _generate_challenge(app.secret_key)
+        return question, challenge_hash
+
     def _reload_users_if_changed() -> None:
         """Reload users.json if the file has been modified."""
         nonlocal users, users_mtime
@@ -140,8 +272,14 @@ def create_app(
     @app.get("/aws")
     def login_form():
         token = _generate_csrf_token()
-        response = render_template_string(LOGIN_FORM, error=None, csrf_token=token)
-        # Store token in a cookie for validation on POST
+        question, challenge_hash = _make_challenge()
+        response = render_template_string(
+            LOGIN_FORM,
+            error=None,
+            csrf_token=token,
+            challenge_question=question,
+            challenge_hash=challenge_hash,
+        )
         resp = app.make_response(response)
         resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
         return resp
@@ -152,8 +290,13 @@ def create_app(
         form_token = request.form.get("csrf_token", "")
         cookie_token = request.cookies.get("csrf_token", "")
         if not form_token or not hmac.compare_digest(form_token, cookie_token):
+            question, challenge_hash = _make_challenge()
             return render_template_string(
-                LOGIN_FORM, error="Invalid request (CSRF)", csrf_token=_generate_csrf_token()
+                LOGIN_FORM,
+                error="Invalid request (CSRF)",
+                csrf_token=_generate_csrf_token(),
+                challenge_question=question,
+                challenge_hash=challenge_hash,
             ), 403
 
         # Rate limiting
@@ -161,10 +304,29 @@ def create_app(
         if rate_limiter.is_limited(client_ip):
             logger.warning("Rate limited: %s", client_ip)
             token = _generate_csrf_token()
+            question, challenge_hash = _make_challenge()
             return render_template_string(
-                LOGIN_FORM, error="Too many attempts. Try again later.",
+                LOGIN_FORM,
+                error="Too many attempts. Try again later.",
                 csrf_token=token,
+                challenge_question=question,
+                challenge_hash=challenge_hash,
             ), 429
+
+        # Human verification
+        challenge_answer = request.form.get("challenge_answer", "")
+        challenge_hash = request.form.get("challenge_hash", "")
+        if not _verify_challenge(app.secret_key, challenge_answer, challenge_hash):
+            rate_limiter.record(client_ip)
+            logger.info("Failed challenge from ip=%s", client_ip)
+            question, new_hash = _make_challenge()
+            return render_template_string(
+                LOGIN_FORM,
+                error="Incorrect answer — please try again.",
+                csrf_token=_generate_csrf_token(),
+                challenge_question=question,
+                challenge_hash=new_hash,
+            ), 401
 
         username = request.form.get("username", "")
         password = request.form.get("password", "")
@@ -173,8 +335,13 @@ def create_app(
         if not user or not _check_password(user["password"], password):
             rate_limiter.record(client_ip)
             logger.info("Failed login attempt for user=%s from ip=%s", username, client_ip)
+            question, new_hash = _make_challenge()
             return render_template_string(
-                LOGIN_FORM, error="Invalid credentials", csrf_token=_generate_csrf_token()
+                LOGIN_FORM,
+                error="Invalid credentials",
+                csrf_token=_generate_csrf_token(),
+                challenge_question=question,
+                challenge_hash=new_hash,
             ), 401
 
         logger.info("Successful login: user=%s from ip=%s", username, client_ip)

@@ -18,16 +18,45 @@ def client():
         yield c
 
 
+def _solve_challenge(html: bytes) -> tuple[str, str]:
+    """Extract the challenge question from the form and compute the answer."""
+    hash_match = re.search(rb'name="challenge_hash" value="([^"]+)"', html)
+    challenge_hash = hash_match.group(1).decode() if hash_match else ""
+
+    # Extract the question text from the challenge-question div
+    q_match = re.search(rb"What is (\d+) (.+?) (\d+)\?", html)
+    if not q_match:
+        return "0", challenge_hash
+
+    a = int(q_match.group(1))
+    op = q_match.group(2)
+    b = int(q_match.group(3))
+
+    if op == b"+":
+        answer = a + b
+    elif op == b"-":
+        answer = a - b
+    else:  # × (UTF-8: \xc3\x97)
+        answer = a * b
+
+    return str(answer), challenge_hash
+
+
 def _login(client, username="topaztest", password="random1"):
-    """Helper: get CSRF token then POST login."""
-    # Get the login form to obtain CSRF token
+    """Helper: get CSRF token, solve challenge, then POST login."""
     form_resp = client.get("/aws")
     csrf_match = re.search(rb'name="csrf_token" value="([^"]+)"', form_resp.data)
     csrf_token = csrf_match.group(1).decode() if csrf_match else ""
-    # Set the cookie that the GET response would have set
+    challenge_answer, challenge_hash = _solve_challenge(form_resp.data)
     return client.post(
         "/aws",
-        data={"username": username, "password": password, "csrf_token": csrf_token},
+        data={
+            "username": username,
+            "password": password,
+            "csrf_token": csrf_token,
+            "challenge_answer": challenge_answer,
+            "challenge_hash": challenge_hash,
+        },
     )
 
 
@@ -57,6 +86,13 @@ def test_login_form_has_csrf_token(client):
     assert b'name="csrf_token"' in data
 
 
+def test_login_form_has_challenge(client):
+    data = client.get("/aws").data
+    assert b'name="challenge_hash"' in data
+    assert b"What is" in data
+    assert b'name="challenge_answer"' in data
+
+
 # --- POST /aws — invalid credentials ---
 
 def test_wrong_password_returns_401(client):
@@ -79,6 +115,25 @@ def test_invalid_credentials_shows_error(client):
 def test_missing_csrf_returns_403(client):
     r = client.post("/aws", data={"username": "topaztest", "password": "random1"})
     assert r.status_code == 403
+
+
+# --- POST /aws — challenge verification ---
+
+def test_wrong_challenge_answer_returns_401(client):
+    form_resp = client.get("/aws")
+    csrf_match = re.search(rb'name="csrf_token" value="([^"]+)"', form_resp.data)
+    csrf_token = csrf_match.group(1).decode()
+    hash_match = re.search(rb'name="challenge_hash" value="([^"]+)"', form_resp.data)
+    challenge_hash = hash_match.group(1).decode()
+    r = client.post("/aws", data={
+        "username": "topaztest",
+        "password": "random1",
+        "csrf_token": csrf_token,
+        "challenge_answer": "99999",
+        "challenge_hash": challenge_hash,
+    })
+    assert r.status_code == 401
+    assert b"Incorrect answer" in r.data
 
 
 # --- POST /aws — valid credentials ---

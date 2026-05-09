@@ -61,9 +61,31 @@ def _get(path: str) -> urllib.request.Request:
     return urllib.request.urlopen(f"{BASE_URL}{path}", timeout=5)
 
 
+def _solve_challenge(body: bytes) -> tuple[str, str]:
+    """Extract and solve the math challenge from the form HTML."""
+    hash_match = re.search(rb'name="challenge_hash" value="([^"]+)"', body)
+    challenge_hash = hash_match.group(1).decode() if hash_match else ""
+
+    q_match = re.search(rb"What is (\d+) (.+?) (\d+)\?", body)
+    if not q_match:
+        return "0", challenge_hash
+
+    a = int(q_match.group(1))
+    op = q_match.group(2)
+    b = int(q_match.group(3))
+
+    if op == b"+":
+        answer = a + b
+    elif op == b"-":
+        answer = a - b
+    else:
+        answer = a * b
+
+    return str(answer), challenge_hash
+
+
 def _post_with_csrf(path: str, fields: dict) -> bytes:
-    """GET the form first to obtain CSRF token, then POST with it."""
-    # Get the login page to extract CSRF token and cookie
+    """GET the form first to obtain CSRF token and challenge, then POST with it."""
     req = urllib.request.Request(f"{BASE_URL}{path}")
     resp = urllib.request.urlopen(req, timeout=5)
     body = resp.read()
@@ -78,7 +100,12 @@ def _post_with_csrf(path: str, fields: dict) -> bytes:
             cookie_value = part.strip()
             break
 
+    # Solve the challenge
+    challenge_answer, challenge_hash = _solve_challenge(body)
+
     fields["csrf_token"] = csrf_token
+    fields["challenge_answer"] = challenge_answer
+    fields["challenge_hash"] = challenge_hash
     data = urllib.parse.urlencode(fields).encode()
     post_req = urllib.request.Request(f"{BASE_URL}{path}", data=data, method="POST")
     if cookie_value:
