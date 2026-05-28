@@ -1,0 +1,33 @@
+# Group-to-Role mapping for ADFS authentication mode
+# Maps Active Directory group names (CN) to AWS IAM roles.
+# Copy this file to group_roles.yaml and customize.
+#
+# When a user authenticates via ADFS, their AD group memberships are
+# looked up and mapped to AWS roles using this file.
+#
+# Format:
+#   <AD Group CN>:
+#     - account_id: "<12-digit AWS account ID>"
+#       role: "<IAM role name>"
+#
+# A group can map to multiple roles (across accounts).
+# A user in multiple groups gets all matching roles combined.
+
+# Example: Members of "AWS-Admins" get AdminRole in the prod account
+AWS-Admins:
+  - account_id: "123456789012"
+    role: "AdminRole"
+
+# Example: Members of "AWS-Developers" get DeveloperRole in prod and dev accounts
+AWS-Developers:
+  - account_id: "123456789012"
+    role: "DeveloperRole"
+  - account_id: "987654321098"
+    role: "DeveloperRole"
+
+# Example: Members of "AWS-ReadOnly" get read-only access
+AWS-ReadOnly:
+  - account_id: "123456789012"
+    role: "ReadOnlyRole"
+  - account_id: "987654321098"
+    role: "ReadOnlyRole"

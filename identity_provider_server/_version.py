@@ -18,7 +18,7 @@ def _read_version() -> str:
     try:
         from importlib.metadata import version
         return version("identity-provider-server")
-    except Exception:
+    except Exception:  # nosec B110
         pass
 
     raise RuntimeError(

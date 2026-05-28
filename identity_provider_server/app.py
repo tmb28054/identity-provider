@@ -172,9 +172,9 @@ def _generate_challenge(secret: str) -> tuple[str, str, str]:
         ("-", lambda a, b: a - b),
         ("×", lambda a, b: a * b),
     ]
-    op_symbol, op_func = random.choice(ops)
-    a = random.randint(1, 20)
-    b = random.randint(1, 12)
+    op_symbol, op_func = random.choice(ops)  # nosec B311
+    a = random.randint(1, 20)  # nosec B311
+    b = random.randint(1, 12)  # nosec B311
 
     # Ensure subtraction doesn't go negative
     if op_symbol == "-" and a < b:
@@ -197,9 +197,9 @@ def _verify_challenge(secret: str, answer: str, expected_hash: str) -> bool:
     return hmac.compare_digest(computed, expected_hash)
 
 
-def _load_users(data: Path) -> dict[str, Any]:
-    """Load users from users.json."""
-    return {u["username"]: u for u in json.loads((data / "users.json").read_text())}
+def _load_users(users_path: Path) -> dict[str, Any]:
+    """Load users from a JSON file."""
+    return {u["username"]: u for u in json.loads(users_path.read_text())}
 
 
 def create_app(
@@ -209,30 +209,66 @@ def create_app(
     port: int = 5000,
     provider_name: str = "local-idp",
     session_duration_hours: int = 1,
+    secret_key: str | None = None,
+    rate_limit_max_attempts: int = 5,
+    rate_limit_window_seconds: int = 60,
+    users_file: str = "users.json",
+    certificate_file: str = "idp.crt",
+    private_key_file: str = "idp.key",
+    adfs_config: dict[str, str] | None = None,
+    group_role_map: dict[str, list[dict[str, str]]] | None = None,
+    skip_ldap_ssl_verify: bool = False,
 ) -> Flask:
     """Flask application factory.
 
     Args:
-        data_dir: Path to directory containing users.json, idp.crt, idp.key.
+        data_dir: Path to directory containing data files.
         host: Bind host — used to derive the IdP entity ID.
         port: Bind port — used to derive the IdP entity ID.
         provider_name: SAML provider name registered in AWS IAM.
         session_duration_hours: SAML assertion validity in hours (1–12).
+        secret_key: Flask secret key for CSRF tokens. Auto-generated if None.
+        rate_limit_max_attempts: Max failed login attempts per IP before limiting.
+        rate_limit_window_seconds: Rate limit window in seconds.
+        users_file: Filename or path to users JSON file (relative to data_dir).
+        certificate_file: Filename or path to signing certificate (relative to data_dir).
+        private_key_file: Filename or path to private key (relative to data_dir).
+        adfs_config: ADFS/LDAP connection config dict (enables ADFS auth mode).
+        group_role_map: Mapping of AD group names to AWS role dicts (used with ADFS).
+        skip_ldap_ssl_verify: If True, disable TLS certificate verification for LDAP.
     """
     data = Path(data_dir)
-    cert_pem = (data / "idp.crt").read_text()
-    key_pem = (data / "idp.key").read_text()
-    users = _load_users(data)
-    users_file = data / "users.json"
-    users_mtime = users_file.stat().st_mtime
+
+    def _resolve(filename: str) -> Path:
+        p = Path(filename)
+        return p if p.is_absolute() else data / p
+
+    cert_pem = _resolve(certificate_file).read_text()
+    key_pem = _resolve(private_key_file).read_text()
+
+    # ADFS mode: authenticate via LDAP, no local users.json needed
+    use_adfs = adfs_config is not None
+    if use_adfs:
+        users = {}
+        users_path = None
+        users_mtime = 0.0
+        _group_role_map = group_role_map or {}
+        logger.info("ADFS authentication mode enabled (host=%s)", adfs_config.get("host"))
+    else:
+        users_path = _resolve(users_file)
+        users = _load_users(users_path)
+        users_mtime = users_path.stat().st_mtime
+        _group_role_map = {}
 
     idp_entity_id = f"http://{host}:{port}/metadata"
     cert_b64 = "".join(cert_pem.strip().splitlines()[1:-1])
 
     app = Flask(__name__)
-    app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+    app.secret_key = secret_key or os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 
-    rate_limiter = _RateLimiter(max_attempts=5, window_seconds=60)
+    rate_limiter = _RateLimiter(
+        max_attempts=rate_limit_max_attempts, window_seconds=rate_limit_window_seconds
+    )
 
     # Store config on app for access in tests
     app.config["IDP_ENTITY_ID"] = idp_entity_id
@@ -251,10 +287,12 @@ def create_app(
     def _reload_users_if_changed() -> None:
         """Reload users.json if the file has been modified."""
         nonlocal users, users_mtime
+        if use_adfs or users_path is None:
+            return
         try:
-            current_mtime = users_file.stat().st_mtime
+            current_mtime = users_path.stat().st_mtime
             if current_mtime > users_mtime:
-                users = _load_users(data)
+                users = _load_users(users_path)
                 users_mtime = current_mtime
                 logger.info("Reloaded users.json (file changed)")
         except OSError:
@@ -330,24 +368,61 @@ def create_app(
 
         username = request.form.get("username", "")
         password = request.form.get("password", "")
-        user = users.get(username)
 
-        if not user or not _check_password(user["password"], password):
-            rate_limiter.record(client_ip)
-            logger.info("Failed login attempt for user=%s from ip=%s", username, client_ip)
-            question, new_hash = _make_challenge()
-            return render_template_string(
-                LOGIN_FORM,
-                error="Invalid credentials",
-                csrf_token=_generate_csrf_token(),
-                challenge_question=question,
-                challenge_hash=new_hash,
-            ), 401
+        if use_adfs:
+            # ADFS mode: authenticate via LDAP, use groups as claims
+            from .adfs import authenticate_adfs, groups_to_roles
+
+            groups = authenticate_adfs(
+                username, password, adfs_config, skip_ssl_verify=skip_ldap_ssl_verify  # type: ignore[arg-type]
+            )
+            if groups is None:
+                rate_limiter.record(client_ip)
+                logger.info("Failed ADFS login for user=%s from ip=%s", username, client_ip)
+                question, new_hash = _make_challenge()
+                return render_template_string(
+                    LOGIN_FORM,
+                    error="Invalid credentials",
+                    csrf_token=_generate_csrf_token(),
+                    challenge_question=question,
+                    challenge_hash=new_hash,
+                ), 401
+
+            roles = groups_to_roles(groups, _group_role_map)
+            if not roles:
+                logger.warning(
+                    "ADFS user %s authenticated but no role mappings found (groups=%s)",
+                    username,
+                    groups,
+                )
+                question, new_hash = _make_challenge()
+                return render_template_string(
+                    LOGIN_FORM,
+                    error="No AWS roles mapped to your groups. Contact your administrator.",
+                    csrf_token=_generate_csrf_token(),
+                    challenge_question=question,
+                    challenge_hash=new_hash,
+                ), 403
+        else:
+            # Local mode: authenticate against users.json
+            user = users.get(username)
+            if not user or not _check_password(user["password"], password):
+                rate_limiter.record(client_ip)
+                logger.info("Failed login attempt for user=%s from ip=%s", username, client_ip)
+                question, new_hash = _make_challenge()
+                return render_template_string(
+                    LOGIN_FORM,
+                    error="Invalid credentials",
+                    csrf_token=_generate_csrf_token(),
+                    challenge_question=question,
+                    challenge_hash=new_hash,
+                ), 401
+            roles = user["roles"]
 
         logger.info("Successful login: user=%s from ip=%s", username, client_ip)
         saml_b64 = build_saml_response(
             username,
-            user["roles"],
+            roles,
             cert_pem,
             key_pem,
             idp_entity_id,

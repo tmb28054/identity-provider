@@ -7,17 +7,20 @@ from pathlib import Path
 
 from ._version import __version__
 from .app import create_app
+from .config import load_config
 
 DEFAULT_DATA_DIR = Path(__file__).parent.parent / "data"
 
 
-def _configure_logging(verbosity: int) -> None:
-    """Configure structured logging based on verbosity level."""
-    level = logging.WARNING
+def _configure_logging(level_str: str, verbosity: int) -> None:
+    """Configure structured logging based on config level and verbosity override."""
+    # CLI verbosity takes precedence over config file level
     if verbosity >= 2:
         level = logging.DEBUG
     elif verbosity >= 1:
         level = logging.INFO
+    else:
+        level = getattr(logging, level_str.upper(), logging.WARNING)
 
     handler = logging.StreamHandler(sys.stderr)
     formatter = logging.Formatter(
@@ -39,21 +42,26 @@ def main() -> None:
     parser.add_argument(
         "--data-dir",
         default=str(DEFAULT_DATA_DIR),
-        help="Directory containing users.json, idp.crt, and idp.key (default: ./data)",
+        help="Directory containing config.yaml, users.json, idp.crt, and idp.key (default: ./data)",
     )
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=5000)
-    parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to config.yaml (default: <data-dir>/config.yaml)",
+    )
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--debug", action="store_true", default=None)
     parser.add_argument(
         "--provider-name",
-        default="local-idp",
-        help="SAML provider name registered in AWS IAM (default: local-idp)",
+        default=None,
+        help="SAML provider name registered in AWS IAM",
     )
     parser.add_argument(
         "--session-duration",
         type=int,
-        default=1,
-        help="SAML assertion validity in hours, 1-12 (default: 1)",
+        default=None,
+        help="SAML assertion validity in hours, 1-12",
     )
     parser.add_argument(
         "-v",
@@ -62,18 +70,66 @@ def main() -> None:
         default=0,
         help="Increase verbosity (-v for INFO, -vv for DEBUG)",
     )
+    parser.add_argument(
+        "--adfs-config",
+        default=None,
+        help="Path to ADFS config YAML file. Enables ADFS/LDAP authentication mode. "
+        "If the file does not exist, you will be prompted for connection details.",
+    )
+    parser.add_argument(
+        "--skip-ldap-ssl-verify",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable TLS certificate verification for LDAP connections "
+            "(not recommended for production)"
+        ),
+    )
     args = parser.parse_args()
 
-    _configure_logging(args.verbose)
+    # Load config from file + env, then apply CLI overrides
+    config = load_config(args.data_dir, config_path=args.config)
+
+    # CLI arguments override config values (only if explicitly provided)
+    if args.host is not None:
+        config.server.host = args.host
+    if args.port is not None:
+        config.server.port = args.port
+    if args.debug is not None:
+        config.server.debug = args.debug
+    if args.provider_name is not None:
+        config.saml.provider_name = args.provider_name
+    if args.session_duration is not None:
+        config.saml.session_duration_hours = args.session_duration
+
+    _configure_logging(config.logging.level, args.verbose)
+
+    # Load ADFS config if specified
+    adfs_cfg = None
+    group_role_map = None
+    if args.adfs_config:
+        from .adfs import load_adfs_config, load_group_role_map
+
+        adfs_cfg = load_adfs_config(args.adfs_config)
+        group_role_map = load_group_role_map(config.data_dir)
 
     app = create_app(
-        args.data_dir,
-        host=args.host,
-        port=args.port,
-        provider_name=args.provider_name,
-        session_duration_hours=args.session_duration,
+        config.data_dir,
+        host=config.server.host,
+        port=config.server.port,
+        provider_name=config.saml.provider_name,
+        session_duration_hours=config.saml.session_duration_hours,
+        secret_key=config.security.secret_key or None,
+        rate_limit_max_attempts=config.security.rate_limit_max_attempts,
+        rate_limit_window_seconds=config.security.rate_limit_window_seconds,
+        users_file=config.data.users_file,
+        certificate_file=config.data.certificate_file,
+        private_key_file=config.data.private_key_file,
+        adfs_config=adfs_cfg,
+        group_role_map=group_role_map,
+        skip_ldap_ssl_verify=args.skip_ldap_ssl_verify,
     )
-    app.run(host=args.host, port=args.port, debug=args.debug)
+    app.run(host=config.server.host, port=config.server.port, debug=config.server.debug)
 
 
 if __name__ == "__main__":
