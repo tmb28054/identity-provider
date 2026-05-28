@@ -12,19 +12,22 @@ Intended use cases: local development, CI/CD test environments, and small intern
 
 In scope:
 - Username/password authentication against a local JSON store
+- ADFS/LDAP authentication with AD group-based role mapping
 - Bcrypt password hashing (optional, with plaintext fallback)
 - SAML 2.0 HTTP-POST binding to `https://signin.aws.amazon.com/saml`
 - RSA-SHA256 signed assertions accepted by AWS IAM
 - Multi-account, multi-role mappings per user
 - SAML IdP metadata endpoint for AWS IAM registration
+- YAML config file with layered configuration (CLI > env vars > config file > defaults)
 - Configurable data directory, host, port, provider name, and session duration
 - CSRF protection, rate limiting, and hot-reload of user data
 - Health check endpoint for container orchestration
+- Kubernetes deployment support
 
 Out of scope:
 - MFA / second factors
 - SAML SP-initiated flows (AWS always initiates via the login form here)
-- LDAP, OAuth, or OIDC backends
+- OAuth or OIDC backends
 - User management API (users are managed by editing `users.json` directly)
 - High availability or horizontal scaling
 
@@ -38,13 +41,19 @@ identity-provider-server/
 │   ├── __init__.py        # public API: exposes create_app and __version__
 │   ├── __main__.py        # CLI entry point with structured logging
 │   ├── _version.py        # parses version from CHANGELOG.md (single source of truth)
+│   ├── adfs.py            # ADFS/LDAP authentication backend
 │   ├── app.py             # Flask application factory (CSRF, rate limiting, hot-reload)
+│   ├── config.py          # YAML config loader with layered priority
 │   ├── hash_password.py   # CLI utility for bcrypt password hashing
 │   └── saml_builder.py    # pure SAML assertion builder
 ├── data/                  # default data directory (not committed)
-│   ├── users.json
+│   ├── config.yaml        # application configuration
+│   ├── users.json         # user credentials and role mappings (local auth)
+│   ├── group_roles.yaml   # AD group to AWS role mapping (ADFS auth)
 │   ├── idp.crt
 │   └── idp.key
+├── examples/
+│   └── kubernetes/        # complete K8s deployment manifests
 ├── docs/
 │   ├── spec.md
 │   ├── installation.md
@@ -68,15 +77,30 @@ identity-provider-server/
 
 ### Module responsibilities
 
-**`app.py` — `create_app(data_dir, *, host, port, provider_name, session_duration_hours)`**
-- Reads `users.json`, `idp.crt`, and `idp.key` from `data_dir` at startup
-- Hot-reloads `users.json` on each request if the file has been modified
+**`app.py` — `create_app(data_dir, *, host, port, provider_name, session_duration_hours, ...)`**
+- Reads `idp.crt` and `idp.key` from `data_dir` at startup
+- In local mode: reads `users.json` and hot-reloads on each request if modified
+- In ADFS mode: authenticates via LDAP and maps AD groups to AWS roles
 - Implements CSRF protection (cookie + hidden form field)
-- Implements per-IP rate limiting (5 attempts per 60 seconds)
+- Implements per-IP rate limiting (configurable attempts per window)
 - Supports bcrypt password hashes (with plaintext fallback)
 - Derives `idp_entity_id` from `host` and `port` arguments
 - Registers four HTTP routes (`/aws` GET/POST, `/metadata`, `/health`)
 - Returns a configured Flask application instance
+
+**`adfs.py` — `authenticate_adfs(...)`, `load_adfs_config(...)`, `load_group_role_map(...)`**
+- Authenticates users against Active Directory via LDAP (ldap3 library)
+- Searches for users by sAMAccountName, verifies password via user bind
+- Extracts group memberships from the `memberOf` attribute
+- Maps AD group CNs to AWS IAM roles via `group_roles.yaml`
+- Supports TLS with optional certificate verification skip
+- Prompts interactively for config values if the ADFS config file doesn't exist
+
+**`config.py` — `load_config(data_dir, config_path)`**
+- Loads YAML config file from the data directory
+- Applies environment variable overrides
+- Returns a typed `AppConfig` dataclass
+- Supports layered priority: CLI args > env vars > config file > defaults
 
 **`saml_builder.py` — `build_saml_response(...)`**
 - Pure function: takes username, roles, cert PEM, key PEM, IdP entity ID, provider name, and session duration
@@ -225,24 +249,39 @@ PEM-encoded RSA-2048 (minimum) X.509 certificate and private key pair. Generated
 
 ## Configuration
 
-All runtime configuration is passed via CLI arguments. There is no config file.
+Runtime configuration is loaded from a YAML config file (`config.yaml`), environment variables, and CLI arguments, merged with the following priority (highest wins):
+
+1. CLI arguments
+2. Environment variables
+3. Config file (`config.yaml` in the data directory)
+4. Built-in defaults
 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--version` | — | Print version (sourced from `CHANGELOG.md`) and exit |
-| `--data-dir` | `<package_root>/../data` | Path to directory containing `users.json`, `idp.crt`, `idp.key` |
+| `--data-dir` | `<package_root>/../data` | Path to directory containing config and data files |
+| `--config` | `<data-dir>/config.yaml` | Explicit path to config file |
 | `--host` | `127.0.0.1` | Bind address (also used to derive IdP entity ID) |
 | `--port` | `5000` | TCP port (also used to derive IdP entity ID) |
 | `--debug` | `False` | Flask debug mode (auto-reload, detailed error pages) |
 | `--provider-name` | `local-idp` | SAML provider name in AWS IAM |
 | `--session-duration` | `1` | Assertion validity in hours (1–12) |
 | `-v, --verbose` | off | Structured logging verbosity (`-v` = INFO, `-vv` = DEBUG) |
+| `--adfs-config` | — | Path to ADFS config YAML. Enables ADFS/LDAP auth mode. |
+| `--skip-ldap-ssl-verify` | `False` | Disable TLS certificate verification for LDAP |
 
 Environment variables:
 
 | Variable | Description |
 |----------|-------------|
 | `SECRET_KEY` | Flask secret key for CSRF tokens. Auto-generated if not set. |
+| `IDP_HOST` | Bind address |
+| `IDP_PORT` | TCP port |
+| `IDP_PROVIDER_NAME` | SAML provider name |
+| `IDP_SESSION_DURATION_HOURS` | Assertion validity |
+| `IDP_LOG_LEVEL` | Log level (DEBUG, INFO, WARNING, ERROR) |
+| `IDP_RATE_LIMIT_MAX_ATTEMPTS` | Rate limit threshold |
+| `IDP_RATE_LIMIT_WINDOW_SECONDS` | Rate limit window |
 
 The `idp_entity_id` and `Location` in the metadata are derived from `--host` and `--port` automatically.
 
@@ -255,12 +294,14 @@ The `idp_entity_id` and `Location` in the metadata are derived from `--host` and
 | `flask` >=3.0,<4.0 | HTTP server and routing |
 | `lxml` >=5.0,<6.0 | XML construction for SAML documents |
 | `signxml` >=4.0,<5.0 | XML digital signature (xmldsig) |
+| `bcrypt` >=4.0,<6.0 | Password hashing and verification |
+| `pyyaml` >=6.0,<7.0 | YAML config file parsing |
 
 Optional dependencies:
 
-| Package | Role |
-|---------|------|
-| `bcrypt` >=4.0,<5.0 | Password hashing (install via `pip install -e ".[bcrypt]"`) |
+| Package | Extra | Role |
+|---------|-------|------|
+| `ldap3` >=2.9,<3.0 | `[adfs]` | LDAP communication for ADFS authentication |
 
 Dev dependencies (installed via `pip install -e ".[dev]"`): `pytest`, `pytest-cov`, `ruff`, `mypy`
 

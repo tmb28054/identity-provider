@@ -1,0 +1,30 @@
+# identity-provider-server configuration
+# This file is read at startup from the data directory.
+# All settings can be overridden by CLI arguments or environment variables.
+
+# Server settings
+server:
+  host: "127.0.0.1"
+  port: 5000
+  debug: false
+
+# SAML settings
+saml:
+  provider_name: "local-idp"
+  session_duration_hours: 1
+
+# Paths to data files (relative to this config file's directory, or absolute)
+data:
+  users_file: "users.json"
+  certificate_file: "idp.crt"
+  private_key_file: "idp.key"
+
+# Logging
+logging:
+  level: "WARNING"  # DEBUG, INFO, WARNING, ERROR
+
+# Security
+security:
+  secret_key: ""  # Flask secret key for CSRF. Leave empty to auto-generate.
+  rate_limit_max_attempts: 5
+  rate_limit_window_seconds: 60

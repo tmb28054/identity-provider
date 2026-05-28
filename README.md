@@ -9,7 +9,7 @@ Intended for development, testing, and small internal teams — not a replacemen
 ```
 Browser → GET /aws → login form
         → POST /aws (username + password)
-             → validates against users.json
+             → validates against users.json (or ADFS/LDAP)
              → builds signed SAML assertion
              → auto-POSTs to https://signin.aws.amazon.com/saml
              → AWS redirects to console
@@ -35,6 +35,23 @@ make cert
 identity-provider-server --debug
 # → http://localhost:5000/aws
 ```
+
+## ADFS mode
+
+Authenticate against Active Directory instead of a local users file. AD group memberships are used as claims to determine AWS roles.
+
+```bash
+# Install with ADFS support
+pip install -e ".[adfs]"
+
+# Run with ADFS (prompts for config if file doesn't exist)
+identity-provider-server --adfs-config data/adfs_config.yaml
+
+# Skip LDAP TLS verification (for self-signed certs)
+identity-provider-server --adfs-config data/adfs_config.yaml --skip-ldap-ssl-verify
+```
+
+See [Configuration — ADFS](docs/configuration.md#adfs-authentication-mode) for the full setup guide.
 
 ## Documentation
 
@@ -76,7 +93,25 @@ docker run -v /path/to/data:/data -p 5000:5000 identity-provider-server
 docker compose up
 ```
 
-The container expects a `/data` volume containing `users.json`, `idp.crt`, and `idp.key`.
+The container expects a `/data` volume containing `config.yaml`, `users.json`, `idp.crt`, and `idp.key`.
+
+## Kubernetes
+
+Complete Kubernetes manifests are provided in `examples/kubernetes/`. The deployment uses:
+
+- **ConfigMap** for `config.yaml` and `users.json`
+- **Secret** for certificates and the Flask secret key
+- **Deployment** with health checks, resource limits, and security context
+- **Service** + **Ingress** for external access
+
+```bash
+# Customize and deploy
+cp -r examples/kubernetes/ my-deployment/
+# Edit configmap.yaml and secret.yaml with your values
+kubectl apply -k my-deployment/
+```
+
+See [Configuration](docs/configuration.md) for the full config file schema and environment variable reference.
 
 ## Endpoints
 

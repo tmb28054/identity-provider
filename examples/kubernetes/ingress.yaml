@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: identity-provider-server
+  namespace: identity-provider
+  labels:
+    app.kubernetes.io/name: identity-provider-server
+  annotations:
+    # Adjust annotations for your ingress controller (nginx, ALB, traefik, etc.)
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - idp.example.com
+      secretName: idp-tls  # Provide a TLS cert for HTTPS (e.g. via cert-manager)
+  rules:
+    - host: idp.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: identity-provider-server
+                port:
+                  number: 80
