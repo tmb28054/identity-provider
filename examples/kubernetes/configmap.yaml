@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: idp-config
+  namespace: identity-provider
+  labels:
+    app.kubernetes.io/name: identity-provider-server
+data:
+  config.yaml: |
+    server:
+      host: "0.0.0.0"
+      port: 5000
+      debug: false
+
+    saml:
+      provider_name: "my-corp-idp"
+      session_duration_hours: 4
+
+    data:
+      users_file: "users.json"
+      certificate_file: "idp.crt"
+      private_key_file: "idp.key"
+
+    logging:
+      level: "INFO"
+
+    security:
+      # secret_key is provided via the Secret resource
+      secret_key: ""
+      rate_limit_max_attempts: 5
+      rate_limit_window_seconds: 60
+
+  users.json: |
+    [
+      {
+        "username": "admin",
+        "password": "$2b$12$EXAMPLE_BCRYPT_HASH_HERE",
+        "roles": [
+          {
+            "account_id": "123456789012",
+            "role": "AdminRole"
+          }
+        ]
+      },
+      {
+        "username": "developer",
+        "password": "$2b$12$EXAMPLE_BCRYPT_HASH_HERE",
+        "roles": [
+          {
+            "account_id": "123456789012",
+            "role": "DeveloperRole"
+          },
+          {
+            "account_id": "987654321098",
+            "role": "ReadOnlyRole"
+          }
+        ]
+      }
+    ]

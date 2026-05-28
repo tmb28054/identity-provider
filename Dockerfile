@@ -5,7 +5,7 @@ WORKDIR /app
 COPY pyproject.toml CHANGELOG.md ./
 COPY identity_provider_server/ identity_provider_server/
 
-RUN pip install --no-cache-dir ".[bcrypt]"
+RUN pip install --no-cache-dir .
 
 VOLUME /data
 

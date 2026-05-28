@@ -48,7 +48,7 @@ idp-hash-password "mypassword"
 idp-hash-password --rounds 14
 ```
 
-Requires the bcrypt extra: `pip install -e ".[bcrypt]"`
+Requires the bcrypt package (installed automatically with the server).
 
 ---
 
@@ -252,6 +252,55 @@ app = create_app(
     session_duration_hours=4,
 )
 app.run(port=8080)
+```
+
+---
+
+## Set up ADFS/LDAP authentication
+
+Instead of managing users in `users.json`, authenticate against Active Directory:
+
+**1. Install the ADFS dependency:**
+
+```bash
+pip install -e ".[adfs]"
+```
+
+**2. Create the ADFS config file** (or let the server prompt you):
+
+```bash
+cp data/adfs_config.yaml.example data/adfs_config.yaml
+# Edit with your AD connection details
+```
+
+**3. Create the group-to-role mapping:**
+
+```bash
+cp data/group_roles.yaml.example data/group_roles.yaml
+```
+
+Edit `group_roles.yaml` to map your AD groups to AWS roles:
+
+```yaml
+AWS-Admins:
+  - account_id: "123456789012"
+    role: "AdminRole"
+
+AWS-Developers:
+  - account_id: "123456789012"
+    role: "DeveloperRole"
+```
+
+**4. Run with ADFS mode:**
+
+```bash
+identity-provider-server --adfs-config data/adfs_config.yaml
+```
+
+If your AD server uses a self-signed certificate:
+
+```bash
+identity-provider-server --adfs-config data/adfs_config.yaml --skip-ldap-ssl-verify
 ```
 
 ---

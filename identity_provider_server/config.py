@@ -1,0 +1,212 @@
+"""Configuration loader for identity-provider-server.
+
+Reads a YAML config file from the data directory and merges with
+CLI arguments and environment variables. Priority (highest wins):
+
+    CLI arguments > Environment variables > Config file > Defaults
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+_DEFAULTS: dict[str, Any] = {
+    "server": {
+        "host": "127.0.0.1",
+        "port": 5000,
+        "debug": False,
+    },
+    "saml": {
+        "provider_name": "local-idp",
+        "session_duration_hours": 1,
+    },
+    "data": {
+        "users_file": "users.json",
+        "certificate_file": "idp.crt",
+        "private_key_file": "idp.key",
+    },
+    "logging": {
+        "level": "WARNING",
+    },
+    "security": {
+        "secret_key": "",  # nosec B105
+        "rate_limit_max_attempts": 5,
+        "rate_limit_window_seconds": 60,
+    },
+}
+
+CONFIG_FILENAME = "config.yaml"
+
+
+@dataclass
+class ServerConfig:
+    host: str = "127.0.0.1"
+    port: int = 5000
+    debug: bool = False
+
+
+@dataclass
+class SamlConfig:
+    provider_name: str = "local-idp"
+    session_duration_hours: int = 1
+
+
+@dataclass
+class DataConfig:
+    users_file: str = "users.json"
+    certificate_file: str = "idp.crt"
+    private_key_file: str = "idp.key"
+
+
+@dataclass
+class LoggingConfig:
+    level: str = "WARNING"
+
+
+@dataclass
+class SecurityConfig:
+    secret_key: str = ""
+    rate_limit_max_attempts: int = 5
+    rate_limit_window_seconds: int = 60
+
+
+@dataclass
+class AppConfig:
+    """Complete application configuration."""
+
+    server: ServerConfig = field(default_factory=ServerConfig)
+    saml: SamlConfig = field(default_factory=SamlConfig)
+    data: DataConfig = field(default_factory=DataConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
+    security: SecurityConfig = field(default_factory=SecurityConfig)
+    data_dir: str = ""
+
+    def resolve_path(self, relative_path: str) -> Path:
+        """Resolve a path relative to the data directory."""
+        p = Path(relative_path)
+        if p.is_absolute():
+            return p
+        return Path(self.data_dir) / p
+
+    @property
+    def users_path(self) -> Path:
+        return self.resolve_path(self.data.users_file)
+
+    @property
+    def certificate_path(self) -> Path:
+        return self.resolve_path(self.data.certificate_file)
+
+    @property
+    def private_key_path(self) -> Path:
+        return self.resolve_path(self.data.private_key_file)
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into base, returning a new dict."""
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _apply_env_overrides(config: dict) -> dict:
+    """Apply environment variable overrides.
+
+    Supported environment variables:
+        IDP_HOST, IDP_PORT, IDP_DEBUG,
+        IDP_PROVIDER_NAME, IDP_SESSION_DURATION_HOURS,
+        IDP_USERS_FILE, IDP_CERTIFICATE_FILE, IDP_PRIVATE_KEY_FILE,
+        IDP_LOG_LEVEL,
+        SECRET_KEY, IDP_RATE_LIMIT_MAX_ATTEMPTS, IDP_RATE_LIMIT_WINDOW_SECONDS
+    """
+    env_map = {
+        "IDP_HOST": ("server", "host"),
+        "IDP_PORT": ("server", "port"),
+        "IDP_DEBUG": ("server", "debug"),
+        "IDP_PROVIDER_NAME": ("saml", "provider_name"),
+        "IDP_SESSION_DURATION_HOURS": ("saml", "session_duration_hours"),
+        "IDP_USERS_FILE": ("data", "users_file"),
+        "IDP_CERTIFICATE_FILE": ("data", "certificate_file"),
+        "IDP_PRIVATE_KEY_FILE": ("data", "private_key_file"),
+        "IDP_LOG_LEVEL": ("logging", "level"),
+        "SECRET_KEY": ("security", "secret_key"),
+        "IDP_RATE_LIMIT_MAX_ATTEMPTS": ("security", "rate_limit_max_attempts"),
+        "IDP_RATE_LIMIT_WINDOW_SECONDS": ("security", "rate_limit_window_seconds"),
+    }
+
+    for env_var, (section, key) in env_map.items():
+        value = os.environ.get(env_var)
+        if value is not None:
+            # Type coercion based on defaults
+            default_value = _DEFAULTS[section][key]
+            if isinstance(default_value, bool):
+                value = value.lower() in ("true", "1", "yes")
+            elif isinstance(default_value, int):
+                value = int(value)
+
+            if section not in config:
+                config[section] = {}
+            config[section][key] = value
+
+    return config
+
+
+def load_config(data_dir: str, config_path: str | None = None) -> AppConfig:
+    """Load configuration from file, environment, and defaults.
+
+    Args:
+        data_dir: Path to the data directory.
+        config_path: Optional explicit path to config file. If not provided,
+                     looks for config.yaml in the data directory.
+
+    Returns:
+        Fully resolved AppConfig instance.
+    """
+    data_path = Path(data_dir)
+
+    # Start with defaults
+    config = _DEFAULTS.copy()
+    config = {k: v.copy() if isinstance(v, dict) else v for k, v in config.items()}
+
+    # Load config file if it exists
+    cfg_file = Path(config_path) if config_path else data_path / CONFIG_FILENAME
+
+    if cfg_file.is_file():
+        try:
+            import yaml
+
+            file_config = yaml.safe_load(cfg_file.read_text()) or {}
+            config = _deep_merge(config, file_config)
+            logger.info("Loaded configuration from %s", cfg_file)
+        except ImportError:
+            logger.warning(
+                "PyYAML not installed — cannot read config file %s. "
+                "Install with: pip install pyyaml",
+                cfg_file,
+            )
+        except Exception as e:
+            logger.warning("Failed to read config file %s: %s", cfg_file, e)
+    else:
+        logger.debug("No config file found at %s, using defaults", cfg_file)
+
+    # Apply environment variable overrides
+    config = _apply_env_overrides(config)
+
+    # Build the AppConfig dataclass
+    return AppConfig(
+        server=ServerConfig(**config.get("server", {})),
+        saml=SamlConfig(**config.get("saml", {})),
+        data=DataConfig(**config.get("data", {})),
+        logging=LoggingConfig(**config.get("logging", {})),
+        security=SecurityConfig(**config.get("security", {})),
+        data_dir=str(data_path),
+    )
