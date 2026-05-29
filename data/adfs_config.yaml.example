@@ -1,0 +1,15 @@
+# ADFS/LDAP connection configuration
+# Copy this file to adfs_config.yaml and fill in your values.
+# Alternatively, run with --adfs-config adfs_config.yaml and you'll be prompted.
+
+# LDAP server hostname or IP (use ldaps:// prefix for TLS)
+host: "ldaps://dc01.corp.example.com"
+
+# Service account for LDAP bind (used to search for users)
+username: "CN=svc-idp,OU=Service Accounts,DC=corp,DC=example,DC=com"
+
+# Base DN for user searches
+base_dn: "DC=corp,DC=example,DC=com"
+
+# Service account password
+password: "your-service-account-password"

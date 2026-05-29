@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2025-05-29
+
+### Added
+- Multi-service-provider routing via `services.yaml` — define multiple SAML and OAuth service providers with dynamic route registration.
+- OAuth 2.0 JWT token issuance (RS256-signed) for OAuth-type service providers.
+- `identity_provider_server/services.py` module for loading and validating `services.yaml`.
+- `identity_provider_server/oauth_builder.py` module for building signed JWT tokens.
+- `data/services.yaml.example` with annotated examples.
+- `cryptography` dependency for RSA JWT signing.
+- Hot-reload of `services.yaml` on file modification.
+- `/metadata` now lists `SingleSignOnService` entries for all SAML service providers.
+
+### Changed
+- `build_saml_response()` now accepts `acs_url` and `audience` parameters for configurable SP targets (defaults to AWS values for backward compat).
+- Login form title is now dynamic per service provider.
+- App refactored to use shared authentication logic across all service provider routes.
+
+## [1.1.0] - 2025-05-28
+
+### Added
+- ADFS/LDAP authentication mode via `--adfs-config` CLI argument — authenticates users against Active Directory and uses group memberships as SAML claims.
+- `--skip-ldap-ssl-verify` CLI flag to disable TLS certificate verification for LDAP connections (for self-signed certs).
+- `identity_provider_server/adfs.py` module with LDAP bind, user search, group extraction, and group-to-role mapping.
+- `group_roles.yaml` mapping file to translate AD group names to AWS IAM roles.
+- Interactive config file creation — if the ADFS config file doesn't exist, the user is prompted for connection details and the file is written automatically.
+- `ldap3` optional dependency (`pip install identity-provider-server[adfs]`).
+- Example files: `data/adfs_config.yaml.example` and `data/group_roles.yaml.example`.
+- YAML config file support (`config.yaml`) — consolidates all settings in a single file for Kubernetes and container deployments.
+- `--config` CLI argument to specify an explicit config file path.
+- Environment variable overrides for all configuration values (`IDP_HOST`, `IDP_PORT`, `IDP_PROVIDER_NAME`, etc.).
+- Layered configuration priority: CLI args > environment variables > config file > defaults.
+- Configurable rate limiting via `security.rate_limit_max_attempts` and `security.rate_limit_window_seconds`.
+- Configurable data file paths (`data.users_file`, `data.certificate_file`, `data.private_key_file`) — supports absolute paths or relative to data directory.
+- Kubernetes deployment examples in `examples/kubernetes/` (Namespace, ConfigMap, Secret, Deployment, Service, Ingress, Kustomization).
+- `pyyaml` dependency for config file parsing.
+- `identity_provider_server/config.py` module with typed `AppConfig` dataclass.
+- `pip-audit` and `bandit` added to dev dependencies for security scanning.
+- Smoke tests enforcing 95% code coverage, ruff lint, bandit security, and pip-audit dependency checks.
+
+### Changed
+- `create_app()` now accepts `adfs_config` and `group_role_map` keyword arguments for ADFS mode.
+- `create_app()` now accepts `secret_key`, `rate_limit_max_attempts`, `rate_limit_window_seconds`, `users_file`, `certificate_file`, and `private_key_file` keyword arguments.
+- `--data-dir` now also serves as the default location for `config.yaml`.
+- Documentation updated to reflect ADFS support, config file support, and Kubernetes deployment.
+
 ## [1.0.0] - 2025-05-08
 
 ### Added

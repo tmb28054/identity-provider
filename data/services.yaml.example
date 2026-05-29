@@ -1,0 +1,41 @@
+# Service provider routing configuration
+# Maps URI paths to service providers with their authentication protocol.
+#
+# Format:
+#   <protocol>:
+#     <path>: <service_provider_url>
+#
+# Protocols: saml, oauth
+# Paths become routes on the IdP (e.g. "aws" → GET/POST /aws)
+#
+# Copy this file to services.yaml and customize.
+
+saml:
+  # AWS Console — issues SAML assertion, auto-POSTs to AWS signin
+  aws: https://signin.aws.amazon.com/saml
+
+  # GitLab — issues SAML assertion for GitLab SSO
+  # gitlab: https://gitlab.corp.com/users/auth/saml/callback
+
+oauth:
+  # Internal docs — issues OAuth token, redirects to docs site
+  # docs: https://docs.example.com/
+
+  # Wiki — issues OAuth token, redirects to wiki callback
+  # wiki: https://wiki.example.com/oauth/callback
+
+# Extended format with per-SP overrides:
+#
+# saml:
+#   aws:
+#     url: https://signin.aws.amazon.com/saml
+#     provider_name: my-corp-idp
+#     session_duration_hours: 4
+#     audience: urn:amazon:webservices
+#
+# oauth:
+#   docs:
+#     url: https://docs.example.com/
+#     client_id: docs-app
+#     scopes: ["openid", "profile", "email"]
+#     token_expiry_minutes: 60

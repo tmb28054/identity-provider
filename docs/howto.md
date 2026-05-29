@@ -256,6 +256,116 @@ app.run(port=8080)
 
 ---
 
+## Set up multi-service-provider routing
+
+Serve multiple applications from a single IdP instance using `services.yaml`:
+
+**1. Create `data/services.yaml`:**
+
+```bash
+cp data/services.yaml.example data/services.yaml
+```
+
+**2. Define your service providers:**
+
+```yaml
+saml:
+  aws: https://signin.aws.amazon.com/saml
+  gitlab: https://gitlab.corp.com/users/auth/saml/callback
+
+oauth:
+  docs: https://docs.corp.com/
+```
+
+**3. Start the server:**
+
+```bash
+identity-provider-server
+```
+
+Users can now access:
+- `http://localhost:5000/aws` — login for AWS Console (SAML)
+- `http://localhost:5000/gitlab` — login for GitLab (SAML)
+- `http://localhost:5000/docs` — login for internal docs (OAuth JWT)
+
+The `/metadata` endpoint will list SSO locations for all SAML service providers.
+
+---
+
+## Add an OAuth service provider
+
+OAuth SPs receive a signed JWT token via redirect after authentication:
+
+**1. Add the SP to `data/services.yaml`:**
+
+```yaml
+oauth:
+  docs:
+    url: https://docs.corp.com/auth/callback
+    client_id: docs-app
+    scopes: ["openid", "profile", "email"]
+    token_expiry_minutes: 120
+```
+
+**2. Configure your application** to validate the JWT:
+- The token is signed with RS256 using the same `idp.key`
+- Verify with the public key from `idp.crt`
+- The `iss` claim is the IdP entity ID (`http://<host>:<port>/metadata`)
+- The `sub` claim is the authenticated username
+- The `aud` claim matches the `client_id`
+- The `groups` claim contains AD group memberships (ADFS mode only)
+
+---
+
+## Set up ADFS/LDAP authentication
+
+Instead of managing users in `users.json`, authenticate against Active Directory:
+
+**1. Install the ADFS dependency:**
+
+```bash
+pip install -e ".[adfs]"
+```
+
+**2. Create the ADFS config file** (or let the server prompt you):
+
+```bash
+cp data/adfs_config.yaml.example data/adfs_config.yaml
+# Edit with your AD connection details
+```
+
+**3. Create the group-to-role mapping:**
+
+```bash
+cp data/group_roles.yaml.example data/group_roles.yaml
+```
+
+Edit `group_roles.yaml` to map your AD groups to AWS roles:
+
+```yaml
+AWS-Admins:
+  - account_id: "123456789012"
+    role: "AdminRole"
+
+AWS-Developers:
+  - account_id: "123456789012"
+    role: "DeveloperRole"
+```
+
+**4. Run with ADFS mode:**
+
+```bash
+identity-provider-server --adfs-config data/adfs_config.yaml
+```
+
+If your AD server uses a self-signed certificate:
+
+```bash
+identity-provider-server --adfs-config data/adfs_config.yaml --skip-ldap-ssl-verify
+```
+
+---
+
 ## Enable verbose logging
 
 Use `-v` for INFO level or `-vv` for DEBUG:

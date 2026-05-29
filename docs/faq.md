@@ -168,6 +168,101 @@ Yes — the server checks the file modification time on each request and reloads
 
 ---
 
+## Multi-service-provider routing
+
+**Q: How do I serve multiple applications from one IdP?**
+
+Create a `data/services.yaml` file that maps paths to service providers:
+
+```yaml
+saml:
+  aws: https://signin.aws.amazon.com/saml
+  gitlab: https://gitlab.corp.com/users/auth/saml/callback
+
+oauth:
+  docs: https://docs.corp.com/
+```
+
+Each entry becomes a route on the server. See [Configuration — services.yaml](configuration.md#service-provider-routing-servicesyaml).
+
+---
+
+**Q: What happens if `services.yaml` doesn't exist?**
+
+The server falls back to a single `/aws` route with the default AWS SAML configuration. This is fully backward compatible with v1.x behavior.
+
+---
+
+**Q: How does OAuth token delivery work?**
+
+After successful authentication on an OAuth path, the server issues a signed JWT (RS256) and redirects the user to the SP URL with `?token=<jwt>`. The SP validates the token using the IdP's public certificate (`idp.crt`).
+
+---
+
+**Q: Can I mix SAML and OAuth service providers?**
+
+Yes. Define SAML SPs under the `saml:` key and OAuth SPs under the `oauth:` key in `services.yaml`. Each gets its own route and protocol handling.
+
+---
+
+**Q: How do I validate the OAuth JWT in my application?**
+
+The JWT is signed with RS256 using `idp.key`. Verify it with the public key from `idp.crt`. Key claims:
+- `iss` — IdP entity ID
+- `sub` — authenticated username
+- `aud` — the `client_id` from services.yaml (defaults to the path name)
+- `exp` — expiration timestamp
+- `scope` — granted scopes
+- `groups` — AD group memberships (ADFS mode only)
+
+---
+
+## ADFS / LDAP authentication
+
+**Q: I get "Failed to bind to LDAP server" in the logs.**
+
+Check that:
+1. The `host` in your ADFS config is reachable from the server (try `telnet <host> 636` for LDAPS or port 389 for LDAP).
+2. The service account `username` and `password` are correct.
+3. If using `ldaps://`, the server's TLS certificate is trusted. Use `--skip-ldap-ssl-verify` for self-signed certs.
+
+---
+
+**Q: ADFS authentication works but I get "No AWS roles mapped to your groups."**
+
+The user authenticated successfully against AD, but none of their group memberships matched entries in `group_roles.yaml`. Check:
+1. The `group_roles.yaml` file exists in the data directory.
+2. The group names in the file match the AD group CNs exactly (case-sensitive).
+3. The user is actually a member of the expected groups in AD.
+
+Use `-vv` to see which groups were returned for the user.
+
+---
+
+**Q: What is `--skip-ldap-ssl-verify` for?**
+
+It disables TLS certificate verification on the LDAP connection. Use it when your AD server has a self-signed certificate or uses an internal CA that isn't in the system trust store:
+
+```bash
+identity-provider-server --adfs-config data/adfs_config.yaml --skip-ldap-ssl-verify
+```
+
+This only takes effect when the host uses `ldaps://`. Not recommended for production — install the CA certificate on the server instead.
+
+---
+
+**Q: Can I use ADFS mode with Kubernetes?**
+
+Yes. Store the ADFS config in a Kubernetes Secret (it contains a password) and mount it into the pod. Add `--adfs-config /data/adfs_config.yaml` to the container command. Put `group_roles.yaml` in the ConfigMap alongside `config.yaml`.
+
+---
+
+**Q: The ADFS config file doesn't exist and the server exits immediately.**
+
+When running non-interactively (e.g. in a container), the server can't prompt for input. Create the ADFS config file before starting the server. See `data/adfs_config.yaml.example` for the format.
+
+---
+
 ## Docker
 
 **Q: How do I run with Docker Compose?**

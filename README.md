@@ -1,19 +1,31 @@
 # identity-provider-server
 
-A lightweight local SAML identity provider for AWS console access. Reads users and role mappings from a JSON file and issues signed SAML assertions that AWS IAM trusts.
+A lightweight, self-hosted identity provider that federates browser-based logins into multiple service providers. Supports SAML 2.0 (e.g. AWS Console, GitLab) and OAuth 2.0 (e.g. internal docs, wikis) via a single login portal.
 
 Intended for development, testing, and small internal teams — not a replacement for a production IdP.
 
 ## How it works
 
 ```
-Browser → GET /aws → login form
-        → POST /aws (username + password)
-             → validates against users.json
-             → builds signed SAML assertion
-             → auto-POSTs to https://signin.aws.amazon.com/saml
-             → AWS redirects to console
+Browser → GET /<service> → login form
+        → POST /<service> (username + password)
+             → validates against users.json (or ADFS/LDAP)
+             → SAML: builds signed assertion, auto-POSTs to SP
+             → OAuth: issues signed JWT, redirects to SP
 ```
+
+Routes are defined in `data/services.yaml`:
+
+```yaml
+saml:
+  aws: https://signin.aws.amazon.com/saml
+  gitlab: https://gitlab.corp.com/users/auth/saml/callback
+
+oauth:
+  docs: https://docs.botthouse.net/
+```
+
+If `services.yaml` doesn't exist, the server falls back to a single `/aws` route (backward compatible).
 
 ## Quick start
 
@@ -35,6 +47,23 @@ make cert
 identity-provider-server --debug
 # → http://localhost:5000/aws
 ```
+
+## ADFS mode
+
+Authenticate against Active Directory instead of a local users file. AD group memberships are used as claims to determine AWS roles.
+
+```bash
+# Install with ADFS support
+pip install -e ".[adfs]"
+
+# Run with ADFS (prompts for config if file doesn't exist)
+identity-provider-server --adfs-config data/adfs_config.yaml
+
+# Skip LDAP TLS verification (for self-signed certs)
+identity-provider-server --adfs-config data/adfs_config.yaml --skip-ldap-ssl-verify
+```
+
+See [Configuration — ADFS](docs/configuration.md#adfs-authentication-mode) for the full setup guide.
 
 ## Documentation
 
@@ -76,16 +105,36 @@ docker run -v /path/to/data:/data -p 5000:5000 identity-provider-server
 docker compose up
 ```
 
-The container expects a `/data` volume containing `users.json`, `idp.crt`, and `idp.key`.
+The container expects a `/data` volume containing `config.yaml`, `users.json`, `idp.crt`, and `idp.key`.
+
+## Kubernetes
+
+Complete Kubernetes manifests are provided in `examples/kubernetes/`. The deployment uses:
+
+- **ConfigMap** for `config.yaml` and `users.json`
+- **Secret** for certificates and the Flask secret key
+- **Deployment** with health checks, resource limits, and security context
+- **Service** + **Ingress** for external access
+
+```bash
+# Customize and deploy
+cp -r examples/kubernetes/ my-deployment/
+# Edit configmap.yaml and secret.yaml with your values
+kubectl apply -k my-deployment/
+```
+
+See [Configuration](docs/configuration.md) for the full config file schema and environment variable reference.
 
 ## Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/aws` | GET | Login form |
-| `/aws` | POST | Authenticate and redirect to AWS console |
-| `/metadata` | GET | SAML IdP metadata XML (needed for AWS IAM registration) |
+| `/<service>` | GET | Login form for the service (defined in `services.yaml`) |
+| `/<service>` | POST | Authenticate and redirect to the service provider |
+| `/metadata` | GET | SAML IdP metadata XML (lists all SAML SP paths) |
 | `/health` | GET | Health check (returns `{"status": "healthy"}`) |
+
+Without `services.yaml`, the default route is `/aws`.
 
 ## License
 

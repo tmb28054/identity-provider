@@ -38,8 +38,10 @@ def build_saml_response(
     *,
     provider_name: str = "local-idp",
     session_duration_hours: int = 1,
+    acs_url: str = ACS_URL,
+    audience: str = SP_ENTITY_ID,
 ) -> str:
-    """Build a signed SAML 2.0 Response for AWS federation.
+    """Build a signed SAML 2.0 Response for federation.
 
     Args:
         username: Authenticated user's name (becomes NameID and RoleSessionName).
@@ -47,8 +49,10 @@ def build_saml_response(
         cert_pem: PEM-encoded signing certificate.
         key_pem: PEM-encoded private key.
         idp_entity_id: IdP entity ID (e.g. http://host:port/metadata).
-        provider_name: SAML provider name registered in AWS IAM.
+        provider_name: SAML provider name registered in the SP.
         session_duration_hours: Assertion validity in hours (1–12).
+        acs_url: Assertion Consumer Service URL (where the SAML response is POSTed).
+        audience: SP entity ID / audience restriction value.
 
     Returns:
         Base64-encoded SAML Response XML.
@@ -84,7 +88,7 @@ def build_saml_response(
         sc,
         "SubjectConfirmationData",
         "saml",
-        {"NotOnOrAfter": not_after.strftime(fmt), "Recipient": ACS_URL},
+        {"NotOnOrAfter": not_after.strftime(fmt), "Recipient": acs_url},
     )
 
     conditions = _sub(
@@ -97,7 +101,7 @@ def build_saml_response(
         _sub(conditions, "AudienceRestriction", "saml"),
         "Audience",
         "saml",
-        text=SP_ENTITY_ID,
+        text=audience,
     )
 
     authn = _sub(
@@ -146,7 +150,7 @@ def build_saml_response(
         "ID": "_" + uuid.uuid4().hex,
         "Version": "2.0",
         "IssueInstant": now.strftime(fmt),
-        "Destination": ACS_URL,
+        "Destination": acs_url,
     })
     _sub(response, "Issuer", "saml", text=idp_entity_id)
     _sub(
