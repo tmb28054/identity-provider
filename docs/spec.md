@@ -2,9 +2,9 @@
 
 ## Purpose
 
-A lightweight, self-hosted SAML 2.0 identity provider that federates browser-based logins into the AWS Management Console. Credentials and role mappings are stored in a local JSON file. The server signs SAML assertions with an RSA key so that AWS IAM can verify them without any external dependency.
+A lightweight, self-hosted identity provider that federates browser-based logins into multiple service providers. Supports SAML 2.0 (e.g. AWS Console, GitLab) and OAuth 2.0 (e.g. internal docs, wikis) via a single login portal. Credentials and role mappings are stored in a local JSON file or sourced from Active Directory. The server signs tokens with an RSA key so that service providers can verify them without any external dependency.
 
-Intended use cases: local development, CI/CD test environments, and small internal teams that need AWS console access without a full enterprise IdP.
+Intended use cases: local development, CI/CD test environments, and small internal teams that need federated access to multiple services without a full enterprise IdP.
 
 ---
 
@@ -14,10 +14,12 @@ In scope:
 - Username/password authentication against a local JSON store
 - ADFS/LDAP authentication with AD group-based role mapping
 - Bcrypt password hashing (optional, with plaintext fallback)
-- SAML 2.0 HTTP-POST binding to `https://signin.aws.amazon.com/saml`
-- RSA-SHA256 signed assertions accepted by AWS IAM
+- Multi-service-provider routing via `services.yaml` configuration
+- SAML 2.0 HTTP-POST binding to configurable service provider URLs
+- OAuth 2.0 token issuance with redirect to configurable service provider URLs
+- RSA-SHA256 signed assertions/tokens
 - Multi-account, multi-role mappings per user
-- SAML IdP metadata endpoint for AWS IAM registration
+- SAML IdP metadata endpoint for SP registration
 - YAML config file with layered configuration (CLI > env vars > config file > defaults)
 - Configurable data directory, host, port, provider name, and session duration
 - CSRF protection, rate limiting, and hot-reload of user data
@@ -26,8 +28,8 @@ In scope:
 
 Out of scope:
 - MFA / second factors
-- SAML SP-initiated flows (AWS always initiates via the login form here)
-- OAuth or OIDC backends
+- SAML SP-initiated flows
+- Full OAuth authorization server (authorization code flow with PKCE, refresh tokens, token introspection)
 - User management API (users are managed by editing `users.json` directly)
 - High availability or horizontal scaling
 
@@ -48,6 +50,7 @@ identity-provider-server/
 │   └── saml_builder.py    # pure SAML assertion builder
 ├── data/                  # default data directory (not committed)
 │   ├── config.yaml        # application configuration
+│   ├── services.yaml      # service provider routing (protocol + path + URL)
 │   ├── users.json         # user credentials and role mappings (local auth)
 │   ├── group_roles.yaml   # AD group to AWS role mapping (ADFS auth)
 │   ├── idp.crt
@@ -139,15 +142,17 @@ Response: `200 OK`, `application/json`
 {"status": "healthy"}
 ```
 
-### `GET /aws`
+### `GET /<service_path>`
 
-Returns an HTML login form with `username`, `password`, and `csrf_token` fields. Sets a `csrf_token` cookie for validation on POST.
+Returns an HTML login form for the specified service provider. The path is defined in `services.yaml` (e.g. `/aws`, `/docs`, `/gitlab`).
+
+Sets a `csrf_token` cookie for validation on POST.
 
 Response: `200 OK`, `text/html`
 
-### `POST /aws`
+### `POST /<service_path>`
 
-Authenticates the submitted credentials and, on success, returns an auto-submitting HTML form that POSTs the SAML assertion to AWS.
+Authenticates the submitted credentials and, on success, redirects to the configured service provider using the appropriate protocol.
 
 Request body (form-encoded):
 
@@ -161,30 +166,36 @@ Responses:
 
 | Status | Condition |
 |--------|-----------|
-| `200 OK` | Credentials valid — returns HTML form that auto-POSTs to AWS ACS |
+| `200 OK` | SAML SP — returns HTML form that auto-POSTs assertion to SP URL |
+| `302 Found` | OAuth SP — redirects to SP URL with token |
 | `401 Unauthorized` | Credentials invalid — returns login form with error message |
-| `403 Forbidden` | CSRF token missing or invalid |
-| `429 Too Many Requests` | Rate limit exceeded (5 attempts per IP per 60s) |
+| `403 Forbidden` | CSRF token missing or invalid; or user has no role mappings |
+| `429 Too Many Requests` | Rate limit exceeded |
 
-On success the response body is an HTML page with:
+**SAML service providers** — on success the response body is an auto-submitting HTML form:
 ```html
-<form method="post" action="https://signin.aws.amazon.com/saml">
+<form method="post" action="<sp_url from services.yaml>">
   <input type="hidden" name="SAMLResponse" value="<base64>">
   <input type="hidden" name="RelayState" value="">
 </form>
 ```
-The page's `onload` handler submits the form immediately.
+
+**OAuth service providers** — on success the response is a redirect:
+```
+HTTP/1.1 302 Found
+Location: <sp_url from services.yaml>?token=<jwt>
+```
 
 ### `GET /metadata`
 
-Returns the SAML IdP metadata XML. Used once during AWS IAM SAML provider registration.
+Returns the SAML IdP metadata XML. Includes `SingleSignOnService` entries for all SAML paths defined in `services.yaml`.
 
 Response: `200 OK`, `application/xml`
 
 The document contains:
 - `EntityDescriptor` with the IdP entity ID (`http://<host>:<port>/metadata`)
 - `IDPSSODescriptor` with the signing certificate
-- `SingleSignOnService` pointing to `http://<host>:<port>/aws`
+- `SingleSignOnService` entries for each SAML service provider path
 
 ---
 
@@ -215,7 +226,129 @@ Signing:
 
 ---
 
+## Service provider routing (`services.yaml`)
+
+The IdP supports multiple service providers, each mapped to a URI path on the server. A YAML configuration file (`services.yaml`) in the data directory defines the routing — which protocol to use (SAML or OAuth) and where to redirect the user after authentication.
+
+### Schema
+
+```yaml
+<protocol>:
+  <path>: <service_provider_url>
+```
+
+- **Top-level keys** are the authentication protocol: `saml` or `oauth`
+- **Second-level keys** are the URI path on the IdP (becomes `/<path>`)
+- **Values** are the service provider URL where the user is redirected post-authentication
+
+### Example (`data/services.yaml`)
+
+```yaml
+saml:
+  aws: https://signin.aws.amazon.com/saml
+  gitlab: https://gitlab.corp.com/users/auth/saml/callback
+
+oauth:
+  docs: https://docs.botthouse.net/
+  wiki: https://wiki.botthouse.net/oauth/callback
+```
+
+### Behavior
+
+| Path | Protocol | Post-auth action |
+|------|----------|-----------------|
+| `/aws` | SAML | Issues a signed SAML assertion, auto-POSTs to `https://signin.aws.amazon.com/saml` |
+| `/gitlab` | SAML | Issues a signed SAML assertion, auto-POSTs to `https://gitlab.corp.com/users/auth/saml/callback` |
+| `/docs` | OAuth | Issues an OAuth token, redirects to `https://docs.botthouse.net/` |
+| `/wiki` | OAuth | Issues an OAuth token, redirects to `https://wiki.botthouse.net/oauth/callback` |
+
+### Route generation
+
+For each entry in `services.yaml`, the server registers:
+
+- `GET /<path>` — login form (same UI, branded per service)
+- `POST /<path>` — authenticate and redirect to the service provider
+
+The protocol determines what happens after successful authentication:
+
+| Protocol | Token type | Delivery method |
+|----------|-----------|-----------------|
+| `saml` | Signed SAML 2.0 Response (base64) | HTTP-POST binding — auto-submitting form with `SAMLResponse` field to the SP URL |
+| `oauth` | OAuth 2.0 access token (JWT) | HTTP redirect with token in the URL fragment or `code` parameter to the SP URL |
+
+### Metadata
+
+For SAML service providers, the `/metadata` endpoint includes all registered SAML paths as `SingleSignOnService` locations. Each SAML SP gets its own `AssertionConsumerServiceURL` derived from the configured URL.
+
+### Validation rules
+
+- Path names must be unique across all protocols (no duplicate paths).
+- Path names must be URL-safe (alphanumeric, hyphens, underscores).
+- Protocol must be one of: `saml`, `oauth`.
+- Service provider URLs must be valid HTTPS URLs.
+- The file is hot-reloaded on modification (no restart needed).
+
+### Relationship to existing configuration
+
+- `services.yaml` replaces the hardcoded `/aws` route when present.
+- If `services.yaml` does not exist, the server falls back to the current single-SP behavior (AWS only, configured via `--provider-name`).
+- The `--provider-name` and `--session-duration` settings apply as defaults to all SAML service providers unless overridden per-SP.
+
+### Extended per-SP configuration
+
+For more control, each service provider entry can be expanded to an object:
+
+```yaml
+saml:
+  aws:
+    url: https://signin.aws.amazon.com/saml
+    provider_name: my-corp-idp
+    session_duration_hours: 4
+    audience: urn:amazon:webservices
+
+  gitlab:
+    url: https://gitlab.corp.com/users/auth/saml/callback
+    provider_name: gitlab-idp
+    session_duration_hours: 8
+    audience: https://gitlab.corp.com
+
+oauth:
+  docs:
+    url: https://docs.botthouse.net/
+    client_id: docs-app
+    scopes: ["openid", "profile", "email"]
+    token_expiry_minutes: 60
+
+  wiki:
+    url: https://wiki.botthouse.net/oauth/callback
+    client_id: wiki-app
+    scopes: ["openid", "profile"]
+    token_expiry_minutes: 120
+```
+
+The short form (`path: url`) is syntactic sugar for `path: { url: <url> }` with all other fields using defaults.
+
+---
+
 ## Data model
+
+### `services.yaml`
+
+```yaml
+saml:
+  aws: https://signin.aws.amazon.com/saml
+  gitlab: https://gitlab.corp.com/users/auth/saml/callback
+
+oauth:
+  docs: https://docs.botthouse.net/
+  wiki: https://wiki.botthouse.net/oauth/callback
+```
+
+- Top-level keys are protocols (`saml`, `oauth`)
+- Second-level keys are URL paths (registered as `/<path>` on the server)
+- Values are service provider URLs (redirect targets after authentication)
+- File is hot-reloaded on modification (no restart needed)
+- If the file does not exist, the server falls back to single-SP mode (`/aws` only)
 
 ### `users.json`
 
@@ -415,3 +548,4 @@ make lint
 | No account lockout | Rate limiting resets after the 60-second window |
 | In-memory rate limiter | Resets on server restart; not shared across processes |
 | No user management API | Users are managed by editing `users.json` directly |
+| OAuth support is planned | `services.yaml` defines the routing spec; OAuth token issuance is not yet implemented |

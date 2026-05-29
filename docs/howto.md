@@ -256,6 +256,67 @@ app.run(port=8080)
 
 ---
 
+## Set up multi-service-provider routing
+
+Serve multiple applications from a single IdP instance using `services.yaml`:
+
+**1. Create `data/services.yaml`:**
+
+```bash
+cp data/services.yaml.example data/services.yaml
+```
+
+**2. Define your service providers:**
+
+```yaml
+saml:
+  aws: https://signin.aws.amazon.com/saml
+  gitlab: https://gitlab.corp.com/users/auth/saml/callback
+
+oauth:
+  docs: https://docs.corp.com/
+```
+
+**3. Start the server:**
+
+```bash
+identity-provider-server
+```
+
+Users can now access:
+- `http://localhost:5000/aws` — login for AWS Console (SAML)
+- `http://localhost:5000/gitlab` — login for GitLab (SAML)
+- `http://localhost:5000/docs` — login for internal docs (OAuth JWT)
+
+The `/metadata` endpoint will list SSO locations for all SAML service providers.
+
+---
+
+## Add an OAuth service provider
+
+OAuth SPs receive a signed JWT token via redirect after authentication:
+
+**1. Add the SP to `data/services.yaml`:**
+
+```yaml
+oauth:
+  docs:
+    url: https://docs.corp.com/auth/callback
+    client_id: docs-app
+    scopes: ["openid", "profile", "email"]
+    token_expiry_minutes: 120
+```
+
+**2. Configure your application** to validate the JWT:
+- The token is signed with RS256 using the same `idp.key`
+- Verify with the public key from `idp.crt`
+- The `iss` claim is the IdP entity ID (`http://<host>:<port>/metadata`)
+- The `sub` claim is the authenticated username
+- The `aud` claim matches the `client_id`
+- The `groups` claim contains AD group memberships (ADFS mode only)
+
+---
+
 ## Set up ADFS/LDAP authentication
 
 Instead of managing users in `users.json`, authenticate against Active Directory:

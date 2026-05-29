@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2025-05-29
+
+### Added
+- Multi-service-provider routing via `services.yaml` — define multiple SAML and OAuth service providers with dynamic route registration.
+- OAuth 2.0 JWT token issuance (RS256-signed) for OAuth-type service providers.
+- `identity_provider_server/services.py` module for loading and validating `services.yaml`.
+- `identity_provider_server/oauth_builder.py` module for building signed JWT tokens.
+- `data/services.yaml.example` with annotated examples.
+- `cryptography` dependency for RSA JWT signing.
+- Hot-reload of `services.yaml` on file modification.
+- `/metadata` now lists `SingleSignOnService` entries for all SAML service providers.
+
+### Changed
+- `build_saml_response()` now accepts `acs_url` and `audience` parameters for configurable SP targets (defaults to AWS values for backward compat).
+- Login form title is now dynamic per service provider.
+- App refactored to use shared authentication logic across all service provider routes.
+
 ## [1.1.0] - 2025-05-28
 
 ### Added

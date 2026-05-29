@@ -1,19 +1,31 @@
 # identity-provider-server
 
-A lightweight local SAML identity provider for AWS console access. Reads users and role mappings from a JSON file and issues signed SAML assertions that AWS IAM trusts.
+A lightweight, self-hosted identity provider that federates browser-based logins into multiple service providers. Supports SAML 2.0 (e.g. AWS Console, GitLab) and OAuth 2.0 (e.g. internal docs, wikis) via a single login portal.
 
 Intended for development, testing, and small internal teams — not a replacement for a production IdP.
 
 ## How it works
 
 ```
-Browser → GET /aws → login form
-        → POST /aws (username + password)
+Browser → GET /<service> → login form
+        → POST /<service> (username + password)
              → validates against users.json (or ADFS/LDAP)
-             → builds signed SAML assertion
-             → auto-POSTs to https://signin.aws.amazon.com/saml
-             → AWS redirects to console
+             → SAML: builds signed assertion, auto-POSTs to SP
+             → OAuth: issues signed JWT, redirects to SP
 ```
+
+Routes are defined in `data/services.yaml`:
+
+```yaml
+saml:
+  aws: https://signin.aws.amazon.com/saml
+  gitlab: https://gitlab.corp.com/users/auth/saml/callback
+
+oauth:
+  docs: https://docs.botthouse.net/
+```
+
+If `services.yaml` doesn't exist, the server falls back to a single `/aws` route (backward compatible).
 
 ## Quick start
 
@@ -117,10 +129,12 @@ See [Configuration](docs/configuration.md) for the full config file schema and e
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/aws` | GET | Login form |
-| `/aws` | POST | Authenticate and redirect to AWS console |
-| `/metadata` | GET | SAML IdP metadata XML (needed for AWS IAM registration) |
+| `/<service>` | GET | Login form for the service (defined in `services.yaml`) |
+| `/<service>` | POST | Authenticate and redirect to the service provider |
+| `/metadata` | GET | SAML IdP metadata XML (lists all SAML SP paths) |
 | `/health` | GET | Health check (returns `{"status": "healthy"}`) |
+
+Without `services.yaml`, the default route is `/aws`.
 
 ## License
 
