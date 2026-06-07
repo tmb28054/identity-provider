@@ -85,7 +85,23 @@ def main() -> None:
             "(not recommended for production)"
         ),
     )
+    parser.add_argument(
+        "--init",
+        action="store_true",
+        default=False,
+        help=(
+            "Initialize a new deployment: generate certificates, "
+            "create config and example files, then exit."
+        ),
+    )
     args = parser.parse_args()
+
+    # Handle --init before anything else
+    if args.init:
+        from .init_project import run_init
+
+        run_init(args.data_dir)
+        sys.exit(0)
 
     # Load config from file + env, then apply CLI overrides
     config = load_config(args.data_dir, config_path=args.config)
