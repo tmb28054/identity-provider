@@ -111,15 +111,76 @@ The directory must contain `users.json`, `idp.crt`, and `idp.key`.
 
 ## Run on a non-default port or expose to the network
 
+**Production (gunicorn):**
+
+```bash
+# Listen on port 8080 with 4 workers
+gunicorn "identity_provider_server:create_app('data')" -b 0.0.0.0:8080 -w 4
+```
+
+**Development (Flask dev server):**
+
 ```bash
 # Different port
 identity-provider-server --port 8443
 
-# Accessible from other machines (e.g. for team use)
+# Accessible from other machines
 identity-provider-server --host 0.0.0.0 --port 5000
 ```
 
 > When changing the host/port, the IdP entity ID in the metadata changes automatically. Re-register the metadata in AWS IAM after changing these values.
+
+---
+
+## Run with gunicorn (production)
+
+The `identity-provider-server` CLI uses Flask's built-in development server which is not suitable for production. Use gunicorn instead:
+
+```bash
+# Basic — 2 workers, bind to all interfaces
+gunicorn "identity_provider_server:create_app('data')" -b 0.0.0.0:5000 -w 2
+
+# With access logging
+gunicorn "identity_provider_server:create_app('data')" \
+  -b 0.0.0.0:5000 -w 2 --access-logfile -
+
+# Custom data directory
+gunicorn "identity_provider_server:create_app('/etc/idp')" -b 0.0.0.0:5000
+
+# With ADFS (pass config via environment or mount the file)
+gunicorn "identity_provider_server:create_app('/data')" -b 0.0.0.0:5000
+```
+
+For ADFS mode with gunicorn, the app reads `services.yaml`, `config.yaml`, and all data files from the directory passed to `create_app()`. The `--adfs-config` CLI flag is only for the development server — in production, place `adfs_config.yaml` in the data directory and start with:
+
+```bash
+gunicorn "identity_provider_server:create_app('/data', adfs_config={'host': 'ldaps://dc.corp.com', ...})" \
+  -b 0.0.0.0:5000
+```
+
+Or better, use the CLI wrapper for complex configurations:
+
+```bash
+identity-provider-server --data-dir /data --adfs-config /data/adfs_config.yaml &
+```
+
+### Gunicorn configuration file
+
+For production deployments, create a `gunicorn.conf.py`:
+
+```python
+bind = "0.0.0.0:5000"
+workers = 2
+accesslog = "-"
+errorlog = "-"
+loglevel = "info"
+```
+
+Then run:
+
+```bash
+gunicorn "identity_provider_server:create_app('data')" -c gunicorn.conf.py
+```
 
 ---
 
@@ -157,7 +218,7 @@ Description=Identity Provider Server
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/identity-provider-server --data-dir /etc/idp/ -v
+ExecStart=/usr/local/bin/gunicorn "identity_provider_server:create_app('/etc/idp')" -b 0.0.0.0:5000 -w 2 --access-logfile -
 Restart=on-failure
 User=idp
 Environment=SECRET_KEY=your-secret-key-here

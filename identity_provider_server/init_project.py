@@ -144,7 +144,10 @@ def run_init(data_dir: str) -> None:
     print()
     print("  4. Start the server:")
     print()
-    print(f"     identity-provider-server --data-dir {data}")
+    print(f"     gunicorn \"identity_provider_server:create_app('{data}')\" -b 0.0.0.0:5000")
+    print()
+    print("     Or for development (auto-reload):")
+    print(f"     identity-provider-server --data-dir {data} --debug")
     print()
 
 

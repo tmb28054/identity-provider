@@ -13,6 +13,7 @@ dependencies = [
     "bcrypt>=4.0,<6.0",
     "pyyaml>=6.0,<7.0",
     "cryptography>=42.0",
+    "gunicorn>=22.0,<24.0",
 ]
 
 [project.optional-dependencies]

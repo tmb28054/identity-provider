@@ -14,5 +14,5 @@ EXPOSE 5000
 HEALTHCHECK --interval=10s --timeout=5s --retries=3 --start-period=5s \
     CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health')"
 
-ENTRYPOINT ["identity-provider-server"]
-CMD ["--data-dir", "/data", "--host", "0.0.0.0"]
+ENTRYPOINT ["gunicorn"]
+CMD ["--bind", "0.0.0.0:5000", "--workers", "2", "--access-logfile", "-", "identity_provider_server:create_app('/data')"]

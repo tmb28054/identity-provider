@@ -86,6 +86,16 @@ Environment variables override config file values. Useful for injecting secrets 
 
 CLI arguments have the highest priority and override both config file and environment variables.
 
+The `identity-provider-server` CLI is intended for development and initialization. For production, use gunicorn:
+
+```bash
+# Production
+gunicorn "identity_provider_server:create_app('data')" -b 0.0.0.0:5000 -w 2
+
+# Development
+identity-provider-server --debug -vv
+```
+
 ```
 identity-provider-server [OPTIONS]
 ```
