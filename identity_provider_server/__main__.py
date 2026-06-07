@@ -10,6 +10,7 @@ from .app import create_app
 from .config import load_config
 
 DEFAULT_DATA_DIR = Path(__file__).parent.parent / "data"
+INIT_DATA_DIR = Path("./data")
 
 
 def _configure_logging(level_str: str, verbosity: int) -> None:
@@ -100,7 +101,12 @@ def main() -> None:
     if args.init:
         from .init_project import run_init
 
-        run_init(args.data_dir)
+        # For --init, default to ./data in the current working directory
+        # (not the package install location)
+        data_dir = args.data_dir
+        if data_dir == str(DEFAULT_DATA_DIR):
+            data_dir = str(INIT_DATA_DIR)
+        run_init(data_dir)
         sys.exit(0)
 
     # Load config from file + env, then apply CLI overrides
