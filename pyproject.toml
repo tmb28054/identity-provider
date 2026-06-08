@@ -41,6 +41,7 @@ include = ["identity_provider_server*"]
 
 [project.scripts]
 identity-provider-server = "identity_provider_server.__main__:main"
+run-idp = "identity_provider_server.run_gunicorn:main"
 idp-hash-password = "identity_provider_server.hash_password:main"
 
 [tool.ruff]
