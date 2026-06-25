@@ -584,6 +584,33 @@ def create_app(
 
     def _handle_login_form(service_path: str):
         """Render the login form for a service path."""
+        # Check for valid session cookie — skip login if remembered
+        session_user = _verify_session_cookie(request.cookies.get(SESSION_COOKIE_NAME, ""))
+        if session_user and not use_adfs:
+            user = users.get(session_user)
+            if user:
+                sp = _get_service(service_path)
+                roles = _resolve_roles_from_claims(user)
+                if sp and sp.protocol == "oauth":
+                    token = build_oauth_token(
+                        session_user, key_pem, idp_entity_id,
+                        client_id=sp.client_id, scopes=sp.scopes,
+                        token_expiry_minutes=sp.token_expiry_minutes, groups=None,
+                    )
+                    separator = "&" if "?" in sp.url else "?"
+                    return redirect(f"{sp.url}{separator}token={token}")
+                else:
+                    sp_acs_url = sp.url if sp else ACS_URL
+                    sp_provider = sp.provider_name if sp else provider_name
+                    sp_duration = sp.session_duration_hours if sp else session_duration_hours
+                    sp_audience = (sp.audience if sp and sp.audience else "urn:amazon:webservices")
+                    saml_b64 = build_saml_response(
+                        session_user, roles, cert_pem, key_pem, idp_entity_id,
+                        provider_name=sp_provider, session_duration_hours=sp_duration,
+                        acs_url=sp_acs_url, audience=sp_audience,
+                    )
+                    return render_template_string(SAML_POST, acs=sp_acs_url, saml=saml_b64)
+
         sp = _get_service(service_path)
         title = service_path.upper() if sp else "AWS Console"
         token = _generate_csrf_token()
@@ -692,7 +719,9 @@ def create_app(
                     token_expiry_minutes=sp.token_expiry_minutes, groups=groups,
                 )
                 separator = "&" if "?" in sp.url else "?"
-                return redirect(f"{sp.url}{separator}token={token}")
+                resp = redirect(f"{sp.url}{separator}token={token}")
+                _set_session_cookie(resp, username)
+                return resp
             else:
                 if use_adfs and not roles:
                     question, new_hash = _make_challenge()
@@ -713,7 +742,11 @@ def create_app(
                     provider_name=sp_provider, session_duration_hours=sp_duration,
                     acs_url=sp_acs_url, audience=sp_audience,
                 )
-                return render_template_string(SAML_POST, acs=sp_acs_url, saml=saml_b64)
+                resp = app.make_response(
+                    render_template_string(SAML_POST, acs=sp_acs_url, saml=saml_b64)
+                )
+                _set_session_cookie(resp, username)
+                return resp
 
         if not _verify_challenge(app.secret_key, challenge_answer, challenge_hash_val):
             rate_limiter.record(client_ip)
@@ -847,6 +880,48 @@ def create_app(
         if time.time() - ts > max_age:
             return None
         return username
+
+    SESSION_COOKIE_NAME = "idp_session"
+    SESSION_MAX_AGE = 12 * 3600  # 12 hours
+
+    def _issue_session_cookie(username: str) -> str:
+        """Issue a signed session cookie value (username + timestamp + HMAC)."""
+        payload = f"{username}:{int(time.time())}"
+        sig = hmac.new(app.secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        return f"{payload}:{sig}"
+
+    def _verify_session_cookie(cookie_val: str) -> str | None:
+        """Verify session cookie. Returns username if valid and not expired."""
+        if not cookie_val:
+            return None
+        parts = cookie_val.rsplit(":", 1)
+        if len(parts) != 2:
+            return None
+        payload, sig = parts
+        expected = hmac.new(app.secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        user_parts = payload.rsplit(":", 1)
+        if len(user_parts) != 2:
+            return None
+        username, ts_str = user_parts
+        try:
+            ts = int(ts_str)
+        except ValueError:
+            return None
+        if time.time() - ts > SESSION_MAX_AGE:
+            return None
+        return username
+
+    def _set_session_cookie(resp, username: str):
+        """Set the session cookie on a response."""
+        resp.set_cookie(
+            SESSION_COOKIE_NAME,
+            _issue_session_cookie(username),
+            max_age=SESSION_MAX_AGE,
+            httponly=True,
+            samesite="Strict",
+        )
 
     # --- /user route for MFA enrollment ---
     @app.get("/user")
