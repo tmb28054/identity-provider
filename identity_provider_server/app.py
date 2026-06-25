@@ -220,42 +220,49 @@ USER_PAGE_ENROLL = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Set Up MFA</title>
+  <title>Account Settings</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       background: #f4f6f9; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
     .card { background: #fff; border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,0.08);
-      padding: 2rem; width: 100%; max-width: 420px; }
+      padding: 2rem; width: 100%; max-width: 420px; margin: 1rem; }
     h1 { font-size: 1.4rem; margin-bottom: 1rem; color: #232f3e; }
+    h2 { font-size: 1.1rem; margin: 1.5rem 0 0.75rem; color: #232f3e; border-top: 1px solid #eee; padding-top: 1.5rem; }
     .qr { text-align: center; margin: 1rem 0; }
     .qr img { border: 4px solid #eee; border-radius: 8px; }
     .secret-code { background: #f0f4f8; border: 1px solid #d5dce6; border-radius: 4px;
       padding: 0.5rem; text-align: center; font-family: monospace; font-size: 0.9rem;
       letter-spacing: 2px; margin-bottom: 1rem; word-break: break-all; }
     label { display: block; font-size: 0.85rem; color: #555; margin-bottom: 0.3rem; }
-    input[type="text"] { width: 100%; padding: 0.6rem 0.75rem; border: 1px solid #ccc;
-      border-radius: 4px; font-size: 1.2rem; letter-spacing: 0.3rem; text-align: center; margin-bottom: 1rem; }
+    input[type="text"], input[type="password"] { width: 100%; padding: 0.6rem 0.75rem; border: 1px solid #ccc;
+      border-radius: 4px; font-size: 0.95rem; margin-bottom: 1rem; }
+    input[type="text"]#totp_code { font-size: 1.2rem; letter-spacing: 0.3rem; text-align: center; }
     button { width: 100%; padding: 0.7rem; background: #0073bb; color: #fff; border: none;
-      border-radius: 4px; font-size: 1rem; cursor: pointer; }
+      border-radius: 4px; font-size: 1rem; cursor: pointer; margin-top: 0.5rem; }
     button:hover { background: #005a94; }
+    .btn-danger { background: #d13212; }
+    .btn-danger:hover { background: #a82610; }
     .error { color: #d13212; font-size: 0.85rem; margin-bottom: 1rem; }
     .success { color: #1d8102; font-size: 0.9rem; margin-bottom: 1rem; }
     .status { background: #e8f5e9; border: 1px solid #a5d6a7; border-radius: 4px;
       padding: 0.75rem; margin-bottom: 1rem; text-align: center; }
-    .status.disabled { background: #fff3e0; border-color: #ffcc80; }
   </style>
 </head>
 <body>
   <div class="card">
-    <h1>Two-Factor Authentication</h1>
+    <h1>Account Settings</h1>
+    {% if password_success|default(false) %}<p class="success">Password changed successfully.</p>{% endif %}
+    {% if password_error|default('') %}<p class="error">{{ password_error }}</p>{% endif %}
+
+    <h2 style="border-top:none;margin-top:0;padding-top:0;">Two-Factor Authentication</h2>
     {% if mfa_enabled %}
       <div class="status">MFA is <strong>enabled</strong> for your account.</div>
       <form method="post">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="action" value="disable">
         <input type="hidden" name="auth_token" value="{{ auth_token }}">
-        <button style="background:#d13212;">Disable MFA</button>
+        <button class="btn-danger">Disable MFA</button>
       </form>
     {% else %}
       {% if error %}<p class="error">{{ error }}</p>{% endif %}
@@ -274,6 +281,18 @@ USER_PAGE_ENROLL = """
         <button type="submit">Enable MFA</button>
       </form>
     {% endif %}
+
+    <h2>Change Password</h2>
+    <form method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="action" value="change_password">
+      <input type="hidden" name="auth_token" value="{{ auth_token }}">
+      <label for="new_password">New password</label>
+      <input type="password" id="new_password" name="new_password" required minlength="8">
+      <label for="confirm_password">Confirm new password</label>
+      <input type="password" id="confirm_password" name="confirm_password" required minlength="8">
+      <button type="submit">Change Password</button>
+    </form>
   </div>
 </body>
 </html>
@@ -983,6 +1002,72 @@ def create_app(
                 ),
                 totp_secret=generate_secret(),
                 error=None,
+            ))
+            resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+            return resp
+
+        elif action == "change_password":
+            auth_token = request.form.get("auth_token", "")
+            username = _verify_auth_token(auth_token)
+            if not username:
+                token = _generate_csrf_token()
+                resp = app.make_response(render_template_string(
+                    USER_PAGE_LOGIN, error="Session expired. Please sign in again.",
+                    csrf_token=token,
+                ))
+                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                return resp, 401
+
+            new_password = request.form.get("new_password", "")
+            confirm_password = request.form.get("confirm_password", "")
+
+            # Validation
+            password_error = None
+            if not new_password or len(new_password) < 8:
+                password_error = "Password must be at least 8 characters."
+            elif new_password != confirm_password:
+                password_error = "Passwords do not match."
+
+            user = users.get(username)
+            mfa_enabled = bool(user.get("totp_secret")) if user else False
+
+            if password_error:
+                token = _generate_csrf_token()
+                resp = app.make_response(render_template_string(
+                    USER_PAGE_ENROLL,
+                    mfa_enabled=mfa_enabled,
+                    csrf_token=token,
+                    auth_token=_issue_auth_token(username),
+                    qr_data_uri="" if mfa_enabled else qr_code_data_uri(
+                        provisioning_uri(generate_secret(), username, issuer="idp.botthouse.net")
+                    ),
+                    totp_secret="" if mfa_enabled else generate_secret(),
+                    error=None,
+                    password_error=password_error,
+                ))
+                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                return resp
+
+            # Hash and save the new password
+            import bcrypt as _bcrypt
+            hashed = _bcrypt.hashpw(new_password.encode(), _bcrypt.gensalt()).decode()
+            if user and users_path:
+                user["password"] = hashed
+                _save_users(users_path, users)
+                logger.info("Password changed for user=%s", username)
+
+            token = _generate_csrf_token()
+            resp = app.make_response(render_template_string(
+                USER_PAGE_ENROLL,
+                mfa_enabled=mfa_enabled,
+                csrf_token=token,
+                auth_token=_issue_auth_token(username),
+                qr_data_uri="" if mfa_enabled else qr_code_data_uri(
+                    provisioning_uri(generate_secret(), username, issuer="idp.botthouse.net")
+                ),
+                totp_secret="" if mfa_enabled else generate_secret(),
+                error=None,
+                password_success=True,
             ))
             resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
             return resp
