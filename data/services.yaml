@@ -1,0 +1,39 @@
+# Service provider routing
+# Maps URI paths to service providers with their authentication protocol.
+#
+# Format:
+#   <protocol>:
+#     <path>: <url>
+#
+# Protocols: saml, oauth
+# Paths become routes on the IdP (e.g. "aws" -> GET/POST /aws)
+#
+# Documentation: docs/configuration.md#service-provider-routing-servicesyaml
+
+saml:
+  # AWS Console — issues SAML assertion, auto-POSTs to AWS signin
+  aws: https://signin.aws.amazon.com/saml
+
+  # Add more SAML service providers here:
+  # gitlab: https://gitlab.corp.com/users/auth/saml/callback
+  # jenkins: https://jenkins.corp.com/securityRealm/finishLogin
+
+# oauth:
+  # OAuth service providers — issues JWT, redirects with ?token=<jwt>
+  # docs: https://docs.corp.com/
+  # wiki: https://wiki.corp.com/oauth/callback
+
+# Extended format with per-SP overrides:
+# saml:
+#   aws:
+#     url: https://signin.aws.amazon.com/saml
+#     provider_name: my-corp-idp
+#     session_duration_hours: 4
+#     audience: urn:amazon:webservices
+#
+# oauth:
+#   docs:
+#     url: https://docs.corp.com/
+#     client_id: docs-app
+#     scopes: ["openid", "profile", "email"]
+#     token_expiry_minutes: 60

@@ -194,7 +194,7 @@ def test_adfs_mode_no_role_mapping(data_dir, adfs_config):
             )
 
     assert resp.status_code == 403
-    assert b"No AWS roles mapped" in resp.data
+    assert b"No roles mapped" in resp.data
 
 
 def test_adfs_mode_health_check(data_dir, adfs_config):

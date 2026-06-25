@@ -168,6 +168,55 @@ Yes — the server checks the file modification time on each request and reloads
 
 ---
 
+## Multi-service-provider routing
+
+**Q: How do I serve multiple applications from one IdP?**
+
+Create a `data/services.yaml` file that maps paths to service providers:
+
+```yaml
+saml:
+  aws: https://signin.aws.amazon.com/saml
+  gitlab: https://gitlab.corp.com/users/auth/saml/callback
+
+oauth:
+  docs: https://docs.corp.com/
+```
+
+Each entry becomes a route on the server. See [Configuration — services.yaml](configuration.md#service-provider-routing-servicesyaml).
+
+---
+
+**Q: What happens if `services.yaml` doesn't exist?**
+
+The server falls back to a single `/aws` route with the default AWS SAML configuration. This is fully backward compatible with v1.x behavior.
+
+---
+
+**Q: How does OAuth token delivery work?**
+
+After successful authentication on an OAuth path, the server issues a signed JWT (RS256) and redirects the user to the SP URL with `?token=<jwt>`. The SP validates the token using the IdP's public certificate (`idp.crt`).
+
+---
+
+**Q: Can I mix SAML and OAuth service providers?**
+
+Yes. Define SAML SPs under the `saml:` key and OAuth SPs under the `oauth:` key in `services.yaml`. Each gets its own route and protocol handling.
+
+---
+
+**Q: How do I validate the OAuth JWT in my application?**
+
+The JWT is signed with RS256 using `idp.key`. Verify it with the public key from `idp.crt`. Key claims:
+- `iss` — IdP entity ID
+- `sub` — authenticated username
+- `aud` — the `client_id` from services.yaml (defaults to the path name)
+- `exp` — expiration timestamp
+- `scope` — granted scopes
+- `groups` — AD group memberships (ADFS mode only)
+
+---
+
 ## ADFS / LDAP authentication
 
 **Q: I get "Failed to bind to LDAP server" in the logs.**

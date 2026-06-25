@@ -12,6 +12,8 @@ dependencies = [
     "lxml>=5.0,<6.0",
     "bcrypt>=4.0,<6.0",
     "pyyaml>=6.0,<7.0",
+    "cryptography>=42.0",
+    "gunicorn>=22.0,<24.0",
 ]
 
 [project.optional-dependencies]
@@ -39,6 +41,7 @@ include = ["identity_provider_server*"]
 
 [project.scripts]
 identity-provider-server = "identity_provider_server.__main__:main"
+run-idp = "identity_provider_server.run_gunicorn:main"
 idp-hash-password = "identity_provider_server.hash_password:main"
 
 [tool.ruff]

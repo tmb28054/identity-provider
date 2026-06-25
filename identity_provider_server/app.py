@@ -12,9 +12,11 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, render_template_string, request
+from flask import Flask, redirect, render_template_string, request
 
+from .oauth_builder import build_oauth_token
 from .saml_builder import ACS_URL, build_saml_response
+from .services import ServiceProvider, load_services
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +26,7 @@ LOGIN_FORM = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AWS Login</title>
+  <title>{{ service_title }} Login</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -90,7 +92,7 @@ LOGIN_FORM = """
 </head>
 <body>
   <div class="card">
-    <h1>AWS Console Login</h1>
+    <h1>{{ service_title }} Login</h1>
     {% if error %}<p class="error">{{ error }}</p>{% endif %}
     <form method="post">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -298,17 +300,73 @@ def create_app(
         except OSError:
             logger.warning("Could not stat users.json for hot-reload check")
 
-    @app.before_request
-    def _before_request() -> None:
-        _reload_users_if_changed()
-
     @app.get("/health")
     def health():
         """Health check endpoint."""
         return {"status": "healthy"}, 200
 
-    @app.get("/aws")
-    def login_form():
+    # --- Load service providers ---
+    services_path = data / "services.yaml"
+    _services = load_services(
+        str(data),
+        default_provider_name=provider_name,
+        default_session_duration_hours=session_duration_hours,
+    )
+    _services_mtime = services_path.stat().st_mtime if services_path.is_file() else 0.0
+
+    def _reload_services_if_changed() -> None:
+        """Reload services.yaml if modified."""
+        nonlocal _services, _services_mtime
+        if not services_path.is_file():
+            return
+        try:
+            current_mtime = services_path.stat().st_mtime
+            if current_mtime > _services_mtime:
+                _services = load_services(
+                    str(data),
+                    default_provider_name=provider_name,
+                    default_session_duration_hours=session_duration_hours,
+                )
+                _services_mtime = current_mtime
+                logger.info("Reloaded services.yaml (file changed)")
+        except (OSError, ValueError) as e:
+            logger.warning("Could not reload services.yaml: %s", e)
+
+    @app.before_request
+    def _before_request() -> None:
+        _reload_users_if_changed()
+        _reload_services_if_changed()
+
+    def _get_service(path: str) -> ServiceProvider | None:
+        """Look up a service provider by path."""
+        if _services:
+            for sp in _services:
+                if sp.path == path:
+                    return sp
+        return None
+
+    def _authenticate_user(username: str, password: str) -> tuple[bool, list | None]:
+        """Authenticate a user. Returns (success, roles_or_groups)."""
+        if use_adfs:
+            from .adfs import authenticate_adfs
+
+            groups = authenticate_adfs(
+                username, password, adfs_config,
+                skip_ssl_verify=skip_ldap_ssl_verify,  # type: ignore[arg-type]
+            )
+            if groups is None:
+                return False, None
+            return True, groups
+        else:
+            user = users.get(username)
+            if not user or not _check_password(user["password"], password):
+                return False, None
+            return True, user["roles"]
+
+    def _handle_login_form(service_path: str):
+        """Render the login form for a service path."""
+        sp = _get_service(service_path)
+        title = service_path.upper() if sp else "AWS Console"
         token = _generate_csrf_token()
         question, challenge_hash = _make_challenge()
         response = render_template_string(
@@ -317,16 +375,20 @@ def create_app(
             csrf_token=token,
             challenge_question=question,
             challenge_hash=challenge_hash,
+            service_title=title,
         )
         resp = app.make_response(response)
         resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
         return resp
 
-    @app.post("/aws")
-    def login_post():
+    def _handle_login_post(service_path: str):
+        """Handle login POST for a service path."""
+        sp = _get_service(service_path)
+
         # CSRF validation
         form_token = request.form.get("csrf_token", "")
         cookie_token = request.cookies.get("csrf_token", "")
+        title = service_path.upper() if sp else "AWS Console"
         if not form_token or not hmac.compare_digest(form_token, cookie_token):
             question, challenge_hash = _make_challenge()
             return render_template_string(
@@ -335,6 +397,7 @@ def create_app(
                 csrf_token=_generate_csrf_token(),
                 challenge_question=question,
                 challenge_hash=challenge_hash,
+                service_title=title,
             ), 403
 
         # Rate limiting
@@ -349,12 +412,13 @@ def create_app(
                 csrf_token=token,
                 challenge_question=question,
                 challenge_hash=challenge_hash,
+                service_title=title,
             ), 429
 
         # Human verification
         challenge_answer = request.form.get("challenge_answer", "")
-        challenge_hash = request.form.get("challenge_hash", "")
-        if not _verify_challenge(app.secret_key, challenge_answer, challenge_hash):
+        challenge_hash_val = request.form.get("challenge_hash", "")
+        if not _verify_challenge(app.secret_key, challenge_answer, challenge_hash_val):
             rate_limiter.record(client_ip)
             logger.info("Failed challenge from ip=%s", client_ip)
             question, new_hash = _make_challenge()
@@ -364,75 +428,140 @@ def create_app(
                 csrf_token=_generate_csrf_token(),
                 challenge_question=question,
                 challenge_hash=new_hash,
+                service_title=title,
             ), 401
 
         username = request.form.get("username", "")
         password = request.form.get("password", "")
 
+        success, auth_result = _authenticate_user(username, password)
+        if not success:
+            rate_limiter.record(client_ip)
+            logger.info("Failed login for user=%s from ip=%s", username, client_ip)
+            question, new_hash = _make_challenge()
+            return render_template_string(
+                LOGIN_FORM,
+                error="Invalid credentials",
+                csrf_token=_generate_csrf_token(),
+                challenge_question=question,
+                challenge_hash=new_hash,
+                service_title=title,
+            ), 401
+
+        # Resolve roles for ADFS mode
         if use_adfs:
-            # ADFS mode: authenticate via LDAP, use groups as claims
-            from .adfs import authenticate_adfs, groups_to_roles
+            from .adfs import groups_to_roles
 
-            groups = authenticate_adfs(
-                username, password, adfs_config, skip_ssl_verify=skip_ldap_ssl_verify  # type: ignore[arg-type]
-            )
-            if groups is None:
-                rate_limiter.record(client_ip)
-                logger.info("Failed ADFS login for user=%s from ip=%s", username, client_ip)
-                question, new_hash = _make_challenge()
-                return render_template_string(
-                    LOGIN_FORM,
-                    error="Invalid credentials",
-                    csrf_token=_generate_csrf_token(),
-                    challenge_question=question,
-                    challenge_hash=new_hash,
-                ), 401
-
-            roles = groups_to_roles(groups, _group_role_map)
-            if not roles:
-                logger.warning(
-                    "ADFS user %s authenticated but no role mappings found (groups=%s)",
-                    username,
-                    groups,
-                )
-                question, new_hash = _make_challenge()
-                return render_template_string(
-                    LOGIN_FORM,
-                    error="No AWS roles mapped to your groups. Contact your administrator.",
-                    csrf_token=_generate_csrf_token(),
-                    challenge_question=question,
-                    challenge_hash=new_hash,
-                ), 403
+            roles = groups_to_roles(auth_result, _group_role_map)  # type: ignore[arg-type]
+            groups = auth_result
         else:
-            # Local mode: authenticate against users.json
-            user = users.get(username)
-            if not user or not _check_password(user["password"], password):
-                rate_limiter.record(client_ip)
-                logger.info("Failed login attempt for user=%s from ip=%s", username, client_ip)
+            roles = auth_result  # type: ignore[assignment]
+            groups = None
+
+        logger.info(
+            "Successful login: user=%s service=%s from ip=%s",
+            username, service_path, client_ip,
+        )
+
+        # Determine protocol and respond accordingly
+        if sp and sp.protocol == "oauth":
+            # OAuth: issue JWT and redirect
+            token = build_oauth_token(
+                username,
+                key_pem,
+                idp_entity_id,
+                client_id=sp.client_id,
+                scopes=sp.scopes,
+                token_expiry_minutes=sp.token_expiry_minutes,
+                groups=groups,
+            )
+            separator = "&" if "?" in sp.url else "?"
+            return redirect(f"{sp.url}{separator}token={token}")
+        else:
+            # SAML: build assertion and auto-POST
+            if use_adfs and not roles:
                 question, new_hash = _make_challenge()
                 return render_template_string(
                     LOGIN_FORM,
-                    error="Invalid credentials",
+                    error="No roles mapped to your groups. Contact your administrator.",
                     csrf_token=_generate_csrf_token(),
                     challenge_question=question,
                     challenge_hash=new_hash,
-                ), 401
-            roles = user["roles"]
+                    service_title=title,
+                ), 403
 
-        logger.info("Successful login: user=%s from ip=%s", username, client_ip)
-        saml_b64 = build_saml_response(
-            username,
-            roles,
-            cert_pem,
-            key_pem,
-            idp_entity_id,
-            provider_name=provider_name,
-            session_duration_hours=session_duration_hours,
-        )
-        return render_template_string(SAML_POST, acs=ACS_URL, saml=saml_b64)
+            sp_acs_url = sp.url if sp else ACS_URL
+            sp_provider = sp.provider_name if sp else provider_name
+            sp_duration = sp.session_duration_hours if sp else session_duration_hours
+            sp_audience = (sp.audience if sp and sp.audience else "urn:amazon:webservices")
+
+            saml_b64 = build_saml_response(
+                username,
+                roles,  # type: ignore[arg-type]
+                cert_pem,
+                key_pem,
+                idp_entity_id,
+                provider_name=sp_provider,
+                session_duration_hours=sp_duration,
+                acs_url=sp_acs_url,
+                audience=sp_audience,
+            )
+            return render_template_string(SAML_POST, acs=sp_acs_url, saml=saml_b64)
+
+    # --- Register routes ---
+    if _services:
+        # Dynamic routes from services.yaml
+        for sp in _services:
+
+            def _make_get(path: str):
+                def _get():
+                    return _handle_login_form(path)
+                _get.__name__ = f"login_form_{path}"
+                return _get
+
+            def _make_post(path: str):
+                def _post():
+                    return _handle_login_post(path)
+                _post.__name__ = f"login_post_{path}"
+                return _post
+
+            app.add_url_rule(
+                f"/{sp.path}", endpoint=f"get_{sp.path}",
+                view_func=_make_get(sp.path), methods=["GET"],
+            )
+            app.add_url_rule(
+                f"/{sp.path}", endpoint=f"post_{sp.path}",
+                view_func=_make_post(sp.path), methods=["POST"],
+            )
+    else:
+        # Fallback: single /aws route (backward compatible)
+        @app.get("/aws")
+        def login_form():
+            return _handle_login_form("aws")
+
+        @app.post("/aws")
+        def login_post():
+            return _handle_login_post("aws")
 
     @app.get("/metadata")
     def metadata():
+        # Build SSO service entries for all SAML service providers
+        sso_entries = ""
+        if _services:
+            for sp in _services:
+                if sp.protocol == "saml":
+                    sso_entries += (
+                        f'    <SingleSignOnService '
+                        f'Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" '
+                        f'Location="{idp_entity_id.replace("/metadata", "/" + sp.path)}"/>\n'
+                    )
+        else:
+            sso_entries = (
+                f'    <SingleSignOnService '
+                f'Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" '
+                f'Location="{idp_entity_id.replace("/metadata", "/aws")}"/>\n'
+            )
+
         xml = f"""<?xml version="1.0"?>
 <EntityDescriptor entityID="{idp_entity_id}"
   xmlns="urn:oasis:names:tc:SAML:2.0:metadata">
@@ -443,9 +572,7 @@ def create_app(
         <X509Data><X509Certificate>{cert_b64}</X509Certificate></X509Data>
       </KeyInfo>
     </KeyDescriptor>
-    <SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"
-      Location="{idp_entity_id.replace('/metadata', '/aws')}"/>
-  </IDPSSODescriptor>
+{sso_entries}  </IDPSSODescriptor>
 </EntityDescriptor>"""
         return app.response_class(xml, mimetype="application/xml")
 

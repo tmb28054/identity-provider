@@ -86,6 +86,16 @@ Environment variables override config file values. Useful for injecting secrets 
 
 CLI arguments have the highest priority and override both config file and environment variables.
 
+The `identity-provider-server` CLI is intended for development and initialization. For production, use gunicorn:
+
+```bash
+# Production
+gunicorn "identity_provider_server:create_app('data')" -b 0.0.0.0:5000 -w 2
+
+# Development
+identity-provider-server --debug -vv
+```
+
 ```
 identity-provider-server [OPTIONS]
 ```
@@ -204,6 +214,7 @@ All data files live in a single directory (default: `./data`, configurable via `
 | File | Description |
 |------|-------------|
 | `config.yaml` | Application configuration (optional) |
+| `services.yaml` | Service provider routing — maps paths to protocols and SP URLs (optional) |
 | `users.json` | User credentials and role mappings (local auth mode) |
 | `group_roles.yaml` | AD group to AWS role mapping (ADFS auth mode) |
 | `adfs_config.yaml` | ADFS/LDAP connection settings (ADFS auth mode) |
@@ -211,6 +222,76 @@ All data files live in a single directory (default: `./data`, configurable via `
 | `idp.key` | PEM-encoded RSA private key — keep secret |
 
 File paths in `config.yaml` can be relative (resolved against the data directory) or absolute.
+
+---
+
+## Service provider routing (`services.yaml`)
+
+Define multiple service providers with different protocols. Place a `services.yaml` in the data directory.
+
+### Schema
+
+```yaml
+<protocol>:
+  <path>: <url>
+```
+
+- **Protocol**: `saml` or `oauth`
+- **Path**: becomes a route on the server (`/<path>`)
+- **URL**: where the user is redirected after authentication
+
+### Example
+
+```yaml
+saml:
+  aws: https://signin.aws.amazon.com/saml
+  gitlab: https://gitlab.corp.com/users/auth/saml/callback
+
+oauth:
+  docs: https://docs.botthouse.net/
+  wiki: https://wiki.botthouse.net/oauth/callback
+```
+
+This registers four routes: `/aws`, `/gitlab`, `/docs`, `/wiki`.
+
+### Extended form (per-SP overrides)
+
+```yaml
+saml:
+  aws:
+    url: https://signin.aws.amazon.com/saml
+    provider_name: my-corp-idp
+    session_duration_hours: 4
+    audience: urn:amazon:webservices
+
+oauth:
+  docs:
+    url: https://docs.botthouse.net/
+    client_id: docs-app
+    scopes: ["openid", "profile", "email"]
+    token_expiry_minutes: 60
+```
+
+### Behavior
+
+| Protocol | Post-auth action |
+|----------|-----------------|
+| `saml` | Issues a signed SAML assertion, auto-POSTs to the SP URL |
+| `oauth` | Issues a signed JWT (RS256), redirects to the SP URL with `?token=<jwt>` |
+
+### Fallback
+
+If `services.yaml` does not exist, the server registers a single `/aws` route using `--provider-name` and `--session-duration` defaults (backward compatible with v1.x).
+
+### Hot-reload
+
+The file is checked on each request and reloaded if modified — no restart needed.
+
+### Validation
+
+- Paths must be unique across all protocols
+- Paths must be URL-safe (alphanumeric, hyphens, underscores)
+- URLs must be valid HTTPS URLs
 
 ---
 

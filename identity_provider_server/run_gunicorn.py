@@ -1,42 +1,23 @@
+"""Production entry point using gunicorn.
+
+Provides the `run-idp` command which accepts all the same arguments as
+`identity-provider-server` but runs the app under gunicorn instead of
+the Flask development server.
+"""
+
 from __future__ import annotations
 
 import argparse
-import logging
 import sys
-from pathlib import Path
 
+from .__main__ import DEFAULT_DATA_DIR, INIT_DATA_DIR, _configure_logging
 from ._version import __version__
-from .app import create_app
-from .config import load_config
-
-DEFAULT_DATA_DIR = Path(__file__).parent.parent / "data"
-INIT_DATA_DIR = Path("./data")
-
-
-def _configure_logging(level_str: str, verbosity: int) -> None:
-    """Configure structured logging based on config level and verbosity override."""
-    # CLI verbosity takes precedence over config file level
-    if verbosity >= 2:
-        level = logging.DEBUG
-    elif verbosity >= 1:
-        level = logging.INFO
-    else:
-        level = getattr(logging, level_str.upper(), logging.WARNING)
-
-    handler = logging.StreamHandler(sys.stderr)
-    formatter = logging.Formatter(
-        fmt='{"time":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","message":"%(message)s"}',
-        datefmt="%Y-%m-%dT%H:%M:%S",
-    )
-    handler.setFormatter(formatter)
-
-    root = logging.getLogger("identity_provider_server")
-    root.setLevel(level)
-    root.addHandler(handler)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Identity Provider Server")
+    parser = argparse.ArgumentParser(
+        description="Identity Provider Server (gunicorn production mode)"
+    )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
     )
@@ -52,7 +33,12 @@ def main() -> None:
     )
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
-    parser.add_argument("--debug", action="store_true", default=None)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=2,
+        help="Number of gunicorn worker processes (default: 2)",
+    )
     parser.add_argument(
         "--provider-name",
         default=None,
@@ -74,8 +60,7 @@ def main() -> None:
     parser.add_argument(
         "--adfs-config",
         default=None,
-        help="Path to ADFS config YAML file. Enables ADFS/LDAP authentication mode. "
-        "If the file does not exist, you will be prompted for connection details.",
+        help="Path to ADFS config YAML file. Enables ADFS/LDAP authentication mode.",
     )
     parser.add_argument(
         "--skip-ldap-ssl-verify",
@@ -101,24 +86,21 @@ def main() -> None:
     if args.init:
         from .init_project import run_init
 
-        # For --init, default to ./data in the current working directory
-        # (not the package install location)
         data_dir = args.data_dir
         if data_dir == str(DEFAULT_DATA_DIR):
             data_dir = str(INIT_DATA_DIR)
         run_init(data_dir)
         sys.exit(0)
 
+    from .config import load_config
+
     # Load config from file + env, then apply CLI overrides
     config = load_config(args.data_dir, config_path=args.config)
 
-    # CLI arguments override config values (only if explicitly provided)
     if args.host is not None:
         config.server.host = args.host
     if args.port is not None:
         config.server.port = args.port
-    if args.debug is not None:
-        config.server.debug = args.debug
     if args.provider_name is not None:
         config.saml.provider_name = args.provider_name
     if args.session_duration is not None:
@@ -139,6 +121,8 @@ def main() -> None:
         if adfs_cfg.get("skip_ssl_verify"):
             skip_ssl = True
 
+    from .app import create_app
+
     app = create_app(
         config.data_dir,
         host=config.server.host,
@@ -155,7 +139,33 @@ def main() -> None:
         group_role_map=group_role_map,
         skip_ldap_ssl_verify=skip_ssl,
     )
-    app.run(host=config.server.host, port=config.server.port, debug=config.server.debug)
+
+    bind = f"{config.server.host}:{config.server.port}"
+
+    from gunicorn.app.base import BaseApplication
+
+    class _IdpApplication(BaseApplication):  # type: ignore[misc]
+        def __init__(self, flask_app, options=None):  # type: ignore[no-untyped-def]
+            self.flask_app = flask_app
+            self.options = options or {}
+            super().__init__()
+
+        def load_config(self):  # type: ignore[no-untyped-def]
+            for key, value in self.options.items():
+                if key in self.cfg.settings and value is not None:
+                    self.cfg.set(key.lower(), value)
+
+        def load(self):  # type: ignore[no-untyped-def]
+            return self.flask_app
+
+    options = {
+        "bind": bind,
+        "workers": args.workers,
+        "accesslog": "-",
+        "errorlog": "-",
+    }
+
+    _IdpApplication(app, options).run()
 
 
 if __name__ == "__main__":
