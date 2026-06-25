@@ -1148,4 +1148,8 @@ def create_app(
 </EntityDescriptor>"""
         return app.response_class(xml, mimetype="application/xml")
 
+    # --- Admin panel ---
+    from .admin import register_admin_routes
+    register_admin_routes(app, users, users_path, _check_password, _save_users)
+
     return app
