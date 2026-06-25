@@ -193,6 +193,10 @@ USER_PAGE_LOGIN = """
       border-radius: 4px; font-size: 1rem; cursor: pointer; }
     button:hover { background: #005a94; }
     .error { color: #d13212; font-size: 0.85rem; margin-bottom: 1rem; }
+    .challenge { background: #f0f4f8; border: 1px solid #d5dce6; border-radius: 4px;
+      padding: 0.75rem; margin-bottom: 1rem; text-align: center; }
+    .challenge-question { font-size: 1.1rem; font-weight: 600; color: #232f3e; margin-bottom: 0.5rem; }
+    .challenge-label { font-size: 0.75rem; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
   </style>
 </head>
 <body>
@@ -202,11 +206,19 @@ USER_PAGE_LOGIN = """
     <p style="margin-bottom:1rem;font-size:0.9rem;color:#555;">Sign in to manage your MFA settings.</p>
     <form method="post">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="challenge_hash" value="{{ challenge_hash }}">
       <input type="hidden" name="action" value="login">
       <label for="username">Username</label>
       <input type="text" id="username" name="username" required autofocus>
       <label for="password">Password</label>
       <input type="password" id="password" name="password" required>
+      <div class="challenge">
+        <div class="challenge-label">Human verification</div>
+        <div class="challenge-question">{{ challenge_question }}</div>
+      </div>
+      <label for="challenge_answer">Your answer</label>
+      <input type="text" id="challenge_answer" name="challenge_answer"
+             placeholder="Type the answer" required autocomplete="off">
       <button type="submit">Sign in</button>
     </form>
   </div>
@@ -841,8 +853,10 @@ def create_app(
     def user_page_get():
         """Show login form for account settings."""
         token = _generate_csrf_token()
+        question, challenge_hash = _make_challenge()
         resp = app.make_response(render_template_string(
             USER_PAGE_LOGIN, error=None, csrf_token=token,
+            challenge_question=question, challenge_hash=challenge_hash,
         ))
         resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
         return resp
@@ -905,13 +919,28 @@ def create_app(
             return resp
 
         if action == "login":
+            # Verify challenge
+            challenge_answer = request.form.get("challenge_answer", "")
+            challenge_hash_val = request.form.get("challenge_hash", "")
+            if not _verify_challenge(app.secret_key, challenge_answer, challenge_hash_val):
+                token = _generate_csrf_token()
+                question, ch_hash = _make_challenge()
+                resp = app.make_response(render_template_string(
+                    USER_PAGE_LOGIN, error="Incorrect answer — please try again.",
+                    csrf_token=token, challenge_question=question, challenge_hash=ch_hash,
+                ))
+                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                return resp, 401
+
             username = request.form.get("username", "")
             password = request.form.get("password", "")
             user = users.get(username)
             if not user or not _check_password(user["password"], password):
                 token = _generate_csrf_token()
+                question, ch_hash = _make_challenge()
                 resp = app.make_response(render_template_string(
                     USER_PAGE_LOGIN, error="Invalid credentials", csrf_token=token,
+                    challenge_question=question, challenge_hash=ch_hash,
                 ))
                 resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
                 return resp, 401
@@ -1177,6 +1206,10 @@ def create_app(
 
     # --- Admin panel ---
     from .admin import register_admin_routes
-    register_admin_routes(app, users, users_path, _check_password, _save_users)
+    register_admin_routes(
+        app, users, users_path, _check_password, _save_users,
+        make_challenge_fn=_make_challenge,
+        verify_challenge_fn=lambda answer, h: _verify_challenge(app.secret_key, answer, h),
+    )
 
     return app
