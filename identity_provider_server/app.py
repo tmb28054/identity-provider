@@ -17,6 +17,7 @@ from flask import Flask, redirect, render_template_string, request
 from .oauth_builder import build_oauth_token
 from .saml_builder import ACS_URL, build_saml_response
 from .services import ServiceProvider, load_services
+from .totp import generate_secret, provisioning_uri, qr_code_data_uri, verify_code
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,156 @@ SAML_POST = """
 </form></body>
 """
 
+TOTP_FORM = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Two-Factor Authentication</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f4f6f9; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .card { background: #fff; border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+      padding: 2rem; width: 100%; max-width: 380px; }
+    h1 { font-size: 1.4rem; margin-bottom: 1.5rem; color: #232f3e; }
+    label { display: block; font-size: 0.85rem; color: #555; margin-bottom: 0.3rem; }
+    input[type="text"] { width: 100%; padding: 0.6rem 0.75rem; border: 1px solid #ccc;
+      border-radius: 4px; font-size: 1.2rem; letter-spacing: 0.3rem; text-align: center; margin-bottom: 1rem; }
+    button { width: 100%; padding: 0.7rem; background: #0073bb; color: #fff; border: none;
+      border-radius: 4px; font-size: 1rem; cursor: pointer; }
+    button:hover { background: #005a94; }
+    .error { color: #d13212; font-size: 0.85rem; margin-bottom: 1rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Two-Factor Authentication</h1>
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    <p style="margin-bottom:1rem;font-size:0.9rem;color:#555;">Enter the 6-digit code from your authenticator app.</p>
+    <form method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="totp_step" value="1">
+      <input type="hidden" name="username" value="{{ username }}">
+      <input type="hidden" name="service_path" value="{{ service_path }}">
+      <label for="totp_code">Verification code</label>
+      <input type="text" id="totp_code" name="totp_code" maxlength="6" pattern="[0-9]{6}"
+             required autofocus autocomplete="one-time-code" inputmode="numeric">
+      <button type="submit">Verify</button>
+    </form>
+  </div>
+</body>
+</html>
+"""
+
+USER_PAGE_LOGIN = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Account Settings</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f4f6f9; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .card { background: #fff; border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+      padding: 2rem; width: 100%; max-width: 380px; }
+    h1 { font-size: 1.4rem; margin-bottom: 1.5rem; color: #232f3e; }
+    label { display: block; font-size: 0.85rem; color: #555; margin-bottom: 0.3rem; }
+    input[type="text"], input[type="password"] { width: 100%; padding: 0.6rem 0.75rem;
+      border: 1px solid #ccc; border-radius: 4px; font-size: 0.95rem; margin-bottom: 1rem; }
+    button { width: 100%; padding: 0.7rem; background: #0073bb; color: #fff; border: none;
+      border-radius: 4px; font-size: 1rem; cursor: pointer; }
+    button:hover { background: #005a94; }
+    .error { color: #d13212; font-size: 0.85rem; margin-bottom: 1rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Account Settings</h1>
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    <p style="margin-bottom:1rem;font-size:0.9rem;color:#555;">Sign in to manage your MFA settings.</p>
+    <form method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="action" value="login">
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username" required autofocus>
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" required>
+      <button type="submit">Sign in</button>
+    </form>
+  </div>
+</body>
+</html>
+"""
+
+USER_PAGE_ENROLL = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Set Up MFA</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f4f6f9; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .card { background: #fff; border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+      padding: 2rem; width: 100%; max-width: 420px; }
+    h1 { font-size: 1.4rem; margin-bottom: 1rem; color: #232f3e; }
+    .qr { text-align: center; margin: 1rem 0; }
+    .qr img { border: 4px solid #eee; border-radius: 8px; }
+    .secret-code { background: #f0f4f8; border: 1px solid #d5dce6; border-radius: 4px;
+      padding: 0.5rem; text-align: center; font-family: monospace; font-size: 0.9rem;
+      letter-spacing: 2px; margin-bottom: 1rem; word-break: break-all; }
+    label { display: block; font-size: 0.85rem; color: #555; margin-bottom: 0.3rem; }
+    input[type="text"] { width: 100%; padding: 0.6rem 0.75rem; border: 1px solid #ccc;
+      border-radius: 4px; font-size: 1.2rem; letter-spacing: 0.3rem; text-align: center; margin-bottom: 1rem; }
+    button { width: 100%; padding: 0.7rem; background: #0073bb; color: #fff; border: none;
+      border-radius: 4px; font-size: 1rem; cursor: pointer; }
+    button:hover { background: #005a94; }
+    .error { color: #d13212; font-size: 0.85rem; margin-bottom: 1rem; }
+    .success { color: #1d8102; font-size: 0.9rem; margin-bottom: 1rem; }
+    .status { background: #e8f5e9; border: 1px solid #a5d6a7; border-radius: 4px;
+      padding: 0.75rem; margin-bottom: 1rem; text-align: center; }
+    .status.disabled { background: #fff3e0; border-color: #ffcc80; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Two-Factor Authentication</h1>
+    {% if mfa_enabled %}
+      <div class="status">MFA is <strong>enabled</strong> for your account.</div>
+      <form method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="action" value="disable">
+        <input type="hidden" name="auth_token" value="{{ auth_token }}">
+        <button style="background:#d13212;">Disable MFA</button>
+      </form>
+    {% else %}
+      {% if error %}<p class="error">{{ error }}</p>{% endif %}
+      <p style="margin-bottom:1rem;font-size:0.9rem;color:#555;">Scan this QR code with your authenticator app (Google Authenticator, Authy, 1Password, etc.):</p>
+      <div class="qr"><img src="{{ qr_data_uri }}" alt="TOTP QR Code" width="200" height="200"></div>
+      <p style="font-size:0.8rem;color:#666;margin-bottom:0.5rem;">Or enter this key manually:</p>
+      <div class="secret-code">{{ totp_secret }}</div>
+      <form method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="action" value="enroll">
+        <input type="hidden" name="auth_token" value="{{ auth_token }}">
+        <input type="hidden" name="totp_secret" value="{{ totp_secret }}">
+        <label for="totp_code">Enter the 6-digit code to confirm</label>
+        <input type="text" id="totp_code" name="totp_code" maxlength="6" pattern="[0-9]{6}"
+               required autofocus autocomplete="one-time-code" inputmode="numeric">
+        <button type="submit">Enable MFA</button>
+      </form>
+    {% endif %}
+  </div>
+</body>
+</html>
+"""
+
 
 def _check_password(stored: str, provided: str) -> bool:
     """Check a password against a stored value.
@@ -204,6 +355,12 @@ def _load_users(users_path: Path) -> dict[str, Any]:
     return {u["username"]: u for u in json.loads(users_path.read_text())}
 
 
+def _save_users(users_path: Path, users: dict[str, Any]) -> None:
+    """Save the users dict back to the JSON file."""
+    user_list = list(users.values())
+    users_path.write_text(json.dumps(user_list, indent=2) + "\n")
+
+
 def create_app(
     data_dir: str,
     *,
@@ -263,6 +420,10 @@ def create_app(
         _group_role_map = {}
 
     idp_entity_id = f"http://{host}:{port}/metadata"
+    if port == 443:
+        idp_entity_id = f"https://{host}/metadata"
+    elif port == 80:
+        idp_entity_id = f"http://{host}/metadata"
     cert_b64 = "".join(cert_pem.strip().splitlines()[1:-1])
 
     app = Flask(__name__)
@@ -418,6 +579,84 @@ def create_app(
         # Human verification
         challenge_answer = request.form.get("challenge_answer", "")
         challenge_hash_val = request.form.get("challenge_hash", "")
+
+        # Check if this is a TOTP verification step (second factor) — skip challenge
+        totp_step = request.form.get("totp_step", "")
+        if totp_step == "1":
+            # Verify TOTP code
+            totp_code = request.form.get("totp_code", "")
+            auth_username = request.form.get("username", "")
+            user = users.get(auth_username)
+            if not user or not user.get("totp_secret"):
+                question, new_hash = _make_challenge()
+                return render_template_string(
+                    LOGIN_FORM,
+                    error="Invalid request",
+                    csrf_token=_generate_csrf_token(),
+                    challenge_question=question,
+                    challenge_hash=new_hash,
+                    service_title=title,
+                ), 401
+
+            if not verify_code(user["totp_secret"], totp_code):
+                rate_limiter.record(client_ip)
+                token = _generate_csrf_token()
+                resp = app.make_response(render_template_string(
+                    TOTP_FORM,
+                    error="Invalid code. Try again.",
+                    csrf_token=token,
+                    username=auth_username,
+                    service_path=service_path,
+                ))
+                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                return resp, 401
+
+            # TOTP verified — proceed with token issuance
+            username = auth_username
+            if use_adfs:
+                from .adfs import groups_to_roles
+                roles = groups_to_roles([], _group_role_map)
+                groups = []
+            else:
+                roles = user["roles"]
+                groups = None
+
+            logger.info(
+                "Successful MFA login: user=%s service=%s from ip=%s",
+                username, service_path, client_ip,
+            )
+
+            # Issue the token
+            if sp and sp.protocol == "oauth":
+                token = build_oauth_token(
+                    username, key_pem, idp_entity_id,
+                    client_id=sp.client_id, scopes=sp.scopes,
+                    token_expiry_minutes=sp.token_expiry_minutes, groups=groups,
+                )
+                separator = "&" if "?" in sp.url else "?"
+                return redirect(f"{sp.url}{separator}token={token}")
+            else:
+                if use_adfs and not roles:
+                    question, new_hash = _make_challenge()
+                    return render_template_string(
+                        LOGIN_FORM,
+                        error="No roles mapped to your groups. Contact your administrator.",
+                        csrf_token=_generate_csrf_token(),
+                        challenge_question=question,
+                        challenge_hash=new_hash,
+                        service_title=title,
+                    ), 403
+                sp_acs_url = sp.url if sp else ACS_URL
+                sp_provider = sp.provider_name if sp else provider_name
+                sp_duration = sp.session_duration_hours if sp else session_duration_hours
+                sp_audience = (sp.audience if sp and sp.audience else "urn:amazon:webservices")
+                saml_b64 = build_saml_response(
+                    username, roles, cert_pem, key_pem, idp_entity_id,
+                    provider_name=sp_provider, session_duration_hours=sp_duration,
+                    acs_url=sp_acs_url, audience=sp_audience,
+                )
+                return render_template_string(SAML_POST, acs=sp_acs_url, saml=saml_b64)
+
         if not _verify_challenge(app.secret_key, challenge_answer, challenge_hash_val):
             rate_limiter.record(client_ip)
             logger.info("Failed challenge from ip=%s", client_ip)
@@ -457,6 +696,22 @@ def create_app(
         else:
             roles = auth_result  # type: ignore[assignment]
             groups = None
+
+        # Check if MFA is required (user has totp_secret)
+        if not use_adfs:
+            user = users.get(username)
+            if user and user.get("totp_secret"):
+                # Show TOTP form instead of issuing token
+                token = _generate_csrf_token()
+                resp = app.make_response(render_template_string(
+                    TOTP_FORM,
+                    error=None,
+                    csrf_token=token,
+                    username=username,
+                    service_path=service_path,
+                ))
+                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                return resp
 
         logger.info(
             "Successful login: user=%s service=%s from ip=%s",
@@ -507,6 +762,195 @@ def create_app(
                 audience=sp_audience,
             )
             return render_template_string(SAML_POST, acs=sp_acs_url, saml=saml_b64)
+
+    def _issue_auth_token(username: str) -> str:
+        """Issue a short-lived HMAC token proving the user authenticated."""
+        payload = f"{username}:{int(time.time())}"
+        sig = hmac.new(app.secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        return f"{payload}:{sig}"
+
+    def _verify_auth_token(token: str, max_age: int = 300) -> str | None:
+        """Verify an auth token and return the username if valid (within max_age seconds)."""
+        parts = token.rsplit(":", 1)
+        if len(parts) != 2:
+            return None
+        payload, sig = parts
+        expected = hmac.new(app.secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        user_parts = payload.rsplit(":", 1)
+        if len(user_parts) != 2:
+            return None
+        username, ts_str = user_parts
+        try:
+            ts = int(ts_str)
+        except ValueError:
+            return None
+        if time.time() - ts > max_age:
+            return None
+        return username
+
+    # --- /user route for MFA enrollment ---
+    @app.get("/user")
+    def user_page_get():
+        """Show login form for account settings."""
+        token = _generate_csrf_token()
+        resp = app.make_response(render_template_string(
+            USER_PAGE_LOGIN, error=None, csrf_token=token,
+        ))
+        resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+        return resp
+
+    @app.post("/user")
+    def user_page_post():
+        """Handle account settings actions."""
+        form_token = request.form.get("csrf_token", "")
+        cookie_token = request.cookies.get("csrf_token", "")
+        if not form_token or not hmac.compare_digest(form_token, cookie_token):
+            token = _generate_csrf_token()
+            resp = app.make_response(render_template_string(
+                USER_PAGE_LOGIN, error="Invalid request (CSRF)", csrf_token=token,
+            ))
+            resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+            return resp, 403
+
+        action = request.form.get("action", "login")
+
+        if action == "login":
+            username = request.form.get("username", "")
+            password = request.form.get("password", "")
+            user = users.get(username)
+            if not user or not _check_password(user["password"], password):
+                token = _generate_csrf_token()
+                resp = app.make_response(render_template_string(
+                    USER_PAGE_LOGIN, error="Invalid credentials", csrf_token=token,
+                ))
+                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                return resp, 401
+
+            # Authenticated — show enrollment page
+            auth_token = _issue_auth_token(username)
+            mfa_enabled = bool(user.get("totp_secret"))
+            token = _generate_csrf_token()
+
+            if mfa_enabled:
+                resp = app.make_response(render_template_string(
+                    USER_PAGE_ENROLL,
+                    mfa_enabled=True,
+                    csrf_token=token,
+                    auth_token=auth_token,
+                    qr_data_uri="",
+                    totp_secret="",
+                    error=None,
+                ))
+            else:
+                secret = generate_secret()
+                uri = provisioning_uri(secret, username, issuer="idp.botthouse.net")
+                qr_uri = qr_code_data_uri(uri)
+                resp = app.make_response(render_template_string(
+                    USER_PAGE_ENROLL,
+                    mfa_enabled=False,
+                    csrf_token=token,
+                    auth_token=auth_token,
+                    qr_data_uri=qr_uri,
+                    totp_secret=secret,
+                    error=None,
+                ))
+            resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+            return resp
+
+        elif action == "enroll":
+            auth_token = request.form.get("auth_token", "")
+            username = _verify_auth_token(auth_token)
+            if not username:
+                token = _generate_csrf_token()
+                resp = app.make_response(render_template_string(
+                    USER_PAGE_LOGIN, error="Session expired. Please sign in again.",
+                    csrf_token=token,
+                ))
+                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                return resp, 401
+
+            totp_secret = request.form.get("totp_secret", "")
+            totp_code = request.form.get("totp_code", "")
+
+            if not totp_secret or not verify_code(totp_secret, totp_code):
+                # Re-show the enrollment page with the same secret
+                uri = provisioning_uri(totp_secret, username, issuer="idp.botthouse.net")
+                qr_uri = qr_code_data_uri(uri)
+                token = _generate_csrf_token()
+                resp = app.make_response(render_template_string(
+                    USER_PAGE_ENROLL,
+                    mfa_enabled=False,
+                    csrf_token=token,
+                    auth_token=_issue_auth_token(username),
+                    qr_data_uri=qr_uri,
+                    totp_secret=totp_secret,
+                    error="Invalid code. Try again.",
+                ))
+                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                return resp, 401
+
+            # Save the TOTP secret to the user
+            user = users.get(username)
+            if user and users_path:
+                user["totp_secret"] = totp_secret
+                _save_users(users_path, users)
+                logger.info("MFA enrolled for user=%s", username)
+
+            token = _generate_csrf_token()
+            resp = app.make_response(render_template_string(
+                USER_PAGE_ENROLL,
+                mfa_enabled=True,
+                csrf_token=token,
+                auth_token=_issue_auth_token(username),
+                qr_data_uri="",
+                totp_secret="",
+                error=None,
+            ))
+            resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+            return resp
+
+        elif action == "disable":
+            auth_token = request.form.get("auth_token", "")
+            username = _verify_auth_token(auth_token)
+            if not username:
+                token = _generate_csrf_token()
+                resp = app.make_response(render_template_string(
+                    USER_PAGE_LOGIN, error="Session expired. Please sign in again.",
+                    csrf_token=token,
+                ))
+                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                return resp, 401
+
+            user = users.get(username)
+            if user and users_path:
+                user.pop("totp_secret", None)
+                _save_users(users_path, users)
+                logger.info("MFA disabled for user=%s", username)
+
+            token = _generate_csrf_token()
+            resp = app.make_response(render_template_string(
+                USER_PAGE_ENROLL,
+                mfa_enabled=False,
+                csrf_token=token,
+                auth_token=_issue_auth_token(username),
+                qr_data_uri=qr_code_data_uri(
+                    provisioning_uri(generate_secret(), username, issuer="idp.botthouse.net")
+                ),
+                totp_secret=generate_secret(),
+                error=None,
+            ))
+            resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+            return resp
+
+        # Unknown action — redirect to login
+        token = _generate_csrf_token()
+        resp = app.make_response(render_template_string(
+            USER_PAGE_LOGIN, error=None, csrf_token=token,
+        ))
+        resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+        return resp
 
     # --- Register routes ---
     if _services:

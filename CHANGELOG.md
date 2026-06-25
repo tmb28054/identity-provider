@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-06-25
+
+### Added
+- TOTP-based multi-factor authentication (MFA) support.
+- `/user` page for MFA enrollment — scan QR code to set up an authenticator app.
+- Users with MFA enabled are prompted for a 6-digit TOTP code after password verification.
+- `identity_provider_server/totp.py` module with TOTP generation, verification, and QR code support.
+- `pyotp`, `qrcode`, and `pillow` dependencies for TOTP functionality.
+- Ability to disable MFA from the `/user` page.
+- `gunicorn` added as a core dependency for production deployments.
+
+### Fixed
+- Entity ID now uses `https://` scheme when port is 443 (proper HTTPS metadata URL).
+- SAML provider name correctly passed through `services.yaml` routing (was defaulting to `local-idp`).
+- CSRF token validation fixed for multi-worker gunicorn deployments (shared `SECRET_KEY`).
+
 ## [1.2.0] - 2025-05-29
 
 ### Added

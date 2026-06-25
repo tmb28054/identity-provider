@@ -10,6 +10,8 @@ from signxml import XMLSigner
 NSMAP = {
     "samlp": "urn:oasis:names:tc:SAML:2.0:protocol",
     "saml": "urn:oasis:names:tc:SAML:2.0:assertion",
+    "xs": "http://www.w3.org/2001/XMLSchema",
+    "xsi": "http://www.w3.org/2001/XMLSchema-instance",
 }
 
 SP_ENTITY_ID = "urn:amazon:webservices"
@@ -60,9 +62,30 @@ def build_saml_response(
     now = datetime.now(timezone.utc)
     not_after = now + timedelta(hours=session_duration_hours)
     fmt = "%Y-%m-%dT%H:%M:%SZ"
+    response_id = "_" + uuid.uuid4().hex
     assertion_id = "_" + uuid.uuid4().hex
 
-    assertion = etree.Element(f"{{{NSMAP['saml']}}}Assertion", nsmap=NSMAP)
+    # Build Response wrapper first
+    response = etree.Element(f"{{{NSMAP['samlp']}}}Response", nsmap=NSMAP)
+    response.attrib.update({
+        "ID": response_id,
+        "Version": "2.0",
+        "IssueInstant": now.strftime(fmt),
+        "Destination": acs_url,
+    })
+    _sub(response, "Issuer", "saml", text=idp_entity_id)
+    _sub(
+        _sub(response, "Status", "samlp"),
+        "StatusCode",
+        "samlp",
+        {"Value": "urn:oasis:names:tc:SAML:2.0:status:Success"},
+    )
+
+    # Build Assertion with Issuer first, then a placeholder for Signature,
+    # then remaining elements
+    assertion = etree.SubElement(
+        response, f"{{{NSMAP['saml']}}}Assertion"
+    )
     assertion.attrib.update({
         "ID": assertion_id,
         "Version": "2.0",
@@ -70,6 +93,7 @@ def build_saml_response(
     })
     _sub(assertion, "Issuer", "saml", text=idp_entity_id)
 
+    # Subject
     subject = _sub(assertion, "Subject", "saml")
     _sub(
         subject,
@@ -91,6 +115,7 @@ def build_saml_response(
         {"NotOnOrAfter": not_after.strftime(fmt), "Recipient": acs_url},
     )
 
+    # Conditions
     conditions = _sub(
         assertion,
         "Conditions",
@@ -104,6 +129,7 @@ def build_saml_response(
         text=audience,
     )
 
+    # AuthnStatement
     authn = _sub(
         assertion, "AuthnStatement", "saml", {"AuthnInstant": now.strftime(fmt)}
     )
@@ -114,6 +140,7 @@ def build_saml_response(
         text="urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
     )
 
+    # AttributeStatement
     attr_stmt = _sub(assertion, "AttributeStatement", "saml")
 
     def _attr(name: str, values: list[str]) -> None:
@@ -127,7 +154,8 @@ def build_saml_response(
             },
         )
         for v in values:
-            _sub(a, "AttributeValue", "saml", text=v)
+            av = _sub(a, "AttributeValue", "saml", text=v)
+            av.attrib[f"{{{NSMAP['xsi']}}}type"] = "xs:string"
 
     _attr(
         "https://aws.amazon.com/SAML/Attributes/Role",
@@ -138,27 +166,20 @@ def build_saml_response(
         ],
     )
     _attr("https://aws.amazon.com/SAML/Attributes/RoleSessionName", [username])
+    _attr(
+        "https://aws.amazon.com/SAML/Attributes/SessionDuration",
+        [str(session_duration_hours * 3600)],
+    )
 
+    # Sign only the Assertion element (detached from tree, sign, put back)
+    # Remove assertion from response, sign it standalone, then reattach
+    response.remove(assertion)
     signed_assertion = XMLSigner(
         signature_algorithm="rsa-sha256",
         digest_algorithm="sha256",
         c14n_algorithm="http://www.w3.org/2001/10/xml-exc-c14n#",
     ).sign(assertion, key=key_pem, cert=cert_pem, reference_uri=assertion_id)
 
-    response = etree.Element(f"{{{NSMAP['samlp']}}}Response", nsmap=NSMAP)
-    response.attrib.update({
-        "ID": "_" + uuid.uuid4().hex,
-        "Version": "2.0",
-        "IssueInstant": now.strftime(fmt),
-        "Destination": acs_url,
-    })
-    _sub(response, "Issuer", "saml", text=idp_entity_id)
-    _sub(
-        _sub(response, "Status", "samlp"),
-        "StatusCode",
-        "samlp",
-        {"Value": "urn:oasis:names:tc:SAML:2.0:status:Success"},
-    )
     response.append(signed_assertion)
 
     return base64.b64encode(
