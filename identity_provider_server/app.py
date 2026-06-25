@@ -816,6 +816,48 @@ def create_app(
 
         action = request.form.get("action", "login")
 
+        # Handle TOTP verification for /user access (from TOTP_FORM)
+        totp_step = request.form.get("totp_step", "")
+        if totp_step == "1" and request.form.get("service_path") == "user":
+            username = request.form.get("username", "")
+            totp_code = request.form.get("totp_code", "")
+            user = users.get(username)
+            if not user or not user.get("totp_secret"):
+                token = _generate_csrf_token()
+                resp = app.make_response(render_template_string(
+                    USER_PAGE_LOGIN, error="Invalid request. Please sign in again.",
+                    csrf_token=token,
+                ))
+                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                return resp, 401
+
+            if not verify_code(user["totp_secret"], totp_code):
+                token = _generate_csrf_token()
+                resp = app.make_response(render_template_string(
+                    TOTP_FORM,
+                    error="Invalid code. Try again.",
+                    csrf_token=token,
+                    username=username,
+                    service_path="user",
+                ))
+                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                return resp, 401
+
+            # TOTP verified — show settings page
+            auth_token = _issue_auth_token(username)
+            token = _generate_csrf_token()
+            resp = app.make_response(render_template_string(
+                USER_PAGE_ENROLL,
+                mfa_enabled=True,
+                csrf_token=token,
+                auth_token=auth_token,
+                qr_data_uri="",
+                totp_secret="",
+                error=None,
+            ))
+            resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+            return resp
+
         if action == "login":
             username = request.form.get("username", "")
             password = request.form.get("password", "")
@@ -828,34 +870,35 @@ def create_app(
                 resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
                 return resp, 401
 
-            # Authenticated — show enrollment page
-            auth_token = _issue_auth_token(username)
+            # If MFA is enabled, require TOTP before granting access
             mfa_enabled = bool(user.get("totp_secret"))
-            token = _generate_csrf_token()
-
             if mfa_enabled:
+                token = _generate_csrf_token()
                 resp = app.make_response(render_template_string(
-                    USER_PAGE_ENROLL,
-                    mfa_enabled=True,
-                    csrf_token=token,
-                    auth_token=auth_token,
-                    qr_data_uri="",
-                    totp_secret="",
+                    TOTP_FORM,
                     error=None,
-                ))
-            else:
-                secret = generate_secret()
-                uri = provisioning_uri(secret, username, issuer="idp.botthouse.net")
-                qr_uri = qr_code_data_uri(uri)
-                resp = app.make_response(render_template_string(
-                    USER_PAGE_ENROLL,
-                    mfa_enabled=False,
                     csrf_token=token,
-                    auth_token=auth_token,
-                    qr_data_uri=qr_uri,
-                    totp_secret=secret,
-                    error=None,
+                    username=username,
+                    service_path="user",
                 ))
+                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                return resp
+
+            # No MFA — go straight to enrollment page
+            auth_token = _issue_auth_token(username)
+            token = _generate_csrf_token()
+            secret = generate_secret()
+            uri = provisioning_uri(secret, username, issuer="idp.botthouse.net")
+            qr_uri = qr_code_data_uri(uri)
+            resp = app.make_response(render_template_string(
+                USER_PAGE_ENROLL,
+                mfa_enabled=False,
+                csrf_token=token,
+                auth_token=auth_token,
+                qr_data_uri=qr_uri,
+                totp_secret=secret,
+                error=None,
+            ))
             resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
             return resp
 
