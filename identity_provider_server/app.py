@@ -494,6 +494,33 @@ def create_app(
     )
     _services_mtime = services_path.stat().st_mtime if services_path.is_file() else 0.0
 
+    # --- Load claim-to-role mapping ---
+    import yaml as _yaml
+    claim_roles_path = data / "claim_roles.yaml"
+    _claim_roles: dict[str, list[dict[str, str]]] = {}
+    if claim_roles_path.is_file():
+        _claim_roles = _yaml.safe_load(claim_roles_path.read_text()) or {}
+        logger.info("Loaded claim_roles.yaml (%d claims mapped)", len(_claim_roles))
+
+    def _resolve_roles_from_claims(user: dict[str, Any]) -> list[dict[str, str]]:
+        """Resolve AWS roles from a user's claims + direct roles array."""
+        roles: list[dict[str, str]] = []
+        seen = set()
+        # Roles from claims
+        for claim in user.get("claims", []):
+            for role in _claim_roles.get(claim, []):
+                key = (role["account_id"], role["role"])
+                if key not in seen:
+                    roles.append(role)
+                    seen.add(key)
+        # Direct roles (backward compat)
+        for role in user.get("roles", []):
+            key = (role["account_id"], role["role"])
+            if key not in seen:
+                roles.append(role)
+                seen.add(key)
+        return roles
+
     def _reload_services_if_changed() -> None:
         """Reload services.yaml if modified."""
         nonlocal _services, _services_mtime
@@ -541,7 +568,7 @@ def create_app(
             user = users.get(username)
             if not user or not _check_password(user["password"], password):
                 return False, None
-            return True, user["roles"]
+            return True, _resolve_roles_from_claims(user)
 
     def _handle_login_form(service_path: str):
         """Render the login form for a service path."""
@@ -637,7 +664,7 @@ def create_app(
                 roles = groups_to_roles([], _group_role_map)
                 groups = []
             else:
-                roles = user["roles"]
+                roles = _resolve_roles_from_claims(user)
                 groups = None
 
             logger.info(

@@ -1,0 +1,26 @@
+# Claim-to-AWS-Role mapping
+# Maps IdP claims to AWS IAM roles. Users with a claim get all roles listed under it.
+#
+# Format:
+#   <claim_name>:
+#     - account_id: "<12-digit AWS account ID>"
+#       role: "<IAM role name>"
+#
+# A user's effective roles = union of all roles from their claims + their direct roles array.
+# This file is hot-reloaded — changes take effect on next login (no restart needed).
+#
+# Example:
+
+awsadmin:
+  - account_id: "123456789012"
+    role: "AdminRole"
+
+developer:
+  - account_id: "123456789012"
+    role: "DeveloperRole"
+  - account_id: "987654321098"
+    role: "DeveloperRole"
+
+readonly:
+  - account_id: "123456789012"
+    role: "ReadOnlyRole"
