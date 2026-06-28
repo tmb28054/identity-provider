@@ -202,6 +202,55 @@ ADMIN_PANEL = """
     </form>
     <p style="font-size:0.8rem;color:#888;margin-top:1rem;">All claims in use: {% for c in all_claims %}<span class="badge">{{ c }}</span> {% endfor %}</p>
   </div>
+
+  <h2>Service Providers</h2>
+  <div class="card">
+    <table>
+      <tr><th>Path</th><th>Protocol</th><th>URL</th><th>Actions</th></tr>
+      {% for sp in sp_list %}
+      <tr>
+        <td><code>/{{ sp.path }}</code></td>
+        <td><span class="badge">{{ sp.protocol }}</span></td>
+        <td style="font-size:0.8rem;word-break:break-all;">{{ sp.url }}</td>
+        <td class="actions">
+          <form method="post" style="display:inline" onsubmit="return confirm('Delete service provider /{{ sp.path }}?')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="auth_token" value="{{ auth_token }}">
+            <input type="hidden" name="action" value="delete_sp">
+            <input type="hidden" name="sp_protocol" value="{{ sp.protocol }}">
+            <input type="hidden" name="sp_path" value="{{ sp.path }}">
+            <button class="btn-sm btn-danger">Delete</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+      {% if not sp_list %}
+      <tr><td colspan="4" style="text-align:center;color:#888;">No service providers configured.</td></tr>
+      {% endif %}
+    </table>
+  </div>
+
+  <h2>Add / Update Service Provider</h2>
+  <div class="card">
+    <form method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="auth_token" value="{{ auth_token }}">
+      <input type="hidden" name="action" value="upsert_sp">
+      <div class="form-row">
+        <div>
+          <label>Protocol</label>
+          <select name="sp_protocol">
+            <option value="saml">SAML</option>
+            <option value="oauth">OAuth</option>
+          </select>
+        </div>
+        <div><label>Path (e.g. aws, gitlab)</label><input type="text" name="sp_path" required pattern="[a-zA-Z0-9_-]+" placeholder="myapp"></div>
+      </div>
+      <label>Service Provider URL</label>
+      <input type="text" name="sp_url" required placeholder="https://example.com/saml/acs">
+      <button type="submit">Add / Update SP</button>
+    </form>
+  </div>
 </div>
 </body>
 </html>
@@ -216,6 +265,8 @@ def register_admin_routes(
     save_users_fn,
     make_challenge_fn=None,
     verify_challenge_fn=None,
+    services_path: Path | None = None,
+    reload_services_fn=None,
 ) -> None:
     """Register /admin routes on the Flask app."""
 
@@ -253,14 +304,39 @@ def register_admin_routes(
             return False
         return claim in user.get("claims", [])
 
+    def _load_services_yaml() -> dict[str, dict[str, str]]:
+        """Load services.yaml and return as {protocol: {path: url}}."""
+        if not services_path or not services_path.is_file():
+            return {}
+        import yaml
+        data = yaml.safe_load(services_path.read_text()) or {}
+        return data
+
+    def _save_services_yaml(data: dict[str, dict[str, str]]) -> None:
+        """Save services data to services.yaml."""
+        if not services_path:
+            return
+        import yaml
+        services_path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
+        if reload_services_fn:
+            reload_services_fn()
+
     def _render_panel(auth_token: str, message: str = "", error: str = ""):
         token = _csrf_token()
         users_list = list(users.values())
         all_claims = sorted({c for u in users.values() for c in u.get("claims", [])})
+        services_data = _load_services_yaml()
+        # Flatten to a list of {protocol, path, url}
+        sp_list = []
+        for protocol, paths in services_data.items():
+            if isinstance(paths, dict):
+                for path, url in paths.items():
+                    sp_list.append({"protocol": protocol, "path": path, "url": url})
         resp = app.make_response(render_template_string(
             ADMIN_PANEL,
             users_list=users_list,
             all_claims=all_claims,
+            sp_list=sp_list,
             csrf_token=token,
             auth_token=auth_token,
             message=message,
@@ -454,5 +530,42 @@ def register_admin_routes(
                 save_users_fn(users_path, users)
             logger.info("Admin %s set claims for %s: %s", admin_user, target, claims)
             return _render_panel(auth_token, message=f"Claims updated for '{target}'.")
+
+        elif action == "upsert_sp":
+            sp_protocol = request.form.get("sp_protocol", "").strip().lower()
+            sp_path = request.form.get("sp_path", "").strip().lower()
+            sp_url = request.form.get("sp_url", "").strip()
+
+            if sp_protocol not in ("saml", "oauth"):
+                return _render_panel(auth_token, error="Protocol must be 'saml' or 'oauth'.")
+            if not sp_path or not sp_path.replace("-", "").replace("_", "").isalnum():
+                return _render_panel(auth_token, error="Path must be URL-safe (letters, numbers, hyphens, underscores).")
+            if not sp_url or not sp_url.startswith("https://"):
+                return _render_panel(auth_token, error="URL must start with https://.")
+
+            data = _load_services_yaml()
+            if sp_protocol not in data:
+                data[sp_protocol] = {}
+            is_update = sp_path in data.get(sp_protocol, {})
+            data[sp_protocol][sp_path] = sp_url
+            _save_services_yaml(data)
+            verb = "updated" if is_update else "added"
+            logger.info("Admin %s %s SP: %s/%s -> %s", admin_user, verb, sp_protocol, sp_path, sp_url)
+            return _render_panel(auth_token, message=f"Service provider '/{sp_path}' ({sp_protocol}) {verb}.")
+
+        elif action == "delete_sp":
+            sp_protocol = request.form.get("sp_protocol", "").strip().lower()
+            sp_path = request.form.get("sp_path", "").strip()
+
+            data = _load_services_yaml()
+            if sp_protocol in data and sp_path in data[sp_protocol]:
+                del data[sp_protocol][sp_path]
+                # Remove empty protocol sections
+                if not data[sp_protocol]:
+                    del data[sp_protocol]
+                _save_services_yaml(data)
+                logger.info("Admin %s deleted SP: %s/%s", admin_user, sp_protocol, sp_path)
+                return _render_panel(auth_token, message=f"Service provider '/{sp_path}' deleted.")
+            return _render_panel(auth_token, error=f"Service provider '/{sp_path}' not found.")
 
         return _render_panel(auth_token, error="Unknown action.")
