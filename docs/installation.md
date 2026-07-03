@@ -297,6 +297,7 @@ containers:
 
 The deployment includes:
 
+- **Gunicorn** — production WSGI server (2 workers by default)
 - **Liveness probe** — restarts the pod if `/health` stops responding
 - **Readiness probe** — removes the pod from service during startup
 - **Security context** — runs as non-root with a read-only filesystem

@@ -33,19 +33,18 @@ If `services.yaml` doesn't exist, the server falls back to a single `/aws` route
 # 1. Install
 pip install -e .
 
-# 2. Generate a signing certificate (one-time)
-make cert
-# or manually:
-# openssl req -x509 -newkey rsa:2048 -keyout data/idp.key -out data/idp.crt \
-#   -days 3650 -nodes -subj "/CN=local-idp"
+# 2. Initialize (generates certs, config, and example files)
+identity-provider-server --init
 
 # 3. Edit data/users.json with your users and role mappings
 
 # 4. Register the IdP in AWS IAM (see docs/installation.md)
 
-# 5. Run
+# 5. Run (production)
+gunicorn "identity_provider_server:create_app('data')" -b 0.0.0.0:5000
+
+# Or run in development mode (auto-reload, verbose errors)
 identity-provider-server --debug
-# → http://localhost:5000/aws
 ```
 
 ## ADFS mode
@@ -105,7 +104,7 @@ docker run -v /path/to/data:/data -p 5000:5000 identity-provider-server
 docker compose up
 ```
 
-The container expects a `/data` volume containing `config.yaml`, `users.json`, `idp.crt`, and `idp.key`.
+The container runs gunicorn with 2 workers by default. It expects a `/data` volume containing `config.yaml`, `services.yaml`, `users.json`, `idp.crt`, and `idp.key`.
 
 ## Kubernetes
 

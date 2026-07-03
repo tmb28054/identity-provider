@@ -11,6 +11,32 @@ import sys
 from pathlib import Path
 
 
+def _extract_cn_from_cert(cert_path: Path) -> str:
+    """Extract the CN from an existing certificate, falling back to 'local-idp'."""
+    try:
+        result = subprocess.run(  # nosec B603 B607
+            ["openssl", "x509", "-in", str(cert_path), "-noout", "-subject"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            subject = result.stdout.strip()
+            # Formats: "subject=CN = value" or "subject= /CN=value"
+            if "CN=" in subject or "CN =" in subject:
+                # Handle "CN = value" format
+                part = subject.split("CN")[-1]
+                # Strip leading '=' or ' = '
+                cn = part.lstrip(" =").strip()
+                # Handle cases like "CN=value/O=org" — take only CN part
+                if "/" in cn:
+                    cn = cn.split("/")[0].strip()
+                if cn:
+                    return cn
+    except OSError:
+        pass
+    return "local-idp"
+
+
 def run_init(data_dir: str) -> None:
     """Run the interactive init process.
 
@@ -37,6 +63,8 @@ def run_init(data_dir: str) -> None:
 
     if cert_path.exists() and key_path.exists():
         print(f"✓ Signing certificate already exists: {cert_path}")
+        # Try to extract CN from existing cert for use as provider_name
+        cn = _extract_cn_from_cert(cert_path)
     else:
         cn = input("  Certificate CN (e.g. local-idp, my-corp-idp): ").strip()
         if not cn:
@@ -69,7 +97,7 @@ def run_init(data_dir: str) -> None:
     if config_path.exists():
         print(f"✓ Config file already exists: {config_path}")
     else:
-        config_path.write_text(_CONFIG_TEMPLATE)
+        config_path.write_text(_CONFIG_TEMPLATE.format(provider_name=cn))
         print(f"  ✓ Created: {config_path}")
 
     print()
@@ -79,7 +107,7 @@ def run_init(data_dir: str) -> None:
     if services_path.exists():
         print(f"✓ Services file already exists: {services_path}")
     else:
-        services_path.write_text(_SERVICES_TEMPLATE)
+        services_path.write_text(_SERVICES_TEMPLATE.format(provider_name=cn))
         print(f"  ✓ Created: {services_path}")
 
     print()
@@ -111,12 +139,15 @@ def run_init(data_dir: str) -> None:
     print("  3. Register the IdP in AWS IAM:")
     print("     identity-provider-server")
     print("     curl http://localhost:5000/metadata -o metadata.xml")
-    print("     aws iam create-saml-provider --name local-idp \\")
+    print(f"     aws iam create-saml-provider --name {cn} \\")
     print("       --saml-metadata-document file://metadata.xml")
     print()
     print("  4. Start the server:")
     print()
-    print(f"     identity-provider-server --data-dir {data}")
+    print(f"     gunicorn \"identity_provider_server:create_app('{data}')\" -b 0.0.0.0:5000")
+    print()
+    print("     Or for development (auto-reload):")
+    print(f"     identity-provider-server --data-dir {data} --debug")
     print()
 
 
@@ -132,7 +163,7 @@ server:
 
 # SAML defaults (applied to all SAML SPs unless overridden in services.yaml)
 saml:
-  provider_name: "local-idp"
+  provider_name: "{provider_name}"
   session_duration_hours: 1
 
 # Paths to data files (relative to this directory, or absolute)
@@ -202,7 +233,7 @@ saml:
 # saml:
 #   aws:
 #     url: https://signin.aws.amazon.com/saml
-#     provider_name: my-corp-idp
+#     provider_name: {provider_name}
 #     session_duration_hours: 4
 #     audience: urn:amazon:webservices
 #
