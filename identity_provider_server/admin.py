@@ -326,7 +326,11 @@ def register_admin_routes(
         if not services_path or not services_path.is_file():
             return {}
         import yaml
-        data = yaml.safe_load(services_path.read_text()) or {}
+        try:
+            data = yaml.safe_load(services_path.read_text()) or {}
+        except yaml.YAMLError as e:
+            logger.warning("Failed to parse services.yaml: %s", e)
+            return {}
         return data
 
     def _save_services_yaml(data: dict[str, dict[str, str]]) -> None:
