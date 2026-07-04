@@ -59,11 +59,9 @@ ADMIN_LOGIN = """
       <input type="text" id="username" name="username" required autofocus>
       <label for="password">Password</label>
       <input type="password" id="password" name="password" required>
-      {% if totp_required %}
-      <label for="totp_code">MFA Code</label>
+      <label for="totp_code">MFA Code (if enabled)</label>
       <input type="text" id="totp_code" name="totp_code" maxlength="6" pattern="[0-9]{6}"
              autocomplete="one-time-code" inputmode="numeric" placeholder="6-digit code">
-      {% endif %}
       <div class="challenge">
         <div class="challenge-label">Human verification</div>
         <div class="challenge-question">{{ challenge_question }}</div>
@@ -359,7 +357,7 @@ def register_admin_routes(
         token = _csrf_token()
         question, ch_hash = make_challenge_fn()
         resp = app.make_response(render_template_string(
-            ADMIN_LOGIN, error=None, csrf_token=token, totp_required=False,
+            ADMIN_LOGIN, error=None, csrf_token=token,
             challenge_question=question, challenge_hash=ch_hash,
         ))
         resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
@@ -374,7 +372,7 @@ def register_admin_routes(
             question, ch_hash = make_challenge_fn()
             resp = app.make_response(render_template_string(
                 ADMIN_LOGIN, error="Invalid request (CSRF)", csrf_token=token,
-                totp_required=False, challenge_question=question, challenge_hash=ch_hash,
+                challenge_question=question, challenge_hash=ch_hash,
             ))
             resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
             return resp, 403
@@ -390,7 +388,7 @@ def register_admin_routes(
                 question, ch_hash = make_challenge_fn()
                 resp = app.make_response(render_template_string(
                     ADMIN_LOGIN, error="Incorrect answer — please try again.",
-                    csrf_token=token, totp_required=False,
+                    csrf_token=token,
                     challenge_question=question, challenge_hash=ch_hash,
                 ))
                 resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
@@ -406,28 +404,19 @@ def register_admin_routes(
                 question, ch_hash = make_challenge_fn()
                 resp = app.make_response(render_template_string(
                     ADMIN_LOGIN, error="Invalid credentials", csrf_token=token,
-                    totp_required=False, challenge_question=question, challenge_hash=ch_hash,
+                    challenge_question=question, challenge_hash=ch_hash,
                 ))
                 resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
                 return resp, 401
 
             # Check MFA
             if user.get("totp_secret"):
-                if not totp_code:
-                    token = _csrf_token()
-                    question, ch_hash = make_challenge_fn()
-                    resp = app.make_response(render_template_string(
-                        ADMIN_LOGIN, error="MFA code required", csrf_token=token,
-                        totp_required=True, challenge_question=question, challenge_hash=ch_hash,
-                    ))
-                    resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
-                    return resp, 401
-                if not verify_code(user["totp_secret"], totp_code):
+                if not totp_code or not verify_code(user["totp_secret"], totp_code):
                     token = _csrf_token()
                     question, ch_hash = make_challenge_fn()
                     resp = app.make_response(render_template_string(
                         ADMIN_LOGIN, error="Invalid MFA code", csrf_token=token,
-                        totp_required=True, challenge_question=question, challenge_hash=ch_hash,
+                        challenge_question=question, challenge_hash=ch_hash,
                     ))
                     resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
                     return resp, 401
@@ -438,7 +427,7 @@ def register_admin_routes(
                 question, ch_hash = make_challenge_fn()
                 resp = app.make_response(render_template_string(
                     ADMIN_LOGIN, error="Access denied. You need the 'idpadmin' claim.",
-                    csrf_token=token, totp_required=False,
+                    csrf_token=token,
                     challenge_question=question, challenge_hash=ch_hash,
                 ))
                 resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
@@ -454,7 +443,7 @@ def register_admin_routes(
             token = _csrf_token()
             resp = app.make_response(render_template_string(
                 ADMIN_LOGIN, error="Session expired. Please sign in again.",
-                csrf_token=token, totp_required=False,
+                csrf_token=token,
             ))
             resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
             return resp, 401
