@@ -283,6 +283,7 @@ def register_admin_routes(
     services_path: Path | None = None,
     reload_services_fn=None,
     verify_session_cookie_fn=None,
+    set_session_cookie_fn=None,
 ) -> None:
     """Register /admin routes on the Flask app."""
 
@@ -459,7 +460,10 @@ def register_admin_routes(
                 return resp, 403
 
             auth_token = _issue_token(username)
-            return _render_panel(auth_token)
+            resp = _render_panel(auth_token)
+            if set_session_cookie_fn:
+                set_session_cookie_fn(resp, username)
+            return resp
 
         # All other actions require a valid auth token with idpadmin
         auth_token = request.form.get("auth_token", "")
