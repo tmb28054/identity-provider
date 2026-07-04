@@ -1286,6 +1286,7 @@ def create_app(
         make_challenge_fn=_make_challenge,
         verify_challenge_fn=lambda answer, h: _verify_challenge(app.secret_key, answer, h),
         services_path=services_path,
+        verify_session_cookie_fn=_verify_session_cookie,
     )
 
     return app

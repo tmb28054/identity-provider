@@ -274,6 +274,7 @@ def register_admin_routes(
     verify_challenge_fn=None,
     services_path: Path | None = None,
     reload_services_fn=None,
+    verify_session_cookie_fn=None,
 ) -> None:
     """Register /admin routes on the Flask app."""
 
@@ -354,6 +355,13 @@ def register_admin_routes(
 
     @app.get("/admin")
     def admin_get():
+        # Check session cookie — skip login if user has idpadmin claim
+        if verify_session_cookie_fn:
+            session_user = verify_session_cookie_fn(request.cookies.get("idp_session", ""))
+            if session_user and _has_claim(session_user, "idpadmin"):
+                auth_token = _issue_token(session_user)
+                return _render_panel(auth_token)
+
         token = _csrf_token()
         question, ch_hash = make_challenge_fn()
         resp = app.make_response(render_template_string(
