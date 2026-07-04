@@ -184,7 +184,7 @@ ADMIN_PANEL = """
 
   <h2>Manage Claims</h2>
   <div class="card">
-    <p style="font-size:0.85rem;color:#555;margin-bottom:1rem;">Modify claims for a user:</p>
+    <p style="font-size:0.85rem;color:#555;margin-bottom:1rem;">Modify claims for a user. Current claims are pre-filled when you select a user.</p>
     <form method="post">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <input type="hidden" name="auth_token" value="{{ auth_token }}">
@@ -192,14 +192,23 @@ ADMIN_PANEL = """
       <div class="form-row">
         <div>
           <label>User</label>
-          <select name="claims_user">
-            {% for u in users_list %}<option value="{{ u.username }}">{{ u.username }}</option>{% endfor %}
+          <select name="claims_user" id="claims_user_select" onchange="prefillClaims()">
+            {% for u in users_list %}<option value="{{ u.username }}" data-claims="{{ u.get('claims', [])|join(',') }}">{{ u.username }}</option>{% endfor %}
           </select>
         </div>
-        <div><label>Claims (comma-separated)</label><input type="text" name="user_claims" placeholder="idpadmin,developer"></div>
+        <div><label>Claims (comma-separated)</label><input type="text" name="user_claims" id="user_claims_input" placeholder="idpadmin,developer"></div>
       </div>
       <button type="submit">Update Claims</button>
     </form>
+    <script>
+      function prefillClaims() {
+        var sel = document.getElementById('claims_user_select');
+        var input = document.getElementById('user_claims_input');
+        var opt = sel.options[sel.selectedIndex];
+        input.value = opt.getAttribute('data-claims') || '';
+      }
+      prefillClaims();
+    </script>
     <p style="font-size:0.8rem;color:#888;margin-top:1rem;">All claims in use: {% for c in all_claims %}<span class="badge">{{ c }}</span> {% endfor %}</p>
   </div>
 
