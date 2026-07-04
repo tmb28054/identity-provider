@@ -213,12 +213,13 @@ ADMIN_PANEL = """
   <h2>Service Providers</h2>
   <div class="card">
     <table>
-      <tr><th>Path</th><th>Protocol</th><th>URL</th><th>Actions</th></tr>
+      <tr><th>Path</th><th>Protocol</th><th>URL</th><th>Token Duration</th><th>Actions</th></tr>
       {% for sp in sp_list %}
       <tr>
         <td><code>/{{ sp.path }}</code></td>
         <td><span class="badge">{{ sp.protocol }}</span></td>
         <td style="font-size:0.8rem;word-break:break-all;">{{ sp.url }}</td>
+        <td>{{ sp.token_duration }} min</td>
         <td class="actions">
           <form method="post" style="display:inline" onsubmit="return confirm('Delete service provider /{{ sp.path }}?')">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -232,7 +233,7 @@ ADMIN_PANEL = """
       </tr>
       {% endfor %}
       {% if not sp_list %}
-      <tr><td colspan="4" style="text-align:center;color:#888;">No service providers configured.</td></tr>
+      <tr><td colspan="5" style="text-align:center;color:#888;">No service providers configured.</td></tr>
       {% endif %}
     </table>
   </div>
@@ -255,6 +256,13 @@ ADMIN_PANEL = """
       </div>
       <label>Service Provider URL</label>
       <input type="text" name="sp_url" required placeholder="https://example.com/saml/acs">
+      <div class="form-row">
+        <div>
+          <label>Token duration (minutes)</label>
+          <input type="number" name="sp_token_duration" min="1" max="720" value="60" placeholder="60">
+          <p style="font-size:0.75rem;color:#888;margin-top:-0.5rem;">SAML: session duration. OAuth: JWT expiry. Default: 60 min.</p>
+        </div>
+      </div>
       <button type="submit">Add / Update SP</button>
     </form>
   </div>
@@ -334,12 +342,21 @@ def register_admin_routes(
         users_list = list(users.values())
         all_claims = sorted({c for u in users.values() for c in u.get("claims", [])})
         services_data = _load_services_yaml()
-        # Flatten to a list of {protocol, path, url}
+        # Flatten to a list of {protocol, path, url, token_duration}
         sp_list = []
         for protocol, paths in services_data.items():
             if isinstance(paths, dict):
-                for path, url in paths.items():
-                    sp_list.append({"protocol": protocol, "path": path, "url": url})
+                for path, val in paths.items():
+                    if isinstance(val, dict):
+                        url = val.get("url", "")
+                        if protocol == "oauth":
+                            duration = val.get("token_expiry_minutes", 60)
+                        else:
+                            duration = val.get("session_duration_hours", 1) * 60
+                    else:
+                        url = val
+                        duration = 60
+                    sp_list.append({"protocol": protocol, "path": path, "url": url, "token_duration": duration})
         resp = app.make_response(render_template_string(
             ADMIN_PANEL,
             users_list=users_list,
@@ -541,6 +558,7 @@ def register_admin_routes(
             sp_protocol = request.form.get("sp_protocol", "").strip().lower()
             sp_path = request.form.get("sp_path", "").strip().lower()
             sp_url = request.form.get("sp_url", "").strip()
+            sp_duration_str = request.form.get("sp_token_duration", "60").strip()
 
             if sp_protocol not in ("saml", "oauth"):
                 return _render_panel(auth_token, error="Protocol must be 'saml' or 'oauth'.")
@@ -549,15 +567,40 @@ def register_admin_routes(
             if not sp_url or not sp_url.startswith("https://"):
                 return _render_panel(auth_token, error="URL must start with https://.")
 
+            try:
+                sp_duration = int(sp_duration_str)
+                if sp_duration < 1 or sp_duration > 720:
+                    raise ValueError
+            except ValueError:
+                return _render_panel(auth_token, error="Token duration must be between 1 and 720 minutes.")
+
             data = _load_services_yaml()
             if sp_protocol not in data:
                 data[sp_protocol] = {}
             is_update = sp_path in data.get(sp_protocol, {})
-            data[sp_protocol][sp_path] = sp_url
+
+            # Use extended format to store duration
+            if sp_protocol == "oauth":
+                data[sp_protocol][sp_path] = {
+                    "url": sp_url,
+                    "token_expiry_minutes": sp_duration,
+                }
+            else:
+                # SAML: store as hours (rounded up) for session_duration_hours
+                duration_hours = max(1, (sp_duration + 59) // 60)
+                if sp_duration == 60 and duration_hours == 1:
+                    # Default — use short form
+                    data[sp_protocol][sp_path] = sp_url
+                else:
+                    data[sp_protocol][sp_path] = {
+                        "url": sp_url,
+                        "session_duration_hours": duration_hours,
+                    }
+
             _save_services_yaml(data)
             verb = "updated" if is_update else "added"
-            logger.info("Admin %s %s SP: %s/%s -> %s", admin_user, verb, sp_protocol, sp_path, sp_url)
-            return _render_panel(auth_token, message=f"Service provider '/{sp_path}' ({sp_protocol}) {verb}.")
+            logger.info("Admin %s %s SP: %s/%s -> %s (%d min)", admin_user, verb, sp_protocol, sp_path, sp_url, sp_duration)
+            return _render_panel(auth_token, message=f"Service provider '/{sp_path}' ({sp_protocol}) {verb}. Token duration: {sp_duration} min.")
 
         elif action == "delete_sp":
             sp_protocol = request.form.get("sp_protocol", "").strip().lower()
