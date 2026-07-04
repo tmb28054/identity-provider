@@ -31,10 +31,19 @@ dev = [
     "bandit>=1.7,<2.0",
     "pip-audit>=2.7,<3.0",
 ]
+integration = [
+    "pytest>=8.0,<9.0",
+    "playwright>=1.40",
+    "pytest-playwright>=0.5",
+    "pyotp>=2.9,<3.0",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["smoke: live subprocess smoke tests"]
+markers = [
+    "smoke: live subprocess smoke tests",
+    "integration: end-to-end tests against live IdP (requires network)",
+]
 
 [tool.setuptools.dynamic]
 version = {attr = "identity_provider_server._version.__version__"}

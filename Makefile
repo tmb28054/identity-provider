@@ -1,4 +1,4 @@
-.PHONY: install dev test test-unit test-smoke lint format typecheck docker cert clean
+.PHONY: install dev test test-unit test-smoke test-integration lint format typecheck docker cert clean
 
 install:
 	pip install -e .
@@ -7,13 +7,16 @@ dev:
 	pip install -e ".[all]"
 
 test:
-	python3 -m pytest
+	python3 -m pytest -m "not integration"
 
 test-unit:
-	python3 -m pytest -m "not smoke"
+	python3 -m pytest -m "not smoke and not integration"
 
 test-smoke:
 	python3 -m pytest -m smoke
+
+test-integration:
+	python3 -m pytest tests/integration/ -v --headed=false
 
 lint:
 	ruff check .
