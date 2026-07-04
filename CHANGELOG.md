@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-07-04
+
+### Added
+- `/admin` panel for user and claims management (requires `idpadmin` claim).
+- Admin: add/delete users, reset passwords, remove MFA, manage claims per user.
+- Admin: create, update, and delete service providers from the UI.
+- Admin: token duration field for service providers (SAML session / OAuth JWT expiry).
+- Claims-to-AWS-roles mapping via `claim_roles.yaml` — grant AWS access by assigning claims.
+- Math captcha on all login pages (`/aws`, `/user`, `/admin`).
+- 12-hour session cookie after MFA login — skips re-authentication across all pages.
+- Session cookie shared between `/aws`, `/admin`, and service login routes.
+- Password change functionality on `/user` settings page.
+- `/user` requires MFA verification when MFA is enrolled (security-sensitive page).
+- Claims input pre-fills with current values when selecting a user in admin panel.
+- Playwright integration test suite (27 tests) covering login, session, user, and admin flows.
+- Integration tests run automatically as part of `scripts/deploy.py`.
+- `[integration]` optional dependency group (`playwright`, `pytest-playwright`, `pyotp`).
+- `make test-integration` Makefile target.
+
+### Changed
+- Admin login is now a single page with username, password, MFA code, and captcha (no two-step flow).
+- Default `make test` now excludes integration tests (use `make test-integration` separately).
+
+### Fixed
+- Entity ID uses `https://` scheme when port is 443.
+- SAML provider name correctly passed through `services.yaml` routing.
+- CSRF token validation fixed for multi-worker gunicorn deployments (shared `SECRET_KEY`).
+- Session cookie set on `/admin` login (not just service routes).
+- YAML parse errors in admin SP loader handled gracefully (no 500).
+
 ## [1.3.0] - 2026-06-25
 
 ### Added
