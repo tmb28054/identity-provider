@@ -748,19 +748,6 @@ def create_app(
                 _set_session_cookie(resp, username)
                 return resp
 
-        if not _verify_challenge(app.secret_key, challenge_answer, challenge_hash_val):
-            rate_limiter.record(client_ip)
-            logger.info("Failed challenge from ip=%s", client_ip)
-            question, new_hash = _make_challenge()
-            return render_template_string(
-                LOGIN_FORM,
-                error="Incorrect answer — please try again.",
-                csrf_token=_generate_csrf_token(),
-                challenge_question=question,
-                challenge_hash=new_hash,
-                service_title=title,
-            ), 401
-
         username = request.form.get("username", "")
         password = request.form.get("password", "")
 
@@ -777,6 +764,27 @@ def create_app(
                 challenge_hash=new_hash,
                 service_title=title,
             ), 401
+
+        # If user has MFA, skip captcha (TOTP proves they're human).
+        # If no MFA, enforce the captcha.
+        user_has_mfa = False
+        if not use_adfs:
+            user = users.get(username)
+            user_has_mfa = bool(user and user.get("totp_secret"))
+
+        if not user_has_mfa:
+            if not _verify_challenge(app.secret_key, challenge_answer, challenge_hash_val):
+                rate_limiter.record(client_ip)
+                logger.info("Failed challenge from ip=%s", client_ip)
+                question, new_hash = _make_challenge()
+                return render_template_string(
+                    LOGIN_FORM,
+                    error="Incorrect answer — please try again.",
+                    csrf_token=_generate_csrf_token(),
+                    challenge_question=question,
+                    challenge_hash=new_hash,
+                    service_title=title,
+                ), 401
 
         # Resolve roles for ADFS mode
         if use_adfs:

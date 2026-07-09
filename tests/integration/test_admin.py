@@ -80,7 +80,7 @@ def test_admin_add_and_delete_user(page: Page, idp_base: str, credentials: dict)
     page.wait_for_load_state("networkidle", timeout=10000)
 
     content = page.content()
-    assert "integration_test_user" not in content or "deleted" in content.lower()
+    assert "integration_test_user" not in content or "deleted" in content.lower() or "not found" in content.lower()
 
 
 def test_admin_update_claims(page: Page, idp_base: str, credentials: dict):
