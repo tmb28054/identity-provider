@@ -129,6 +129,36 @@ SAML_POST = """
 </form></body>
 """
 
+LOGOUT_PAGE = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Logged Out</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f4f6f9; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .card { background: #fff; border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+      padding: 2rem; width: 100%; max-width: 380px; text-align: center; }
+    h1 { font-size: 1.4rem; margin-bottom: 1rem; color: #232f3e; }
+    p { font-size: 0.9rem; color: #555; margin-bottom: 1.5rem; }
+    a { display: inline-block; padding: 0.6rem 1.5rem; background: #0073bb; color: #fff;
+      border-radius: 4px; text-decoration: none; font-size: 0.95rem; }
+    a:hover { background: #005a94; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Logged Out</h1>
+    <p>Your session has been cleared.</p>
+    <a href="/{{ service_path }}">Sign in again</a>
+  </div>
+</body>
+</html>
+"""
+
 TOTP_FORM = """
 <!doctype html>
 <html lang="en">
@@ -1236,6 +1266,17 @@ def create_app(
                 _post.__name__ = f"login_post_{path}"
                 return _post
 
+            def _make_logout(path: str):
+                def _logout():
+                    resp = app.make_response(render_template_string(
+                        LOGOUT_PAGE, service_path=path,
+                    ))
+                    resp.delete_cookie(SESSION_COOKIE_NAME)
+                    resp.delete_cookie("csrf_token")
+                    return resp
+                _logout.__name__ = f"logout_{path}"
+                return _logout
+
             app.add_url_rule(
                 f"/{sp.path}", endpoint=f"get_{sp.path}",
                 view_func=_make_get(sp.path), methods=["GET"],
@@ -1243,6 +1284,10 @@ def create_app(
             app.add_url_rule(
                 f"/{sp.path}", endpoint=f"post_{sp.path}",
                 view_func=_make_post(sp.path), methods=["POST"],
+            )
+            app.add_url_rule(
+                f"/{sp.path}/logout", endpoint=f"logout_{sp.path}",
+                view_func=_make_logout(sp.path), methods=["GET"],
             )
     else:
         # Fallback: single /aws route (backward compatible)
@@ -1253,6 +1298,15 @@ def create_app(
         @app.post("/aws")
         def login_post():
             return _handle_login_post("aws")
+
+        @app.get("/aws/logout")
+        def logout_aws():
+            resp = app.make_response(render_template_string(
+                LOGOUT_PAGE, service_path="aws",
+            ))
+            resp.delete_cookie(SESSION_COOKIE_NAME)
+            resp.delete_cookie("csrf_token")
+            return resp
 
     @app.get("/metadata")
     def metadata():
