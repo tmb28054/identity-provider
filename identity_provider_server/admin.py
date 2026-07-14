@@ -334,13 +334,18 @@ def register_admin_routes(
         return data
 
     def _save_services_yaml(data: dict[str, dict[str, str]]) -> None:
-        """Save services data to services.yaml."""
+        """Save services data to services.yaml and restart the server to register new routes."""
         if not services_path:
             return
         import yaml
         services_path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
         if reload_services_fn:
             reload_services_fn()
+        # Restart gunicorn to register new/removed routes
+        import os
+        import signal
+        os.kill(os.getppid(), signal.SIGHUP)
+        logger.info("Sent SIGHUP to gunicorn master (pid=%d) to reload routes", os.getppid())
 
     def _render_panel(auth_token: str, message: str = "", error: str = ""):
         token = _csrf_token()
