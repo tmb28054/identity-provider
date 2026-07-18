@@ -35,6 +35,7 @@ def build_oauth_token(
     scopes: list[str] | None = None,
     token_expiry_minutes: int = 60,
     groups: list[str] | None = None,
+    claims: list[str] | None = None,
 ) -> str:
     """Build a signed JWT access token.
 
@@ -46,6 +47,7 @@ def build_oauth_token(
         scopes: List of granted scopes (becomes the 'scope' claim).
         token_expiry_minutes: Token validity in minutes.
         groups: Optional list of group memberships (becomes the 'groups' claim).
+        claims: Optional list of user claims (becomes the 'claims' claim).
 
     Returns:
         Signed JWT string (header.payload.signature).
@@ -70,6 +72,8 @@ def build_oauth_token(
 
     if groups:
         payload["groups"] = groups
+    if claims:
+        payload["claims"] = claims
 
     header_b64 = _b64url(json.dumps(header, separators=(",", ":")).encode())
     payload_b64 = _b64url(json.dumps(payload, separators=(",", ":")).encode())

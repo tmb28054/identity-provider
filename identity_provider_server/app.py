@@ -626,6 +626,7 @@ def create_app(
                         session_user, key_pem, idp_entity_id,
                         client_id=sp.client_id, scopes=sp.scopes,
                         token_expiry_minutes=sp.token_expiry_minutes, groups=None,
+                        claims=user.get("claims", []),
                     )
                     separator = "&" if "?" in sp.url else "?"
                     return redirect(f"{sp.url}{separator}token={token}")
@@ -747,6 +748,7 @@ def create_app(
                     username, key_pem, idp_entity_id,
                     client_id=sp.client_id, scopes=sp.scopes,
                     token_expiry_minutes=sp.token_expiry_minutes, groups=groups,
+                    claims=users.get(username, {}).get("claims", []),
                 )
                 separator = "&" if "?" in sp.url else "?"
                 resp = redirect(f"{sp.url}{separator}token={token}")
@@ -858,6 +860,7 @@ def create_app(
                 scopes=sp.scopes,
                 token_expiry_minutes=sp.token_expiry_minutes,
                 groups=groups,
+                claims=users.get(username, {}).get("claims", []),
             )
             separator = "&" if "?" in sp.url else "?"
             return redirect(f"{sp.url}{separator}token={token}")
