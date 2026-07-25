@@ -481,6 +481,7 @@ def register_admin_routes(
             error=error,
         ))
         resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
 
     @app.get("/admin")
@@ -499,6 +500,7 @@ def register_admin_routes(
             challenge_question=question, challenge_hash=ch_hash,
         ))
         resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
 
     @app.post("/admin")
@@ -800,6 +802,7 @@ def register_admin_routes(
             error=error,
         ))
         resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
 
     @app.get("/admin/user/<target_username>")
