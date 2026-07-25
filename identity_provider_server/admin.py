@@ -120,7 +120,7 @@ ADMIN_PANEL = """
 </head>
 <body>
 <div class="container">
-  <h1>Admin Panel</h1>
+  <h1>Admin Panel <a href="/admin" style="font-size:0.7rem;color:#0073bb;text-decoration:none;margin-left:1rem;">↻ Reload</a></h1>
   {% if message %}<p class="success">{{ message }}</p>{% endif %}
   {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
