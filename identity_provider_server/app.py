@@ -159,6 +159,73 @@ LOGOUT_PAGE = """
 </html>
 """
 
+RECOVERY_PAGE = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Account Recovery</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f4f6f9; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .card { background: #fff; border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+      padding: 2rem; width: 100%; max-width: 420px; }
+    h1 { font-size: 1.4rem; margin-bottom: 0.5rem; color: #232f3e; }
+    .subtitle { font-size: 0.9rem; color: #555; margin-bottom: 1.5rem; }
+    h2 { font-size: 1.1rem; color: #232f3e; margin: 1.5rem 0 0.75rem; border-top: 1px solid #eee; padding-top: 1rem; }
+    label { display: block; font-size: 0.85rem; color: #555; margin-bottom: 0.3rem; }
+    input[type="text"], input[type="password"] { width: 100%; padding: 0.6rem 0.75rem;
+      border: 1px solid #ccc; border-radius: 4px; font-size: 0.95rem; margin-bottom: 1rem; }
+    button { width: 100%; padding: 0.7rem; background: #0073bb; color: #fff; border: none;
+      border-radius: 4px; font-size: 1rem; cursor: pointer; }
+    button:hover { background: #005a94; }
+    .error { color: #d13212; font-size: 0.85rem; margin-bottom: 1rem; }
+    .success { color: #1d8102; font-size: 0.9rem; margin-bottom: 1rem; }
+    .qr { text-align: center; margin: 1rem 0; }
+    .qr img { border: 4px solid #eee; border-radius: 8px; }
+    .secret-code { background: #f0f4f8; border: 1px solid #d5dce6; border-radius: 4px;
+      padding: 0.5rem; text-align: center; font-family: monospace; font-size: 0.9rem;
+      letter-spacing: 2px; margin-bottom: 1rem; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Account Recovery</h1>
+    <p class="subtitle">Hello, {{ username }}. Set your new password{% if qr_data_uri %} and enable MFA{% endif %}.</p>
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    {% if success %}<p class="success">{{ success }}</p>{% endif %}
+
+    {% if not success %}
+    <form method="post">
+      <input type="hidden" name="recovery_token" value="{{ recovery_token }}">
+
+      <label for="new_password">New password (min 8 characters)</label>
+      <input type="password" id="new_password" name="new_password" required minlength="8">
+      <label for="confirm_password">Confirm password</label>
+      <input type="password" id="confirm_password" name="confirm_password" required minlength="8">
+
+      {% if qr_data_uri %}
+      <h2 style="border-top:none;margin-top:1rem;padding-top:0;">Set up MFA (optional)</h2>
+      <p style="font-size:0.85rem;color:#555;margin-bottom:0.75rem;">Scan with your authenticator app:</p>
+      <div class="qr"><img src="{{ qr_data_uri }}" alt="QR Code" width="180" height="180"></div>
+      <p style="font-size:0.8rem;color:#666;margin-bottom:0.5rem;">Manual key:</p>
+      <div class="secret-code">{{ totp_secret }}</div>
+      <input type="hidden" name="totp_secret" value="{{ totp_secret }}">
+      <label for="totp_code">Enter 6-digit code to confirm MFA (leave blank to skip)</label>
+      <input type="text" id="totp_code" name="totp_code" maxlength="6" pattern="[0-9]{6}"
+             autocomplete="one-time-code" inputmode="numeric" placeholder="Optional">
+      {% endif %}
+
+      <button type="submit">Save</button>
+    </form>
+    {% endif %}
+  </div>
+</body>
+</html>
+"""
+
 TOTP_FORM = """
 <!doctype html>
 <html lang="en">
@@ -1346,6 +1413,93 @@ def create_app(
 {sso_entries}  </IDPSSODescriptor>
 </EntityDescriptor>"""
         return app.response_class(xml, mimetype="application/xml")
+
+    # --- Recovery route ---
+    @app.get("/recover/<recovery_token>")
+    def recover_get(recovery_token: str):
+        from .admin import validate_recovery_token, consume_recovery_token
+        username = validate_recovery_token(recovery_token)
+        if not username:
+            return render_template_string(
+                RECOVERY_PAGE, username="", recovery_token="",
+                error="This recovery link is invalid or has expired.",
+                success=None, qr_data_uri="", totp_secret="",
+            ), 404
+
+        # Generate TOTP secret for optional MFA enrollment
+        totp_secret = generate_secret()
+        uri = provisioning_uri(totp_secret, username, issuer="idp.botthouse.net")
+        qr_uri = qr_code_data_uri(uri)
+
+        return render_template_string(
+            RECOVERY_PAGE, username=username, recovery_token=recovery_token,
+            error=None, success=None, qr_data_uri=qr_uri, totp_secret=totp_secret,
+        )
+
+    @app.post("/recover/<recovery_token>")
+    def recover_post(recovery_token: str):
+        from .admin import validate_recovery_token, consume_recovery_token
+        username = validate_recovery_token(recovery_token)
+        if not username:
+            return render_template_string(
+                RECOVERY_PAGE, username="", recovery_token="",
+                error="This recovery link is invalid or has expired.",
+                success=None, qr_data_uri="", totp_secret="",
+            ), 404
+
+        new_password = request.form.get("new_password", "")
+        confirm_password = request.form.get("confirm_password", "")
+        totp_secret = request.form.get("totp_secret", "")
+        totp_code = request.form.get("totp_code", "")
+
+        # Validate password
+        if len(new_password) < 8:
+            uri = provisioning_uri(totp_secret, username, issuer="idp.botthouse.net")
+            return render_template_string(
+                RECOVERY_PAGE, username=username, recovery_token=recovery_token,
+                error="Password must be at least 8 characters.",
+                success=None, qr_data_uri=qr_code_data_uri(uri), totp_secret=totp_secret,
+            )
+        if new_password != confirm_password:
+            uri = provisioning_uri(totp_secret, username, issuer="idp.botthouse.net")
+            return render_template_string(
+                RECOVERY_PAGE, username=username, recovery_token=recovery_token,
+                error="Passwords do not match.",
+                success=None, qr_data_uri=qr_code_data_uri(uri), totp_secret=totp_secret,
+            )
+
+        # Validate TOTP if provided
+        mfa_enrolled = False
+        if totp_code and totp_secret:
+            if not verify_code(totp_secret, totp_code):
+                uri = provisioning_uri(totp_secret, username, issuer="idp.botthouse.net")
+                return render_template_string(
+                    RECOVERY_PAGE, username=username, recovery_token=recovery_token,
+                    error="Invalid MFA code. Try again.",
+                    success=None, qr_data_uri=qr_code_data_uri(uri), totp_secret=totp_secret,
+                )
+            mfa_enrolled = True
+
+        # Apply changes
+        import bcrypt as _bcrypt
+        user = users.get(username)
+        if user:
+            user["password"] = _bcrypt.hashpw(new_password.encode(), _bcrypt.gensalt()).decode()
+            if mfa_enrolled:
+                user["totp_secret"] = totp_secret
+            if users_path:
+                _save_users(users_path, users)
+            logger.info("Recovery completed for user=%s (MFA=%s)", username, mfa_enrolled)
+
+        # Consume the token (single-use)
+        consume_recovery_token(recovery_token)
+
+        mfa_msg = " MFA has been enabled." if mfa_enrolled else ""
+        return render_template_string(
+            RECOVERY_PAGE, username=username, recovery_token="",
+            error=None, success=f"Password updated successfully.{mfa_msg} You can now log in.",
+            qr_data_uri="", totp_secret="",
+        )
 
     # --- Admin panel ---
     from .admin import register_admin_routes

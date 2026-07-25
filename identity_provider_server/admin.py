@@ -353,6 +353,22 @@ ADMIN_USER_DETAIL = """
     <div class="info-row"><span class="label">MFA:</span> {{ 'Enabled' if user.get('totp_secret') else 'Disabled' }}</div>
     <div class="info-row"><span class="label">Claims:</span> {{ user.get('claims', [])|length }}</div>
   </div>
+
+  <h2>Recovery Link</h2>
+  <div class="card">
+    <p style="font-size:0.85rem;color:#555;margin-bottom:0.75rem;">Generate a one-time link for this user to reset their password and set up MFA. The link expires after 24 hours.</p>
+    {% if recovery_url %}
+    <div style="background:#f0f4f8;border:1px solid #d5dce6;border-radius:4px;padding:0.75rem;margin-bottom:1rem;word-break:break-all;font-family:monospace;font-size:0.85rem;">{{ recovery_url }}</div>
+    <p style="font-size:0.8rem;color:#888;">Copy this link and send it to the user. It can only be used once.</p>
+    {% else %}
+    <form method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="auth_token" value="{{ auth_token }}">
+      <input type="hidden" name="action" value="generate_recovery">
+      <button type="submit">Generate Recovery Link</button>
+    </form>
+    {% endif %}
+  </div>
 </div>
 </body>
 </html>
@@ -421,6 +437,58 @@ def register_admin_routes(
         claims_file = users_path.parent / "claims.json" if users_path else None
         if claims_file:
             claims_file.write_text(json.dumps(sorted(set(claims)), indent=2) + "\n")
+
+    # --- Recovery tokens ---
+    RECOVERY_TOKEN_EXPIRY = 24 * 3600  # 24 hours
+
+    def _recovery_tokens_path() -> Path | None:
+        return users_path.parent / "recovery_tokens.json" if users_path else None
+
+    def _load_recovery_tokens() -> dict[str, dict]:
+        path = _recovery_tokens_path()
+        if path and path.is_file():
+            return json.loads(path.read_text())
+        return {}
+
+    def _save_recovery_tokens(tokens: dict[str, dict]) -> None:
+        path = _recovery_tokens_path()
+        if path:
+            path.write_text(json.dumps(tokens, indent=2) + "\n")
+
+    def _generate_recovery_token(username: str) -> str:
+        """Generate a secure recovery token for a user. Returns the token string."""
+        token = secrets.token_urlsafe(48)  # 64 chars, 384 bits of entropy
+        tokens = _load_recovery_tokens()
+        # Prune expired tokens
+        now = time.time()
+        tokens = {k: v for k, v in tokens.items() if v.get("expires", 0) > now}
+        # Store new token
+        tokens[token] = {
+            "username": username,
+            "created": now,
+            "expires": now + RECOVERY_TOKEN_EXPIRY,
+        }
+        _save_recovery_tokens(tokens)
+        return token
+
+    def _validate_recovery_token(token: str) -> str | None:
+        """Validate and consume a recovery token. Returns username or None."""
+        tokens = _load_recovery_tokens()
+        entry = tokens.get(token)
+        if not entry:
+            return None
+        if time.time() > entry.get("expires", 0):
+            # Expired — clean up
+            del tokens[token]
+            _save_recovery_tokens(tokens)
+            return None
+        return entry.get("username")
+
+    def _consume_recovery_token(token: str) -> None:
+        """Delete a recovery token after use."""
+        tokens = _load_recovery_tokens()
+        tokens.pop(token, None)
+        _save_recovery_tokens(tokens)
 
     def _load_services_yaml() -> dict[str, dict[str, str]]:
         """Load services.yaml and return as {protocol: {path: url}}."""
@@ -782,7 +850,7 @@ def register_admin_routes(
         return _render_panel(auth_token, error="Unknown action.")
 
     # --- User detail page ---
-    def _render_user_detail(username: str, auth_token: str, message: str = "", error: str = ""):
+    def _render_user_detail(username: str, auth_token: str, message: str = "", error: str = "", recovery_url: str = ""):
         user = users.get(username)
         if not user:
             return _render_panel(auth_token, error=f"User '{username}' not found.")
@@ -798,6 +866,7 @@ def register_admin_routes(
             auth_token=auth_token,
             message=message,
             error=error,
+            recovery_url=recovery_url,
         ))
         resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -852,4 +921,20 @@ def register_admin_routes(
                 return _render_user_detail(target_username, auth_token, message=f"Claim '{claim_name}' removed.")
             return _render_user_detail(target_username, auth_token, error=f"Claim '{claim_name}' not found on user.")
 
+        elif action == "generate_recovery":
+            token = _generate_recovery_token(target_username)
+            recovery_url = f"https://idp.botthouse.net/recover/{token}"
+            logger.info("Admin %s generated recovery link for %s", admin_user, target_username)
+            return _render_user_detail(target_username, auth_token, recovery_url=recovery_url)
+
         return _render_user_detail(target_username, auth_token)
+
+    # Expose recovery token functions at module level for use by app.py
+    import identity_provider_server.admin as _admin_module
+    _admin_module.validate_recovery_token = _validate_recovery_token
+    _admin_module.consume_recovery_token = _consume_recovery_token
+
+
+# Module-level references set by register_admin_routes for use by recovery routes
+validate_recovery_token = None
+consume_recovery_token = None
