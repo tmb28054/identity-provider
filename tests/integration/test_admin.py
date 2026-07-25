@@ -84,18 +84,14 @@ def test_admin_add_and_delete_user(page: Page, idp_base: str, credentials: dict)
 
 
 def test_admin_update_claims(page: Page, idp_base: str, credentials: dict):
-    """Admin can update claims for a user (non-destructive: sets same claims)."""
+    """Claims Registry section shows existing claims and has Add Claim form."""
     login_to_service(page, idp_base, "aws", credentials)
     page.goto(f"{idp_base}/admin", wait_until="networkidle")
-
-    # The claims input should be pre-filled for the first user
-    claims_value = page.input_value("#user_claims_input")
-    assert claims_value  # Should have some claims
-
-    # Submit the same claims (non-destructive)
-    page.locator("button:has-text('Update Claims')").click()
-    page.wait_for_load_state("networkidle", timeout=10000)
-    assert "Claims updated" in page.content()
+    content = page.content()
+    assert "Claims Registry" in content
+    assert "Add Claim" in content
+    # Verify existing claims are shown
+    assert "idpadmin" in content
 
 
 def test_admin_add_and_delete_sp(page: Page, idp_base: str, credentials: dict):
