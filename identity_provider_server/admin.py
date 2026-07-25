@@ -298,7 +298,7 @@ def register_admin_routes(
         sig = hmac.new(app.secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
         return f"{payload}:{sig}"
 
-    def _verify_token(token: str, max_age: int = 600) -> str | None:
+    def _verify_token(token: str, max_age: int = 3600) -> str | None:
         parts = token.rsplit(":", 1)
         if len(parts) != 2:
             return None
