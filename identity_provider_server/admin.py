@@ -130,7 +130,7 @@ ADMIN_PANEL = """
       <tr><th>Username</th><th>Email</th><th>Claims</th><th>MFA</th><th>Actions</th></tr>
       {% for u in users_list %}
       <tr>
-        <td><strong>{{ u.username }}</strong></td>
+        <td><a href="/admin/user/{{ u.username }}" style="color:#0073bb;text-decoration:none;font-weight:600;">{{ u.username }}</a></td>
         <td style="font-size:0.85rem;">{{ u.get('email', '') }}</td>
         <td>{% for c in u.get('claims', []) %}<span class="badge">{{ c }}</span>{% endfor %}</td>
         <td>{% if u.get('totp_secret') %}<span class="badge badge-mfa">MFA</span>{% else %}—{% endif %}</td>
@@ -183,34 +183,28 @@ ADMIN_PANEL = """
     </form>
   </div>
 
-  <h2>Manage Claims</h2>
+  <h2>Claims Registry</h2>
   <div class="card">
-    <p style="font-size:0.85rem;color:#555;margin-bottom:1rem;">Modify claims for a user. Current claims are pre-filled when you select a user.</p>
-    <form method="post">
+    <p style="font-size:0.85rem;color:#555;margin-bottom:0.75rem;">Defined claims (click a username above to assign claims to users):</p>
+    <div style="margin-bottom:1rem;">
+      {% for c in all_claims %}<span class="badge" style="font-size:0.85rem;padding:4px 10px;">{{ c }}
+        <form method="post" style="display:inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="auth_token" value="{{ auth_token }}">
+          <input type="hidden" name="action" value="delete_claim">
+          <input type="hidden" name="claim_name" value="{{ c }}">
+          <button style="background:none;border:none;color:#d13212;cursor:pointer;font-size:0.75rem;padding:0 3px;" title="Delete claim" onclick="return confirm('Delete claim {{ c }}? It will be removed from all users.')">✕</button>
+        </form>
+      </span>{% endfor %}
+      {% if not all_claims %}<span style="color:#888;font-size:0.85rem;">No claims defined yet.</span>{% endif %}
+    </div>
+    <form method="post" style="display:flex;gap:0.5rem;align-items:flex-end;">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <input type="hidden" name="auth_token" value="{{ auth_token }}">
-      <input type="hidden" name="action" value="set_claims">
-      <div class="form-row">
-        <div>
-          <label>User</label>
-          <select name="claims_user" id="claims_user_select" onchange="prefillClaims()">
-            {% for u in users_list %}<option value="{{ u.username }}" data-claims="{{ u.get('claims', [])|join(',') }}">{{ u.username }}</option>{% endfor %}
-          </select>
-        </div>
-        <div><label>Claims (comma-separated)</label><input type="text" name="user_claims" id="user_claims_input" placeholder="idpadmin,developer"></div>
-      </div>
-      <button type="submit">Update Claims</button>
+      <input type="hidden" name="action" value="add_claim">
+      <div style="flex:1;"><label>New claim name</label><input type="text" name="claim_name" required pattern="[a-zA-Z0-9_-]+" placeholder="e.g. wiki-admin" style="margin-bottom:0;"></div>
+      <button type="submit" style="margin-bottom:0;">Add Claim</button>
     </form>
-    <script>
-      function prefillClaims() {
-        var sel = document.getElementById('claims_user_select');
-        var input = document.getElementById('user_claims_input');
-        var opt = sel.options[sel.selectedIndex];
-        input.value = opt.getAttribute('data-claims') || '';
-      }
-      prefillClaims();
-    </script>
-    <p style="font-size:0.8rem;color:#888;margin-top:1rem;">All claims in use: {% for c in all_claims %}<span class="badge">{{ c }}</span> {% endfor %}</p>
   </div>
 
   <h2>Service Providers</h2>
@@ -275,6 +269,96 @@ ADMIN_PANEL = """
 """
 
 
+ADMIN_USER_DETAIL = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>User: {{ user.username }}</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f4f6f9; padding: 2rem; }
+    .container { max-width: 700px; margin: 0 auto; }
+    h1 { font-size: 1.6rem; color: #232f3e; margin-bottom: 0.5rem; }
+    .subtitle { font-size: 0.9rem; color: #555; margin-bottom: 1.5rem; }
+    h2 { font-size: 1.2rem; color: #232f3e; margin: 2rem 0 1rem; border-bottom: 2px solid #0073bb; padding-bottom: 0.5rem; }
+    .card { background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+      padding: 1.5rem; margin-bottom: 1.5rem; }
+    .badge { display: inline-flex; align-items: center; background: #e8f5e9; color: #1d8102; padding: 4px 10px;
+      border-radius: 12px; font-size: 0.85rem; margin: 3px 4px; }
+    .badge form { display: inline; margin-left: 6px; }
+    .badge button { background: none; border: none; color: #d13212; cursor: pointer; font-size: 0.8rem; padding: 0; }
+    label { display: block; font-size: 0.85rem; color: #555; margin-bottom: 0.3rem; }
+    select, input[type="text"] { width: 100%; padding: 0.5rem 0.6rem; border: 1px solid #ccc;
+      border-radius: 4px; font-size: 0.9rem; margin-bottom: 0.75rem; }
+    button, .btn { padding: 0.5rem 1rem; background: #0073bb; color: #fff; border: none;
+      border-radius: 4px; font-size: 0.85rem; cursor: pointer; text-decoration: none; display: inline-block; }
+    button:hover, .btn:hover { background: #005a94; }
+    .back-link { display: inline-block; margin-bottom: 1rem; color: #0073bb; text-decoration: none; font-size: 0.9rem; }
+    .back-link:hover { text-decoration: underline; }
+    .success { color: #1d8102; font-size: 0.9rem; margin-bottom: 1rem; padding: 0.5rem;
+      background: #e8f5e9; border-radius: 4px; }
+    .error { color: #d13212; font-size: 0.9rem; margin-bottom: 1rem; padding: 0.5rem;
+      background: #fde8e8; border-radius: 4px; }
+    .info-row { display: flex; gap: 2rem; margin-bottom: 0.5rem; font-size: 0.9rem; }
+    .info-row .label { color: #555; min-width: 80px; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <a href="/admin" class="back-link">← Back to Admin Panel</a>
+  <h1>{{ user.username }}</h1>
+  <p class="subtitle">{{ user.get('email', 'No email set') }}</p>
+  {% if message %}<p class="success">{{ message }}</p>{% endif %}
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+  <h2>User Claims</h2>
+  <div class="card">
+    <div style="margin-bottom:1rem;">
+      {% for c in user.get('claims', []) %}
+      <span class="badge">{{ c }}
+        <form method="post">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="auth_token" value="{{ auth_token }}">
+          <input type="hidden" name="action" value="remove_user_claim">
+          <input type="hidden" name="claim_name" value="{{ c }}">
+          <button type="submit" title="Remove this claim">✕</button>
+        </form>
+      </span>
+      {% endfor %}
+      {% if not user.get('claims', []) %}<span style="color:#888;font-size:0.85rem;">No claims assigned.</span>{% endif %}
+    </div>
+
+    <form method="post" style="display:flex;gap:0.5rem;align-items:flex-end;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="auth_token" value="{{ auth_token }}">
+      <input type="hidden" name="action" value="add_user_claim">
+      <div style="flex:1;">
+        <label>Add claim</label>
+        <select name="claim_name" style="margin-bottom:0;">
+          {% for c in available_claims %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+          {% if not available_claims %}<option disabled>No claims available to add</option>{% endif %}
+        </select>
+      </div>
+      <button type="submit" style="margin-bottom:0;" {% if not available_claims %}disabled{% endif %}>Add</button>
+    </form>
+  </div>
+
+  <h2>Details</h2>
+  <div class="card">
+    <div class="info-row"><span class="label">Username:</span> {{ user.username }}</div>
+    <div class="info-row"><span class="label">Email:</span> {{ user.get('email', '—') }}</div>
+    <div class="info-row"><span class="label">MFA:</span> {{ 'Enabled' if user.get('totp_secret') else 'Disabled' }}</div>
+    <div class="info-row"><span class="label">Claims:</span> {{ user.get('claims', [])|length }}</div>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+
 def register_admin_routes(
     app: Flask,
     users: dict[str, Any],
@@ -324,6 +408,22 @@ def register_admin_routes(
             return False
         return claim in user.get("claims", [])
 
+    def _load_claims_registry() -> list[str]:
+        """Load the claims registry from claims.json (or derive from users)."""
+        claims_file = Path(app.config.get("DATA_DIR", "")) / "claims.json" if users_path else None
+        if claims_file is None and users_path:
+            claims_file = users_path.parent / "claims.json"
+        if claims_file and claims_file.is_file():
+            return json.loads(claims_file.read_text())
+        # Fallback: derive from all users' claims
+        return sorted({c for u in users.values() for c in u.get("claims", [])})
+
+    def _save_claims_registry(claims: list[str]) -> None:
+        """Save the claims registry to claims.json."""
+        claims_file = users_path.parent / "claims.json" if users_path else None
+        if claims_file:
+            claims_file.write_text(json.dumps(sorted(set(claims)), indent=2) + "\n")
+
     def _load_services_yaml() -> dict[str, dict[str, str]]:
         """Load services.yaml and return as {protocol: {path: url}}."""
         if not services_path or not services_path.is_file():
@@ -353,7 +453,7 @@ def register_admin_routes(
     def _render_panel(auth_token: str, message: str = "", error: str = ""):
         token = _csrf_token()
         users_list = list(users.values())
-        all_claims = sorted({c for u in users.values() for c in u.get("claims", [])})
+        all_claims = _load_claims_registry()
         services_data = _load_services_yaml()
         # Flatten to a list of {protocol, path, url, token_duration}
         sp_list = []
@@ -575,6 +675,47 @@ def register_admin_routes(
             logger.info("Admin %s set claims for %s: %s", admin_user, target, claims)
             return _render_panel(auth_token, message=f"Claims updated for '{target}'.")
 
+        elif action == "add_claim":
+            claim_name = request.form.get("claim_name", "").strip().lower()
+            if not claim_name or not claim_name.replace("-", "").replace("_", "").isalnum():
+                return _render_panel(auth_token, error="Claim name must be URL-safe (letters, numbers, hyphens, underscores).")
+            registry = _load_claims_registry()
+            if claim_name in registry:
+                return _render_panel(auth_token, error=f"Claim '{claim_name}' already exists.")
+            registry.append(claim_name)
+            _save_claims_registry(registry)
+            logger.info("Admin %s added claim: %s", admin_user, claim_name)
+            return _render_panel(auth_token, message=f"Claim '{claim_name}' added.")
+
+        elif action == "delete_claim":
+            claim_name = request.form.get("claim_name", "").strip()
+            registry = _load_claims_registry()
+            if claim_name not in registry:
+                return _render_panel(auth_token, error=f"Claim '{claim_name}' not found.")
+            registry.remove(claim_name)
+            _save_claims_registry(registry)
+            # Also remove from all users
+            for u in users.values():
+                if claim_name in u.get("claims", []):
+                    u["claims"].remove(claim_name)
+            if users_path:
+                save_users_fn(users_path, users)
+            logger.info("Admin %s deleted claim: %s (removed from all users)", admin_user, claim_name)
+            return _render_panel(auth_token, message=f"Claim '{claim_name}' deleted and removed from all users.")
+
+        elif action == "set_claims":
+            target = request.form.get("claims_user", "")
+            claims_str = request.form.get("user_claims", "").strip()
+            user = users.get(target)
+            if not user:
+                return _render_panel(auth_token, error=f"User '{target}' not found.")
+            claims = [c.strip() for c in claims_str.split(",") if c.strip()]
+            user["claims"] = claims
+            if users_path:
+                save_users_fn(users_path, users)
+            logger.info("Admin %s set claims for %s: %s", admin_user, target, claims)
+            return _render_panel(auth_token, message=f"Claims updated for '{target}'.")
+
         elif action == "upsert_sp":
             sp_protocol = request.form.get("sp_protocol", "").strip().lower()
             sp_path = request.form.get("sp_path", "").strip().lower()
@@ -639,3 +780,75 @@ def register_admin_routes(
             return _render_panel(auth_token, error=f"Service provider '/{sp_path}' not found.")
 
         return _render_panel(auth_token, error="Unknown action.")
+
+    # --- User detail page ---
+    def _render_user_detail(username: str, auth_token: str, message: str = "", error: str = ""):
+        user = users.get(username)
+        if not user:
+            return _render_panel(auth_token, error=f"User '{username}' not found.")
+        token = _csrf_token()
+        registry = _load_claims_registry()
+        user_claims = set(user.get("claims", []))
+        available = [c for c in registry if c not in user_claims]
+        resp = app.make_response(render_template_string(
+            ADMIN_USER_DETAIL,
+            user=user,
+            available_claims=available,
+            csrf_token=token,
+            auth_token=auth_token,
+            message=message,
+            error=error,
+        ))
+        resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+        return resp
+
+    @app.get("/admin/user/<target_username>")
+    def admin_user_detail_get(target_username: str):
+        # Check session cookie
+        if verify_session_cookie_fn:
+            session_user = verify_session_cookie_fn(request.cookies.get("idp_session", ""))
+            if session_user and _has_claim(session_user, "idpadmin"):
+                auth_token = _issue_token(session_user)
+                return _render_user_detail(target_username, auth_token)
+        # No session — redirect to admin login
+        return app.redirect("/admin")
+
+    @app.post("/admin/user/<target_username>")
+    def admin_user_detail_post(target_username: str):
+        form_token = request.form.get("csrf_token", "")
+        cookie_token = request.cookies.get("csrf_token", "")
+        if not form_token or not hmac.compare_digest(form_token, cookie_token):
+            return app.redirect("/admin")
+
+        auth_token = request.form.get("auth_token", "")
+        admin_user = _verify_token(auth_token)
+        if not admin_user or not _has_claim(admin_user, "idpadmin"):
+            return app.redirect("/admin")
+
+        auth_token = _issue_token(admin_user)
+        action = request.form.get("action", "")
+        user = users.get(target_username)
+        if not user:
+            return _render_panel(auth_token, error=f"User '{target_username}' not found.")
+
+        if action == "add_user_claim":
+            claim_name = request.form.get("claim_name", "").strip()
+            if claim_name and claim_name not in user.get("claims", []):
+                user.setdefault("claims", []).append(claim_name)
+                if users_path:
+                    save_users_fn(users_path, users)
+                logger.info("Admin %s added claim '%s' to user %s", admin_user, claim_name, target_username)
+                return _render_user_detail(target_username, auth_token, message=f"Claim '{claim_name}' added.")
+            return _render_user_detail(target_username, auth_token, error="Claim already assigned or invalid.")
+
+        elif action == "remove_user_claim":
+            claim_name = request.form.get("claim_name", "").strip()
+            if claim_name in user.get("claims", []):
+                user["claims"].remove(claim_name)
+                if users_path:
+                    save_users_fn(users_path, users)
+                logger.info("Admin %s removed claim '%s' from user %s", admin_user, claim_name, target_username)
+                return _render_user_detail(target_username, auth_token, message=f"Claim '{claim_name}' removed.")
+            return _render_user_detail(target_username, auth_token, error=f"Claim '{claim_name}' not found on user.")
+
+        return _render_user_detail(target_username, auth_token)
