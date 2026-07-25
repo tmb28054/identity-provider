@@ -410,9 +410,7 @@ def register_admin_routes(
 
     def _load_claims_registry() -> list[str]:
         """Load the claims registry from claims.json (or derive from users)."""
-        claims_file = Path(app.config.get("DATA_DIR", "")) / "claims.json" if users_path else None
-        if claims_file is None and users_path:
-            claims_file = users_path.parent / "claims.json"
+        claims_file = users_path.parent / "claims.json" if users_path else None
         if claims_file and claims_file.is_file():
             return json.loads(claims_file.read_text())
         # Fallback: derive from all users' claims
