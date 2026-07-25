@@ -127,10 +127,11 @@ ADMIN_PANEL = """
   <h2>Users</h2>
   <div class="card">
     <table>
-      <tr><th>Username</th><th>Claims</th><th>MFA</th><th>Actions</th></tr>
+      <tr><th>Username</th><th>Email</th><th>Claims</th><th>MFA</th><th>Actions</th></tr>
       {% for u in users_list %}
       <tr>
         <td><strong>{{ u.username }}</strong></td>
+        <td style="font-size:0.85rem;">{{ u.get('email', '') }}</td>
         <td>{% for c in u.get('claims', []) %}<span class="badge">{{ c }}</span>{% endfor %}</td>
         <td>{% if u.get('totp_secret') %}<span class="badge badge-mfa">MFA</span>{% else %}—{% endif %}</td>
         <td class="actions">
@@ -174,6 +175,8 @@ ADMIN_PANEL = """
         <div><label>Username</label><input type="text" name="new_username" required></div>
         <div><label>Password</label><input type="password" name="new_user_password" required minlength="8"></div>
       </div>
+      <label>Email</label>
+      <input type="text" name="new_user_email" placeholder="user@example.com">
       <label>Claims (comma-separated)</label>
       <input type="text" name="new_user_claims" placeholder="e.g. idpadmin,developer">
       <button type="submit">Add User</button>
@@ -492,6 +495,7 @@ def register_admin_routes(
         if action == "add_user":
             new_username = request.form.get("new_username", "").strip()
             new_password = request.form.get("new_user_password", "")
+            new_email = request.form.get("new_user_email", "").strip()
             new_claims_str = request.form.get("new_user_claims", "").strip()
 
             if not new_username:
@@ -505,12 +509,16 @@ def register_admin_routes(
             hashed = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
             claims = [c.strip() for c in new_claims_str.split(",") if c.strip()]
 
-            users[new_username] = {
+            new_user: dict = {
                 "username": new_username,
                 "password": hashed,
                 "roles": [],
                 "claims": claims,
             }
+            if new_email:
+                new_user["email"] = new_email
+
+            users[new_username] = new_user
             if users_path:
                 save_users_fn(users_path, users)
             logger.info("Admin %s added user %s", admin_user, new_username)
