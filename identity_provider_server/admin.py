@@ -216,9 +216,24 @@ ADMIN_PANEL = """
         <td><code>/{{ sp.path }}</code></td>
         <td><span class="badge">{{ sp.protocol }}</span></td>
         <td style="font-size:0.8rem;word-break:break-all;">{{ sp.url }}</td>
-        <td>{{ sp.token_duration }} min</td>
+        <td>
+          <form method="post" style="display:inline-flex;align-items:center;gap:0.3rem;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="auth_token" value="{{ auth_token }}">
+            <input type="hidden" name="action" value="update_sp_duration">
+            <input type="hidden" name="sp_protocol" value="{{ sp.protocol }}">
+            <input type="hidden" name="sp_path" value="{{ sp.path }}">
+            <input type="number" name="sp_token_duration"
+              value="{{ sp.token_duration }}" min="1" max="720"
+              style="width:5rem;padding:0.2rem 0.4rem;
+              margin-bottom:0;font-size:0.85rem;">
+            <span style="font-size:0.8rem;color:#555;">min</span>
+            <button class="btn-sm" style="padding:0.2rem 0.5rem;">Save</button>
+          </form>
+        </td>
         <td class="actions">
-          <form method="post" style="display:inline" onsubmit="return confirm('Delete service provider /{{ sp.path }}?')">
+          <form method="post" style="display:inline"
+            onsubmit="return confirm('Delete SP /{{ sp.path }}?')">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <input type="hidden" name="auth_token" value="{{ auth_token }}">
             <input type="hidden" name="action" value="delete_sp">
@@ -829,8 +844,75 @@ def register_admin_routes(
 
             _save_services_yaml(data)
             verb = "updated" if is_update else "added"
-            logger.info("Admin %s %s SP: %s/%s -> %s (%d min)", admin_user, verb, sp_protocol, sp_path, sp_url, sp_duration)
-            return _render_panel(auth_token, message=f"Service provider '/{sp_path}' ({sp_protocol}) {verb}. Token duration: {sp_duration} min.")
+            logger.info(
+                "Admin %s %s SP: %s/%s -> %s (%d min)",
+                admin_user, verb, sp_protocol, sp_path, sp_url, sp_duration,
+            )
+            return _render_panel(
+                auth_token,
+                message=(
+                    f"Service provider '/{sp_path}' ({sp_protocol}) {verb}."
+                    f" Token duration: {sp_duration} min."
+                ),
+            )
+
+        elif action == "update_sp_duration":
+            sp_protocol = request.form.get("sp_protocol", "").strip().lower()
+            sp_path = request.form.get("sp_path", "").strip()
+            sp_duration_str = request.form.get("sp_token_duration", "60").strip()
+
+            try:
+                sp_duration = int(sp_duration_str)
+                if sp_duration < 1 or sp_duration > 720:
+                    raise ValueError
+            except ValueError:
+                return _render_panel(
+                    auth_token,
+                    error="Token duration must be between 1 and 720 minutes.",
+                )
+
+            data = _load_services_yaml()
+            if sp_protocol not in data or sp_path not in data.get(sp_protocol, {}):
+                return _render_panel(
+                    auth_token,
+                    error=f"Service provider '/{sp_path}' not found.",
+                )
+
+            current = data[sp_protocol][sp_path]
+            sp_url = current if isinstance(current, str) else current.get("url", "")
+
+            # Store in extended format with updated duration
+            if sp_protocol == "oauth":
+                entry: dict[str, Any] = {"url": sp_url, "token_expiry_minutes": sp_duration}
+                # Preserve other fields
+                if isinstance(current, dict):
+                    for k, v in current.items():
+                        if k not in ("url", "token_expiry_minutes"):
+                            entry[k] = v
+                data[sp_protocol][sp_path] = entry
+            else:
+                duration_hours = max(1, (sp_duration + 59) // 60)
+                if sp_duration == 60 and duration_hours == 1:
+                    # Default — use short form
+                    data[sp_protocol][sp_path] = sp_url
+                else:
+                    entry = {"url": sp_url, "session_duration_hours": duration_hours}
+                    # Preserve other fields
+                    if isinstance(current, dict):
+                        for k, v in current.items():
+                            if k not in ("url", "session_duration_hours"):
+                                entry[k] = v
+                    data[sp_protocol][sp_path] = entry
+
+            _save_services_yaml(data)
+            logger.info(
+                "Admin %s updated duration for %s/%s to %d min",
+                admin_user, sp_protocol, sp_path, sp_duration,
+            )
+            return _render_panel(
+                auth_token,
+                message=f"Token duration for '/{sp_path}' updated to {sp_duration} minutes.",
+            )
 
         elif action == "delete_sp":
             sp_protocol = request.form.get("sp_protocol", "").strip().lower()
