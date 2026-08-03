@@ -582,7 +582,7 @@ def create_app(
             return
         try:
             current_mtime = users_path.stat().st_mtime
-            if current_mtime > users_mtime:
+            if current_mtime != users_mtime:
                 users = _load_users(users_path)
                 users_mtime = current_mtime
                 logger.info("Reloaded users.json (file changed)")
@@ -1199,7 +1199,7 @@ def create_app(
             user = users.get(username)
             if user and users_path:
                 user["totp_secret"] = totp_secret
-                _save_users(users_path, users)
+                _save_users_and_update_mtime(users_path, users)
                 logger.info("MFA enrolled for user=%s", username)
 
             token = _generate_csrf_token()
@@ -1230,7 +1230,7 @@ def create_app(
             user = users.get(username)
             if user and users_path:
                 user.pop("totp_secret", None)
-                _save_users(users_path, users)
+                _save_users_and_update_mtime(users_path, users)
                 logger.info("MFA disabled for user=%s", username)
 
             token = _generate_csrf_token()
@@ -1295,7 +1295,7 @@ def create_app(
             hashed = _bcrypt.hashpw(new_password.encode(), _bcrypt.gensalt()).decode()
             if user and users_path:
                 user["password"] = hashed
-                _save_users(users_path, users)
+                _save_users_and_update_mtime(users_path, users)
                 logger.info("Password changed for user=%s", username)
 
             token = _generate_csrf_token()
@@ -1488,7 +1488,7 @@ def create_app(
             if mfa_enrolled:
                 user["totp_secret"] = totp_secret
             if users_path:
-                _save_users(users_path, users)
+                _save_users_and_update_mtime(users_path, users)
             logger.info("Recovery completed for user=%s (MFA=%s)", username, mfa_enrolled)
 
         # Consume the token (single-use)
@@ -1502,9 +1502,15 @@ def create_app(
         )
 
     # --- Admin panel ---
+    def _save_users_and_update_mtime(path: Path, user_dict: dict[str, Any]) -> None:
+        """Save users and update mtime tracker so this worker doesn't re-read."""
+        nonlocal users_mtime
+        _save_users(path, user_dict)
+        users_mtime = path.stat().st_mtime
+
     from .admin import register_admin_routes
     register_admin_routes(
-        app, users, users_path, _check_password, _save_users,
+        app, users, users_path, _check_password, _save_users_and_update_mtime,
         make_challenge_fn=_make_challenge,
         verify_challenge_fn=lambda answer, h: _verify_challenge(app.secret_key, answer, h),
         services_path=services_path,
