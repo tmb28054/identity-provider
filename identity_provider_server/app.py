@@ -539,12 +539,15 @@ def create_app(
         users = {}
         users_path = None
         users_mtime = 0.0
+        users_size = 0
         _group_role_map = group_role_map or {}
         logger.info("ADFS authentication mode enabled (host=%s)", adfs_config.get("host"))
     else:
         users_path = _resolve(users_file)
         users = _load_users(users_path)
-        users_mtime = users_path.stat().st_mtime
+        _stat = users_path.stat()
+        users_mtime = _stat.st_mtime
+        users_size = _stat.st_size
         _group_role_map = {}
 
     idp_entity_id = f"http://{host}:{port}/metadata"
@@ -577,14 +580,15 @@ def create_app(
 
     def _reload_users_if_changed() -> None:
         """Reload users.json if the file has been modified."""
-        nonlocal users, users_mtime
+        nonlocal users, users_mtime, users_size
         if use_adfs or users_path is None:
             return
         try:
-            current_mtime = users_path.stat().st_mtime
-            if current_mtime != users_mtime:
+            stat = users_path.stat()
+            if stat.st_mtime != users_mtime or stat.st_size != users_size:
                 users = _load_users(users_path)
-                users_mtime = current_mtime
+                users_mtime = stat.st_mtime
+                users_size = stat.st_size
                 logger.info("Reloaded users.json (file changed)")
         except OSError:
             logger.warning("Could not stat users.json for hot-reload check")
@@ -1503,10 +1507,12 @@ def create_app(
 
     # --- Admin panel ---
     def _save_users_and_update_mtime(path: Path, user_dict: dict[str, Any]) -> None:
-        """Save users and update mtime tracker so this worker doesn't re-read."""
-        nonlocal users_mtime
+        """Save users and update mtime/size tracker so this worker doesn't re-read."""
+        nonlocal users_mtime, users_size
         _save_users(path, user_dict)
-        users_mtime = path.stat().st_mtime
+        _stat = path.stat()
+        users_mtime = _stat.st_mtime
+        users_size = _stat.st_size
 
     from .admin import register_admin_routes
     register_admin_routes(
