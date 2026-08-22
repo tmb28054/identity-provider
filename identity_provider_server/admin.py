@@ -120,7 +120,8 @@ ADMIN_PANEL = """
 </head>
 <body>
 <div class="container">
-  <h1>Admin Panel <a href="/admin" style="font-size:0.7rem;color:#0073bb;text-decoration:none;margin-left:1rem;">↻ Reload</a></h1>
+  <h1>Admin Panel <a href="/admin" style="font-size:0.7rem;color:#0073bb;text-decoration:none;margin-left:1rem;">↻ Reload</a>
+  <a href="/admin/audit-log" style="font-size:0.7rem;color:#0073bb;text-decoration:none;margin-left:1rem;">Audit Log</a></h1>
   {% if message %}<p class="success">{{ message }}</p>{% endif %}
   {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
@@ -402,6 +403,7 @@ def register_admin_routes(
     reload_services_fn=None,
     verify_session_cookie_fn=None,
     set_session_cookie_fn=None,
+    audit_logger=None,
 ) -> None:
     """Register /admin routes on the Flask app."""
 
@@ -571,6 +573,15 @@ def register_admin_routes(
         if verify_session_cookie_fn:
             session_user = verify_session_cookie_fn(request.cookies.get("idp_session", ""))
             if session_user and _has_claim(session_user, "idpadmin"):
+                if audit_logger:
+                    audit_logger.log(
+                        username=session_user,
+                        ip=request.remote_addr or "unknown",
+                        service="admin",
+                        protocol="admin",
+                        result="session_reuse",
+                        user_agent=request.headers.get("User-Agent", ""),
+                    )
                 auth_token = _issue_token(session_user)
                 return _render_panel(auth_token)
 
@@ -605,6 +616,16 @@ def register_admin_routes(
             challenge_answer = request.form.get("challenge_answer", "")
             challenge_hash_val = request.form.get("challenge_hash", "")
             if not verify_challenge_fn(challenge_answer, challenge_hash_val):
+                if audit_logger:
+                    audit_logger.log(
+                        username=request.form.get("username", ""),
+                        ip=request.remote_addr or "unknown",
+                        service="admin",
+                        protocol="admin",
+                        result="failure",
+                        reason="failed_captcha",
+                        user_agent=request.headers.get("User-Agent", ""),
+                    )
                 token = _csrf_token()
                 question, ch_hash = make_challenge_fn()
                 resp = app.make_response(render_template_string(
@@ -621,6 +642,16 @@ def register_admin_routes(
             user = users.get(username)
 
             if not user or not check_password_fn(user["password"], password):
+                if audit_logger:
+                    audit_logger.log(
+                        username=username,
+                        ip=request.remote_addr or "unknown",
+                        service="admin",
+                        protocol="admin",
+                        result="failure",
+                        reason="invalid_credentials",
+                        user_agent=request.headers.get("User-Agent", ""),
+                    )
                 token = _csrf_token()
                 question, ch_hash = make_challenge_fn()
                 resp = app.make_response(render_template_string(
@@ -633,6 +664,16 @@ def register_admin_routes(
             # Check MFA
             if user.get("totp_secret"):
                 if not totp_code or not verify_code(user["totp_secret"], totp_code):
+                    if audit_logger:
+                        audit_logger.log(
+                            username=username,
+                            ip=request.remote_addr or "unknown",
+                            service="admin",
+                            protocol="admin",
+                            result="failure",
+                            reason="invalid_mfa",
+                            user_agent=request.headers.get("User-Agent", ""),
+                        )
                     token = _csrf_token()
                     question, ch_hash = make_challenge_fn()
                     resp = app.make_response(render_template_string(
@@ -644,6 +685,16 @@ def register_admin_routes(
 
             # Check idpadmin claim
             if not _has_claim(username, "idpadmin"):
+                if audit_logger:
+                    audit_logger.log(
+                        username=username,
+                        ip=request.remote_addr or "unknown",
+                        service="admin",
+                        protocol="admin",
+                        result="failure",
+                        reason="access_denied",
+                        user_agent=request.headers.get("User-Agent", ""),
+                    )
                 token = _csrf_token()
                 question, ch_hash = make_challenge_fn()
                 resp = app.make_response(render_template_string(
@@ -655,6 +706,15 @@ def register_admin_routes(
                 return resp, 403
 
             auth_token = _issue_token(username)
+            if audit_logger:
+                audit_logger.log(
+                    username=username,
+                    ip=request.remote_addr or "unknown",
+                    service="admin",
+                    protocol="admin",
+                    result="success",
+                    user_agent=request.headers.get("User-Agent", ""),
+                )
             resp = _render_panel(auth_token)
             if set_session_cookie_fn:
                 set_session_cookie_fn(resp, username)
@@ -953,6 +1013,99 @@ def register_admin_routes(
         resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
+
+    # --- Audit log page ---
+    ADMIN_AUDIT_LOG = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Access Audit Log</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+      Roboto, sans-serif; background: #f4f6f9; padding: 2rem; }
+    .container { max-width: 1100px; margin: 0 auto; }
+    h1 { font-size: 1.6rem; color: #232f3e; margin-bottom: 1.5rem; }
+    .back-link { display: inline-block; margin-bottom: 1rem;
+      color: #0073bb; text-decoration: none; font-size: 0.9rem; }
+    .back-link:hover { text-decoration: underline; }
+    .card { background: #fff; border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+      padding: 1.5rem; margin-bottom: 1.5rem; overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    th, td { text-align: left; padding: 0.4rem 0.6rem;
+      border-bottom: 1px solid #eee; white-space: nowrap; }
+    th { background: #f8f9fa; font-weight: 600; color: #555;
+      position: sticky; top: 0; }
+    .result-success { color: #1d8102; font-weight: 600; }
+    .result-failure { color: #d13212; font-weight: 600; }
+    .result-session { color: #0073bb; font-weight: 600; }
+    .filter-bar { margin-bottom: 1rem; display: flex; gap: 0.5rem;
+      flex-wrap: wrap; align-items: center; }
+    .filter-bar input, .filter-bar select { padding: 0.4rem 0.6rem;
+      border: 1px solid #ccc; border-radius: 4px; font-size: 0.85rem; }
+    .filter-bar button { padding: 0.4rem 0.8rem; background: #0073bb;
+      color: #fff; border: none; border-radius: 4px;
+      font-size: 0.85rem; cursor: pointer; }
+    .count { font-size: 0.85rem; color: #555; margin-bottom: 0.5rem; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <a href="/admin" class="back-link">&larr; Back to Admin Panel</a>
+  <h1>Access Audit Log</h1>
+  <p class="count">Showing {{ entries|length }} most recent entries</p>
+  <div class="card">
+    <table>
+      <tr>
+        <th>Timestamp (UTC)</th>
+        <th>Username</th>
+        <th>IP</th>
+        <th>Service</th>
+        <th>Protocol</th>
+        <th>Result</th>
+        <th>Reason</th>
+      </tr>
+      {% for e in entries %}
+      <tr>
+        <td>{{ e.timestamp[:19] }}</td>
+        <td>{{ e.username or '—' }}</td>
+        <td>{{ e.ip }}</td>
+        <td>{{ e.service }}</td>
+        <td>{{ e.protocol }}</td>
+        <td class="{% if e.result == 'success' %}result-success{% elif e.result == 'failure' %}result-failure{% else %}result-session{% endif %}">{{ e.result }}</td>
+        <td>{{ e.reason or '—' }}</td>
+      </tr>
+      {% endfor %}
+      {% if not entries %}
+      <tr><td colspan="7" style="text-align:center;color:#888;">
+        No audit entries yet.</td></tr>
+      {% endif %}
+    </table>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+    @app.get("/admin/audit-log")
+    def admin_audit_log_get():
+        # Check session cookie
+        if verify_session_cookie_fn:
+            session_user = verify_session_cookie_fn(
+                request.cookies.get("idp_session", ""),
+            )
+            if session_user and _has_claim(session_user, "idpadmin"):
+                entries = []
+                if audit_logger:
+                    entries = audit_logger.read_recent(500)
+                return render_template_string(
+                    ADMIN_AUDIT_LOG, entries=entries,
+                )
+        # No session — redirect to admin login
+        return app.redirect("/admin")
 
     @app.get("/admin/user/<target_username>")
     def admin_user_detail_get(target_username: str):

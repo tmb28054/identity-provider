@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Admin: inline token duration editing for service providers in the SP table.
+- Access audit log: all authentication attempts (success, failure, session reuse) are recorded
+  as structured JSON lines in `data/audit.log`.
+- Admin panel: "Audit Log" page at `/admin/audit-log` shows 500 most recent access events.
 
 ### Fixed
 - User changes (add, MFA, password) now immediately stable across all gunicorn workers without restart.

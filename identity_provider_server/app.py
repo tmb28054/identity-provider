@@ -18,6 +18,7 @@ from .oauth_builder import build_oauth_token
 from .saml_builder import ACS_URL, build_saml_response
 from .services import ServiceProvider, load_services
 from .totp import generate_secret, provisioning_uri, qr_code_data_uri, verify_code
+from .audit import AuditLogger
 
 logger = logging.getLogger(__name__)
 
@@ -564,6 +565,8 @@ def create_app(
         max_attempts=rate_limit_max_attempts, window_seconds=rate_limit_window_seconds
     )
 
+    audit = AuditLogger(data_dir)
+
     # Store config on app for access in tests
     app.config["IDP_ENTITY_ID"] = idp_entity_id
     app.config["PROVIDER_NAME"] = provider_name
@@ -691,6 +694,15 @@ def create_app(
             user = users.get(session_user)
             if user:
                 sp = _get_service(service_path)
+                protocol = sp.protocol if sp else "saml"
+                audit.log(
+                    username=session_user,
+                    ip=request.remote_addr or "unknown",
+                    service=service_path,
+                    protocol=protocol,
+                    result="session_reuse",
+                    user_agent=request.headers.get("User-Agent", ""),
+                )
                 roles = _resolve_roles_from_claims(user)
                 if sp and sp.protocol == "oauth":
                     token = build_oauth_token(
@@ -753,6 +765,15 @@ def create_app(
         client_ip = request.remote_addr or "unknown"
         if rate_limiter.is_limited(client_ip):
             logger.warning("Rate limited: %s", client_ip)
+            audit.log(
+                username="",
+                ip=client_ip,
+                service=service_path,
+                protocol=sp.protocol if sp else "saml",
+                result="failure",
+                reason="rate_limited",
+                user_agent=request.headers.get("User-Agent", ""),
+            )
             token = _generate_csrf_token()
             question, challenge_hash = _make_challenge()
             return render_template_string(
@@ -788,6 +809,15 @@ def create_app(
 
             if not verify_code(user["totp_secret"], totp_code):
                 rate_limiter.record(client_ip)
+                audit.log(
+                    username=auth_username,
+                    ip=client_ip,
+                    service=service_path,
+                    protocol=sp.protocol if sp else "saml",
+                    result="failure",
+                    reason="invalid_mfa",
+                    user_agent=request.headers.get("User-Agent", ""),
+                )
                 token = _generate_csrf_token()
                 resp = app.make_response(render_template_string(
                     TOTP_FORM,
@@ -812,6 +842,14 @@ def create_app(
             logger.info(
                 "Successful MFA login: user=%s service=%s from ip=%s",
                 username, service_path, client_ip,
+            )
+            audit.log(
+                username=username,
+                ip=client_ip,
+                service=service_path,
+                protocol=sp.protocol if sp else "saml",
+                result="success",
+                user_agent=request.headers.get("User-Agent", ""),
             )
 
             # Issue the token
@@ -860,6 +898,15 @@ def create_app(
         if not success:
             rate_limiter.record(client_ip)
             logger.info("Failed login for user=%s from ip=%s", username, client_ip)
+            audit.log(
+                username=username,
+                ip=client_ip,
+                service=service_path,
+                protocol=sp.protocol if sp else "saml",
+                result="failure",
+                reason="invalid_credentials",
+                user_agent=request.headers.get("User-Agent", ""),
+            )
             question, new_hash = _make_challenge()
             return render_template_string(
                 LOGIN_FORM,
@@ -881,6 +928,15 @@ def create_app(
             if not _verify_challenge(app.secret_key, challenge_answer, challenge_hash_val):
                 rate_limiter.record(client_ip)
                 logger.info("Failed challenge from ip=%s", client_ip)
+                audit.log(
+                    username=username,
+                    ip=client_ip,
+                    service=service_path,
+                    protocol=sp.protocol if sp else "saml",
+                    result="failure",
+                    reason="failed_captcha",
+                    user_agent=request.headers.get("User-Agent", ""),
+                )
                 question, new_hash = _make_challenge()
                 return render_template_string(
                     LOGIN_FORM,
@@ -920,6 +976,14 @@ def create_app(
         logger.info(
             "Successful login: user=%s service=%s from ip=%s",
             username, service_path, client_ip,
+        )
+        audit.log(
+            username=username,
+            ip=client_ip,
+            service=service_path,
+            protocol=sp.protocol if sp else "saml",
+            result="success",
+            user_agent=request.headers.get("User-Agent", ""),
         )
 
         # Determine protocol and respond accordingly
@@ -1522,6 +1586,7 @@ def create_app(
         services_path=services_path,
         verify_session_cookie_fn=_verify_session_cookie,
         set_session_cookie_fn=_set_session_cookie,
+        audit_logger=audit,
     )
 
     return app
