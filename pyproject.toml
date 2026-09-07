@@ -17,6 +17,7 @@ dependencies = [
     "pyotp>=2.9,<3.0",
     "qrcode>=8.0,<9.0",
     "pillow>=10.0",
+    "requests>=2.31,<3.0",
 ]
 
 [project.optional-dependencies]
@@ -55,6 +56,7 @@ include = ["identity_provider_server*"]
 identity-provider-server = "identity_provider_server.__main__:main"
 run-idp = "identity_provider_server.run_gunicorn:main"
 idp-hash-password = "identity_provider_server.hash_password:main"
+get-jwt = "identity_provider_server.get_jwt:main"
 
 [tool.ruff]
 target-version = "py310"
