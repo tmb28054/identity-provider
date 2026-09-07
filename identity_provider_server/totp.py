@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import io
 import base64
+import io
 
 import pyotp
 import qrcode

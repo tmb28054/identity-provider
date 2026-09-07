@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- SMB backup + restore for the IdP's critical state (signing key, users, services,
+  claims, config). Configure the SMB server/share/credentials on the admin
+  **Backups** page (`/admin/backups`).
+- Nightly backup at 02:30 (server time) via a root `idp-backup.timer`, writing
+  timestamped archives to `daily/` (and `weekly/` on Sundays) on the share, with
+  30-daily / 52-weekly retention pruning.
+- Portal-driven restore: pick an archive, confirm with MFA/captcha, and the
+  service restores (after a local pre-restore snapshot) and restarts. All
+  backup/restore events are recorded in the access audit log.
+- Failure banner in the admin panel and Backups page when the last backup failed.
+- `backup_cli` privileged runner and systemd units (`idp-backup.service`,
+  `idp-backup.timer`, `idp-restore@.service`) provisioned by `scripts/deploy.py`,
+  plus a narrow sudoers rule so the unprivileged web app can trigger them.
+
 ## [1.5.0] - 2026-09-07
 
 ### Added

@@ -65,6 +65,14 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]
 
+# These modules embed large HTML page templates as triple-quoted strings,
+# whose lines legitimately exceed the code line-length limit. Exempt them
+# from E501 (line-too-long) only; all other lint rules still apply.
+[tool.ruff.lint.per-file-ignores]
+"identity_provider_server/admin.py" = ["E501"]
+"identity_provider_server/app.py" = ["E501"]
+"identity_provider_server/totp.py" = ["E501"]
+
 [tool.mypy]
 python_version = "3.10"
 strict = true

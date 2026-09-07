@@ -40,6 +40,103 @@ Environment=SECRET_KEY=d218a93fdcdb0e0ec72adaf262fe759be98e887b386c5d3f188d97e15
 WantedBy=multi-user.target
 """
 
+# --- Backup / restore units (run as root: mount.cifs needs privileges) ---
+
+# The unprivileged web app (running as the service user) triggers these via a
+# narrow sudoers rule. The units themselves run as root and do the SMB mount.
+BACKUP_SERVICE_UNIT = f"""\
+[Unit]
+Description=Identity Provider nightly backup to SMB share
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={REMOTE_VENV}/bin/python -m identity_provider_server.backup_cli backup --data-dir {REMOTE_DATA}
+"""
+
+BACKUP_TIMER_UNIT = """\
+[Unit]
+Description=Run Identity Provider backup nightly at 02:30
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+# Templated instance unit: `idp-restore@<archive>.service`. The instance name
+# is the archive filename (systemd-escaped). After a successful restore the
+# IdP service is restarted so the new signing key / routes take effect.
+RESTORE_SERVICE_UNIT = f"""\
+[Unit]
+Description=Identity Provider restore from SMB archive %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={REMOTE_VENV}/bin/python -m identity_provider_server.backup_cli restore --data-dir {REMOTE_DATA} --archive %i
+ExecStartPost=/bin/systemctl restart {SERVICE_NAME}
+"""
+
+# Sudoers rule: let the unprivileged service user start ONLY these units
+# (and run the connection test), with no password. Nothing else.
+SERVICE_USER = "idp"
+SUDOERS_RULE = f"""\
+# Managed by scripts/deploy.py — allow the IdP service user to trigger
+# backup/restore units and the SMB connection test, and nothing else.
+{SERVICE_USER} ALL=(root) NOPASSWD: /bin/systemctl start idp-backup.service
+{SERVICE_USER} ALL=(root) NOPASSWD: /bin/systemctl start idp-restore@*.service
+{SERVICE_USER} ALL=(root) NOPASSWD: {REMOTE_VENV}/bin/python -m identity_provider_server.backup_cli test --data-dir {REMOTE_DATA}
+"""
+
+
+def _scp_unit(content: str, remote_name: str) -> None:
+    """Write a unit/config file locally and scp it to the remote host."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".unit", delete=False) as f:
+        f.write(content)
+        tmp_path = f.name
+    run(f"scp {tmp_path} {HOST}:{remote_name}")
+    os.unlink(tmp_path)
+
+
+def deploy_backup() -> bool:
+    """Install the backup/restore units, sudoers rule, and prerequisites.
+
+    Returns True on success.
+    """
+    print("\n==> Installing cifs-utils (for SMB mounts)...")
+    ssh("apt-get install -y cifs-utils", check=False)
+
+    print("\n==> Writing backup/restore systemd units...")
+    _scp_unit(BACKUP_SERVICE_UNIT, "/etc/systemd/system/idp-backup.service")
+    _scp_unit(BACKUP_TIMER_UNIT, "/etc/systemd/system/idp-backup.timer")
+    _scp_unit(RESTORE_SERVICE_UNIT, "/etc/systemd/system/idp-restore@.service")
+
+    print("\n==> Installing sudoers rule for the service user...")
+    # Stage to a temp path, validate with visudo -c, then move into place.
+    _scp_unit(SUDOERS_RULE, "/tmp/idp-backup.sudoers")  # nosec B108 - remote staging path
+    check = ssh("visudo -cf /tmp/idp-backup.sudoers", check=False)
+    if check.returncode != 0:
+        print("  ✗ sudoers rule failed validation; not installing.")
+        ssh("rm -f /tmp/idp-backup.sudoers", check=False)
+        return False
+    ssh("install -m 0440 /tmp/idp-backup.sudoers /etc/sudoers.d/idp-backup")
+    ssh("rm -f /tmp/idp-backup.sudoers", check=False)
+
+    print("\n==> Enabling backup timer...")
+    ssh("systemctl daemon-reload")
+    ssh("systemctl enable --now idp-backup.timer")
+    result = ssh("systemctl is-enabled idp-backup.timer", check=False)
+    if result.returncode != 0:
+        print("  ✗ backup timer did not enable.")
+        return False
+    print("  ✓ backup timer enabled (nightly at 02:30).")
+    return True
+
 
 def run(cmd: str | list, *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
     """Run a local shell command."""
@@ -141,6 +238,10 @@ def main() -> int:
     # Deploy
     if not deploy():
         return 1
+
+    # Install/refresh backup infrastructure (units, sudoers, timer).
+    if not deploy_backup():
+        print("\n  ⚠ Backup infrastructure setup incomplete — check output above.")
 
     print("\n✓ Deployment complete. Service is active.")
 

@@ -10,15 +10,23 @@ import hmac
 import json
 import logging
 import secrets
+import subprocess  # nosec
 import time
 from pathlib import Path
 from typing import Any
 
 from flask import Flask, render_template_string, request
 
+from . import backup as bk
 from .totp import verify_code
 
 logger = logging.getLogger(__name__)
+
+# Path to the venv python + data dir are needed to trigger the privileged
+# backup/restore units and the connection test via sudo. These match the
+# deploy layout (scripts/deploy.py).
+_SUDO = "/usr/bin/sudo"
+_SYSTEMCTL = "/bin/systemctl"
 
 ADMIN_LOGIN = """
 <!doctype html>
@@ -121,7 +129,9 @@ ADMIN_PANEL = """
 <body>
 <div class="container">
   <h1>Admin Panel <a href="/admin" style="font-size:0.7rem;color:#0073bb;text-decoration:none;margin-left:1rem;">↻ Reload</a>
-  <a href="/admin/audit-log" style="font-size:0.7rem;color:#0073bb;text-decoration:none;margin-left:1rem;">Audit Log</a></h1>
+  <a href="/admin/audit-log" style="font-size:0.7rem;color:#0073bb;text-decoration:none;margin-left:1rem;">Audit Log</a>
+  <a href="/admin/backups" style="font-size:0.7rem;color:#0073bb;text-decoration:none;margin-left:1rem;">Backups</a></h1>
+  {% if backup_failing %}<div style="background:#fde8e8;border:1px solid #f5b5b5;color:#d13212;padding:0.6rem 1rem;border-radius:6px;margin-bottom:1rem;font-size:0.85rem;font-weight:600;">⚠ The last backup failed. <a href="/admin/backups" style="color:#d13212;">View backups →</a></div>{% endif %}
   {% if message %}<p class="success">{{ message }}</p>{% endif %}
   {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
@@ -404,6 +414,7 @@ def register_admin_routes(
     verify_session_cookie_fn=None,
     set_session_cookie_fn=None,
     audit_logger=None,
+    data_dir: Path | None = None,
 ) -> None:
     """Register /admin routes on the Flask app."""
 
@@ -553,11 +564,16 @@ def register_admin_routes(
                         url = val
                         duration = 60
                     sp_list.append({"protocol": protocol, "path": path, "url": url, "token_duration": duration})
+        backup_failing = False
+        _bdir = data_dir if data_dir is not None else (users_path.parent if users_path else None)
+        if _bdir is not None:
+            backup_failing = bk.load_status(_bdir).is_failing
         resp = app.make_response(render_template_string(
             ADMIN_PANEL,
             users_list=users_list,
             all_claims=all_claims,
             sp_list=sp_list,
+            backup_failing=backup_failing,
             csrf_token=token,
             auth_token=auth_token,
             message=message,
@@ -662,7 +678,7 @@ def register_admin_routes(
                 return resp, 401
 
             # Check MFA
-            if user.get("totp_secret"):
+            if user.get("totp_secret"):  # noqa: SIM102 - kept nested for auth-flow clarity
                 if not totp_code or not verify_code(user["totp_secret"], totp_code):
                     if audit_logger:
                         audit_logger.log(
@@ -1106,6 +1122,343 @@ def register_admin_routes(
                 )
         # No session — redirect to admin login
         return app.redirect("/admin")
+
+    # --- Backups page ---
+    ADMIN_BACKUPS = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Backups</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+      Roboto, sans-serif; background: #f4f6f9; padding: 2rem; }
+    .container { max-width: 800px; margin: 0 auto; }
+    h1 { font-size: 1.6rem; color: #232f3e; margin-bottom: 1rem; }
+    h2 { font-size: 1.2rem; color: #232f3e; margin: 2rem 0 1rem;
+      border-bottom: 2px solid #0073bb; padding-bottom: 0.5rem; }
+    .back-link { display: inline-block; margin-bottom: 1rem;
+      color: #0073bb; text-decoration: none; font-size: 0.9rem; }
+    .back-link:hover { text-decoration: underline; }
+    .card { background: #fff; border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.06); padding: 1.5rem; margin-bottom: 1.5rem; }
+    label { display: block; font-size: 0.85rem; color: #555; margin-bottom: 0.3rem; }
+    input[type="text"], input[type="password"], input[type="number"] {
+      width: 100%; padding: 0.5rem 0.6rem; border: 1px solid #ccc;
+      border-radius: 4px; font-size: 0.9rem; margin-bottom: 0.75rem; }
+    .form-row { display: flex; gap: 0.75rem; }
+    .form-row > div { flex: 1; }
+    button, .btn { padding: 0.5rem 1rem; background: #0073bb; color: #fff;
+      border: none; border-radius: 4px; font-size: 0.85rem; cursor: pointer;
+      text-decoration: none; display: inline-block; }
+    button:hover { background: #005a94; }
+    .btn-warning { background: #ff9900; }
+    .btn-danger { background: #d13212; }
+    .success { color: #1d8102; font-size: 0.9rem; margin-bottom: 1rem;
+      padding: 0.5rem; background: #e8f5e9; border-radius: 4px; }
+    .error { color: #d13212; font-size: 0.9rem; margin-bottom: 1rem;
+      padding: 0.5rem; background: #fde8e8; border-radius: 4px; }
+    .banner { background: #fde8e8; border: 1px solid #f5b5b5; color: #d13212;
+      padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1.5rem;
+      font-size: 0.9rem; font-weight: 600; }
+    .status-row { display: flex; gap: 1rem; font-size: 0.9rem;
+      margin-bottom: 0.4rem; }
+    .status-row .label { color: #555; min-width: 160px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; }
+    th { background: #f8f9fa; color: #555; }
+    .muted { color: #888; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <a href="/admin" class="back-link">&larr; Back to Admin Panel</a>
+  <h1>Backups</h1>
+
+  {% if status.is_failing %}
+  <div class="banner">⚠ Last backup FAILED ({{ status.last_attempt[:19] }} UTC):
+    {{ status.message }}{% if status.consecutive_failures > 1 %}
+    — {{ status.consecutive_failures }} consecutive failures.{% endif %}</div>
+  {% endif %}
+
+  {% if message %}<p class="success">{{ message }}</p>{% endif %}
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+  <h2>Status</h2>
+  <div class="card">
+    <div class="status-row"><span class="label">Last attempt:</span>
+      {{ status.last_attempt[:19] or '—' }}{% if status.last_attempt %} UTC{% endif %}</div>
+    <div class="status-row"><span class="label">Last success:</span>
+      {{ status.last_success[:19] or '—' }}{% if status.last_success %} UTC{% endif %}</div>
+    <div class="status-row"><span class="label">Result:</span> {{ status.result or '—' }}</div>
+    <div class="status-row"><span class="label">Detail:</span> {{ status.message or '—' }}</div>
+    <div class="status-row"><span class="label">Schedule:</span> Nightly at 02:30 (server time)</div>
+    <form method="post" style="margin-top:1rem;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="auth_token" value="{{ auth_token }}">
+      <input type="hidden" name="action" value="run_backup_now">
+      <button type="submit">Run backup now</button>
+    </form>
+  </div>
+
+  <h2>SMB Destination</h2>
+  <div class="card">
+    <form method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="auth_token" value="{{ auth_token }}">
+      <input type="hidden" name="action" value="save_backup_config">
+      <div class="form-row">
+        <div><label>SMB server</label>
+          <input type="text" name="server" value="{{ config.server }}"
+            placeholder="192.168.101.20"></div>
+        <div><label>Share</label>
+          <input type="text" name="share" value="{{ config.share }}"
+            placeholder="idp-backups"></div>
+      </div>
+      <div class="form-row">
+        <div><label>Username</label>
+          <input type="text" name="username" value="{{ config.username }}"></div>
+        <div><label>Password</label>
+          <input type="password" name="password"
+            placeholder="{% if config.password %}(unchanged){% else %}password{% endif %}"></div>
+      </div>
+      <label>Subpath within share</label>
+      <input type="text" name="subpath" value="{{ config.subpath }}" placeholder="idp-backup">
+      <div class="form-row">
+        <div><label>Daily retention</label>
+          <input type="number" name="daily_retention" min="1" max="365"
+            value="{{ config.daily_retention }}"></div>
+        <div><label>Weekly retention</label>
+          <input type="number" name="weekly_retention" min="1" max="520"
+            value="{{ config.weekly_retention }}"></div>
+      </div>
+      <label style="display:inline-flex;align-items:center;gap:0.4rem;margin-bottom:0.75rem;">
+        <input type="checkbox" name="enabled" value="1" style="width:auto;"
+          {% if config.enabled %}checked{% endif %}> Enabled
+      </label>
+      <div>
+        <button type="submit">Save settings</button>
+      </div>
+    </form>
+    <form method="post" style="margin-top:0.75rem;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="auth_token" value="{{ auth_token }}">
+      <input type="hidden" name="action" value="test_backup_connection">
+      <button type="submit" class="btn-warning">Test connection</button>
+    </form>
+    <p class="muted" style="margin-top:0.75rem;">The password is stored on the
+      server (file mode 600) and used only by the root backup job to mount the
+      share. Leave the password blank to keep the existing one.</p>
+  </div>
+
+  <h2>Restore</h2>
+  <div class="card">
+    <p class="muted" style="margin-bottom:0.75rem;">Restoring overwrites all
+      current IdP data with the selected archive, then restarts the service. A
+      snapshot of the current data is taken first. This cannot be undone easily
+      — you must re-enter your MFA/captcha to confirm.</p>
+    {% if archives %}
+    <form method="post" onsubmit="return confirm('Restore will OVERWRITE all current data and restart the IdP. Continue?');">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="auth_token" value="{{ auth_token }}">
+      <input type="hidden" name="action" value="restore_backup">
+      <label>Archive to restore</label>
+      <select name="archive" style="width:100%;padding:0.5rem;border:1px solid #ccc;
+        border-radius:4px;margin-bottom:0.75rem;">
+        {% for a in archives %}<option value="{{ a }}">{{ a }}</option>{% endfor %}
+      </select>
+      <label>Confirm with your MFA code (or captcha answer): {{ challenge_question }}</label>
+      <input type="hidden" name="challenge_hash" value="{{ challenge_hash }}">
+      <input type="text" name="confirm_answer" placeholder="MFA code or captcha answer" required>
+      <div style="margin-top:0.75rem;">
+        <button type="submit" class="btn-danger">Restore selected archive</button>
+      </div>
+    </form>
+    {% else %}
+    <p class="muted">No archives available on the share (or the share is not
+      reachable). Configure and test the connection above.</p>
+    {% endif %}
+  </div>
+</div>
+</body>
+</html>
+"""
+
+    def _trigger_unit(unit: str) -> tuple[bool, str]:
+        """Start a systemd unit via the narrow sudo rule. Returns (ok, detail)."""
+        try:
+            result = subprocess.run(  # nosec B603
+                [_SUDO, "-n", _SYSTEMCTL, "start", unit],
+                capture_output=True, text=True, check=False, timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, str(exc)
+        if result.returncode != 0:
+            return False, result.stderr.strip() or f"exit {result.returncode}"
+        return True, "started"
+
+    def _backup_data_dir() -> Path | None:
+        """Resolve the data directory for backup operations."""
+        if data_dir is not None:
+            return Path(data_dir)
+        return users_path.parent if users_path else None
+
+    def _list_share_archives(ddir: Path) -> list[str]:
+        """List archives available for restore (from the cached listing).
+
+        The share is only mounted by the root job, so the web app reads the
+        listing that the backup job caches locally after each successful run.
+        """
+        return bk.read_archive_listing(ddir)
+
+    def _render_backups(auth_token: str, message: str = "", error: str = ""):
+        token = _csrf_token()
+        ddir = _backup_data_dir()
+        config = bk.load_config(ddir) if ddir else bk.BackupConfig()
+        status = bk.load_status(ddir) if ddir else bk.BackupStatus()
+        archives = _list_share_archives(ddir) if ddir else []
+        question, ch_hash = make_challenge_fn()
+        resp = app.make_response(render_template_string(
+            ADMIN_BACKUPS,
+            config=config,
+            status=status,
+            archives=archives,
+            challenge_question=question,
+            challenge_hash=ch_hash,
+            csrf_token=token,
+            auth_token=auth_token,
+            message=message,
+            error=error,
+        ))
+        resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
+
+    @app.get("/admin/backups")
+    def admin_backups_get():
+        if verify_session_cookie_fn:
+            session_user = verify_session_cookie_fn(request.cookies.get("idp_session", ""))
+            if session_user and _has_claim(session_user, "idpadmin"):
+                auth_token = _issue_token(session_user)
+                return _render_backups(auth_token)
+        return app.redirect("/admin")
+
+    @app.post("/admin/backups")
+    def admin_backups_post():
+        form_token = request.form.get("csrf_token", "")
+        cookie_token = request.cookies.get("csrf_token", "")
+        if not form_token or not hmac.compare_digest(form_token, cookie_token):
+            return app.redirect("/admin")
+
+        auth_token = request.form.get("auth_token", "")
+        admin_user = _verify_token(auth_token)
+        if not admin_user or not _has_claim(admin_user, "idpadmin"):
+            return app.redirect("/admin")
+
+        auth_token = _issue_token(admin_user)
+        action = request.form.get("action", "")
+        ddir = _backup_data_dir()
+        if ddir is None:
+            return _render_backups(auth_token, error="No data directory available.")
+
+        ip = request.remote_addr or "unknown"
+        ua = request.headers.get("User-Agent", "")
+
+        if action == "save_backup_config":
+            config = bk.load_config(ddir)
+            config.server = request.form.get("server", "").strip()
+            config.share = request.form.get("share", "").strip()
+            config.username = request.form.get("username", "").strip()
+            # Blank password means "keep existing".
+            new_pw = request.form.get("password", "")
+            if new_pw:
+                config.password = new_pw
+            config.subpath = request.form.get("subpath", "idp-backup").strip() or "idp-backup"
+            config.enabled = request.form.get("enabled") == "1"
+            try:
+                config.daily_retention = max(1, int(request.form.get("daily_retention", "30")))
+                config.weekly_retention = max(1, int(request.form.get("weekly_retention", "52")))
+            except ValueError:
+                return _render_backups(auth_token, error="Retention values must be numbers.")
+            bk.save_config(ddir, config)
+            logger.info("Admin %s updated backup config", admin_user)
+            return _render_backups(auth_token, message="Backup settings saved.")
+
+        if action == "test_backup_connection":
+            ok, detail = _trigger_test(ddir)
+            if ok:
+                return _render_backups(auth_token, message=f"Connection OK. {detail}")
+            return _render_backups(auth_token, error=f"Connection failed: {detail}")
+
+        if action == "run_backup_now":
+            ok, detail = _trigger_unit("idp-backup.service")
+            if audit_logger:
+                audit_logger.log(
+                    username=admin_user, ip=ip, service="backup", protocol="admin",
+                    result="success" if ok else "failure",
+                    reason="" if ok else "trigger_failed", user_agent=ua,
+                )
+            if ok:
+                return _render_backups(
+                    auth_token,
+                    message="Backup started. Refresh in a moment to see the result.",
+                )
+            return _render_backups(auth_token, error=f"Could not start backup: {detail}")
+
+        if action == "restore_backup":
+            archive = request.form.get("archive", "").strip()
+            confirm = request.form.get("confirm_answer", "")
+            ch_hash = request.form.get("challenge_hash", "")
+            # Confirm identity: accept the admin's MFA code or the captcha answer.
+            user = users.get(admin_user, {})
+            mfa_ok = bool(user.get("totp_secret")) and verify_code(user["totp_secret"], confirm)
+            captcha_ok = bool(verify_challenge_fn) and verify_challenge_fn(confirm, ch_hash)
+            if not (mfa_ok or captcha_ok):
+                if audit_logger:
+                    audit_logger.log(
+                        username=admin_user, ip=ip, service="restore", protocol="admin",
+                        result="failure", reason="confirm_failed", user_agent=ua,
+                    )
+                return _render_backups(auth_token, error="Confirmation failed. Restore aborted.")
+            # Guard the archive name before handing it to systemd.
+            if "/" in archive or ".." in archive or not archive.endswith(".tar.gz"):
+                return _render_backups(auth_token, error="Invalid archive name.")
+            unit = f"idp-restore@{archive}.service"
+            ok, detail = _trigger_unit(unit)
+            if audit_logger:
+                audit_logger.log(
+                    username=admin_user, ip=ip, service="restore", protocol="admin",
+                    result="success" if ok else "failure",
+                    reason=archive if ok else f"trigger_failed:{detail}", user_agent=ua,
+                )
+            logger.warning("Admin %s triggered restore of %s (ok=%s)", admin_user, archive, ok)
+            if ok:
+                return _render_backups(
+                    auth_token,
+                    message=f"Restore of '{archive}' started. The service will restart.",
+                )
+            return _render_backups(auth_token, error=f"Could not start restore: {detail}")
+
+        return _render_backups(auth_token, error="Unknown action.")
+
+    def _trigger_test(ddir: Path) -> tuple[bool, str]:
+        """Run the privileged connection test via sudo. Returns (ok, detail)."""
+        cmd = [
+            _SUDO, "-n",
+            f"{Path('/opt/idp/.venv/bin/python')}",
+            "-m", "identity_provider_server.backup_cli", "test",
+            "--data-dir", str(ddir),
+        ]
+        try:
+            result = subprocess.run(  # nosec B603
+                cmd, capture_output=True, text=True, check=False, timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, str(exc)
+        detail = (result.stdout or result.stderr).strip()
+        return result.returncode == 0, detail
 
     @app.get("/admin/user/<target_username>")
     def admin_user_detail_get(target_username: str):

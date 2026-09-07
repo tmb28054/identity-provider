@@ -14,11 +14,11 @@ from typing import Any
 
 from flask import Flask, redirect, render_template_string, request
 
+from .audit import AuditLogger
 from .oauth_builder import build_oauth_token
 from .saml_builder import ACS_URL, build_saml_response
 from .services import ServiceProvider, load_services
 from .totp import generate_secret, provisioning_uri, qr_code_data_uri, verify_code
-from .audit import AuditLogger
 
 logger = logging.getLogger(__name__)
 
@@ -924,7 +924,7 @@ def create_app(
             user = users.get(username)
             user_has_mfa = bool(user and user.get("totp_secret"))
 
-        if not user_has_mfa:
+        if not user_has_mfa:  # noqa: SIM102 - kept nested for auth-flow clarity
             if not _verify_challenge(app.secret_key, challenge_answer, challenge_hash_val):
                 rate_limiter.record(client_ip)
                 logger.info("Failed challenge from ip=%s", client_ip)
@@ -1485,7 +1485,7 @@ def create_app(
     # --- Recovery route ---
     @app.get("/recover/<recovery_token>")
     def recover_get(recovery_token: str):
-        from .admin import validate_recovery_token, consume_recovery_token
+        from .admin import validate_recovery_token
         username = validate_recovery_token(recovery_token)
         if not username:
             return render_template_string(
@@ -1506,7 +1506,7 @@ def create_app(
 
     @app.post("/recover/<recovery_token>")
     def recover_post(recovery_token: str):
-        from .admin import validate_recovery_token, consume_recovery_token
+        from .admin import consume_recovery_token, validate_recovery_token
         username = validate_recovery_token(recovery_token)
         if not username:
             return render_template_string(
@@ -1587,6 +1587,7 @@ def create_app(
         verify_session_cookie_fn=_verify_session_cookie,
         set_session_cookie_fn=_set_session_cookie,
         audit_logger=audit,
+        data_dir=data,
     )
 
     return app

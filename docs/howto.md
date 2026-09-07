@@ -441,3 +441,11 @@ Logs are JSON-formatted and written to stderr:
 ```json
 {"time":"2025-04-19T10:30:00","level":"INFO","logger":"identity_provider_server.app","message":"Successful login: user=alice from ip=127.0.0.1"}
 ```
+
+## Back up and restore the server
+
+The signing key, users (with MFA secrets), and service configuration live in
+`data/` and are not stored in git. Configure nightly SMB backups and perform
+restores from the admin **Backups** page (`/admin/backups`).
+
+See [backups.md](backups.md) for the full guide.
