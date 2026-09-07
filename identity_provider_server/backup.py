@@ -289,13 +289,16 @@ def run_backup(
 
     try:
         base = Path(mount_dir) / config.subpath
+        # Ensure the configured subpath (and its daily set) exists on the share.
         daily_dir = base / "daily"
+        daily_dir.mkdir(parents=True, exist_ok=True)
         name = archive_name(when)
         size = create_archive(data_dir, daily_dir / name)
         prune_archives(daily_dir, config.daily_retention)
 
         if _is_weekly(when):
             weekly_dir = base / "weekly"
+            weekly_dir.mkdir(parents=True, exist_ok=True)
             create_archive(data_dir, weekly_dir / name)
             prune_archives(weekly_dir, config.weekly_retention)
 

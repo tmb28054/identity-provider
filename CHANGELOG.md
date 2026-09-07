@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SMB backup + restore for the IdP's critical state (signing key, users, services,
   claims, config). Configure the SMB server/share/credentials on the admin
   **Backups** page (`/admin/backups`).
+- The configured backup subpath (including nested paths) is created on the share
+  automatically if it does not already exist.
 - Nightly backup at 02:30 (server time) via a root `idp-backup.timer`, writing
   timestamped archives to `daily/` (and `weekly/` on Sundays) on the share, with
   30-daily / 52-weekly retention pruning.

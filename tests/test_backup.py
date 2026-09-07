@@ -172,6 +172,27 @@ def test_run_backup_success_updates_status_and_listing(tmp_path):
     assert bk.read_archive_listing(data) == bk.list_archives(daily)
 
 
+def test_run_backup_creates_missing_subpath(tmp_path):
+    """The configured subpath is created on the share if it doesn't exist."""
+    data = tmp_path / "data"
+    data.mkdir()
+    _seed_data_dir(data)
+    mount = tmp_path / "mnt"
+    mount.mkdir()  # share root exists, but subpath does not
+    cfg = bk.BackupConfig(
+        server="s", share="sh", username="u", subpath="deep/nested/idp-backup",
+    )
+    assert not (mount / "deep").exists()
+
+    when = datetime(2026, 9, 9, 2, 30, tzinfo=timezone.utc)  # Wednesday
+    status = bk.run_backup(data, mount, cfg, when=when)
+
+    assert status.result == "success"
+    daily = mount / "deep" / "nested" / "idp-backup" / "daily"
+    assert daily.is_dir()
+    assert len(bk.list_archives(daily)) == 1
+
+
 def test_run_backup_sunday_also_writes_weekly(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
