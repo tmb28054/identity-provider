@@ -220,6 +220,11 @@ def test_mount_smb_builds_cifs_command(tmp_path):
     assert captured["cmd"][0] == backup_cli.MOUNT_CMD
     assert "cifs" in captured["cmd"]
     assert "//10.0.0.5/idp" in captured["cmd"]
+    # Must request read-write with the bare "rw" flag, never "ro=false"
+    # (mount.cifs treats "ro=false" as read-only).
+    opts = captured["cmd"][captured["cmd"].index("-o") + 1]
+    assert ",rw," in f",{opts},"
+    assert "ro=false" not in opts
     # Password is in the temp creds file, never on the command line.
     assert "pw" not in " ".join(captured["cmd"])
     assert "password=pw" in captured["creds"]

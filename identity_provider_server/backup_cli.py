@@ -58,7 +58,12 @@ def _mount_smb(config: bk.BackupConfig, mount_dir: Path) -> None:
         cred_file.close()
         Path(cred_file.name).chmod(0o600)
 
-        options = f"credentials={cred_file.name},ro=false,uid=0,gid=0,file_mode=0600,dir_mode=0700"
+        # Use the bare "rw" flag — mount.cifs does NOT understand "ro=false"
+        # (it parses the "ro" token and mounts read-only, ignoring "=false").
+        options = (
+            f"credentials={cred_file.name},rw,"
+            "uid=0,gid=0,file_mode=0600,dir_mode=0700"
+        )
         cmd = [
             MOUNT_CMD,
             "-t",
