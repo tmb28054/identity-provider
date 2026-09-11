@@ -54,6 +54,66 @@ def test_do_backup_not_configured(tmp_path):
     assert bk.load_status(data).result == "failure"
 
 
+def test_do_backup_readonly_share_records_clear_status(tmp_path):
+    """A read-only mount yields an actionable failure message, not Errno 30."""
+    data = tmp_path / "data"
+    data.mkdir()
+    _seed(data)
+    bk.save_config(data, bk.BackupConfig(server="s", share="sh", username="u"))
+
+    # Simulate a successful mount onto a read-only directory: mount creates the
+    # dir, then we make it unwritable so the write-probe fails.
+    def fake_mount(config, mount_dir):
+        md = Path(mount_dir)
+        md.mkdir(parents=True, exist_ok=True)
+        md.chmod(0o500)  # read + execute, no write
+
+    with mock.patch.object(backup_cli, "_mount_smb", side_effect=fake_mount), \
+         mock.patch.object(backup_cli, "_umount"):
+        rc = backup_cli.do_backup(str(data))
+
+    assert rc == 1
+    status = bk.load_status(data)
+    assert status.result == "failure"
+    assert "read-only" in status.message.lower()
+    assert "write permission" in status.message.lower()
+
+
+def test_check_writable_raises_on_readonly(tmp_path):
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    ro.chmod(0o500)
+    try:
+        with pytest.raises(backup_cli.ReadOnlyShareError):
+            backup_cli._check_writable(ro)
+    finally:
+        ro.chmod(0o700)  # allow cleanup
+
+
+def test_check_writable_ok_on_writable(tmp_path):
+    # Should not raise, and must clean up its probe file.
+    backup_cli._check_writable(tmp_path)
+    assert not (tmp_path / ".idp-write-test").exists()
+
+
+def test_test_connection_readonly(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    _seed(data)
+    bk.save_config(data, bk.BackupConfig(server="s", share="sh", username="u"))
+
+    def fake_mount(config, mount_dir):
+        md = Path(mount_dir)
+        md.mkdir(parents=True, exist_ok=True)
+        md.chmod(0o500)
+
+    with mock.patch.object(backup_cli, "_mount_smb", side_effect=fake_mount), \
+         mock.patch.object(backup_cli, "_umount"):
+        ok, msg = backup_cli.test_connection(str(data))
+    assert ok is False
+    assert "read-only" in msg.lower()
+
+
 def test_do_backup_mount_failure_records_status(tmp_path):
     data = tmp_path / "data"
     data.mkdir()

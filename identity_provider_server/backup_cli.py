@@ -93,17 +93,46 @@ def _umount(mount_dir: Path) -> None:
         logger.warning("umount warning: %s", result.stderr.strip())
 
 
+class ReadOnlyShareError(RuntimeError):
+    """Raised when the mounted share is not writable by the backup user."""
+
+
+def _check_writable(mount_dir: Path) -> None:
+    """Verify the mounted share is writable, else raise ReadOnlyShareError.
+
+    A CIFS mount can succeed but still be read-only if the SMB server grants
+    the user only read access (the client mounts 'ro' regardless of the
+    requested 'rw'). Detect that here so the failure message is actionable.
+    """
+    probe = mount_dir / ".idp-write-test"
+    try:
+        probe.write_text("ok")
+    except OSError as exc:
+        raise ReadOnlyShareError(
+            "The SMB share mounted read-only — the configured user does not "
+            "have write permission on the server. Grant the backup user "
+            "write access to the share and try again."
+        ) from exc
+    finally:
+        with contextlib.suppress(OSError):
+            probe.unlink()
+
+
+def _record_failure(data_dir: str, message: str) -> None:
+    """Persist a failure status so the portal can show the banner."""
+    status = bk.load_status(data_dir)
+    status.result = "failure"
+    status.message = message
+    status.consecutive_failures += 1
+    status.last_attempt = bk._now().isoformat()
+    bk.save_status(data_dir, status)
+
+
 def do_backup(data_dir: str) -> int:
     """Mount, run a backup, unmount. Returns a process exit code."""
     config = bk.load_config(data_dir)
     if not config.is_configured:
-        # Record a failure status so the portal can show the banner.
-        status = bk.load_status(data_dir)
-        status.result = "failure"
-        status.message = "Backup not configured (missing SMB settings)."
-        status.consecutive_failures += 1
-        status.last_attempt = bk._now().isoformat()
-        bk.save_status(data_dir, status)
+        _record_failure(data_dir, "Backup not configured (missing SMB settings).")
         logger.error("Backup not configured")
         return 2
 
@@ -112,16 +141,16 @@ def do_backup(data_dir: str) -> int:
         try:
             _mount_smb(config, mount_dir)
         except MountError as exc:
-            status = bk.load_status(data_dir)
-            status.result = "failure"
-            status.message = f"Backup failed: {exc}"
-            status.consecutive_failures += 1
-            status.last_attempt = bk._now().isoformat()
-            bk.save_status(data_dir, status)
+            _record_failure(data_dir, f"Backup failed: {exc}")
             logger.error("%s", exc)
             return 1
         try:
+            _check_writable(mount_dir)
             status = bk.run_backup(data_dir, mount_dir, config)
+        except ReadOnlyShareError as exc:
+            _record_failure(data_dir, f"Backup failed: {exc}")
+            logger.error("%s", exc)
+            return 1
         finally:
             _umount(mount_dir)
     return 0 if status.result == "success" else 1
@@ -190,10 +219,13 @@ def test_connection(data_dir: str) -> tuple[bool, str]:
         except MountError as exc:
             return False, str(exc)
         try:
+            _check_writable(mount_dir)
             base = mount_dir / config.subpath
             base.mkdir(parents=True, exist_ok=True)
             count = len(bk.list_archives(base / "daily"))
-            return True, f"Connected. {count} daily archive(s) present."
+            return True, f"Connected and writable. {count} daily archive(s) present."
+        except ReadOnlyShareError as exc:
+            return False, str(exc)
         except OSError as exc:
             return False, f"Mounted but could not access {config.subpath}: {exc}"
         finally:
