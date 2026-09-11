@@ -7,19 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-09-11
+
 ### Added
 - SMB backup + restore for the IdP's critical state (signing key, users, services,
   claims, config). Configure the SMB server/share/credentials on the admin
   **Backups** page (`/admin/backups`).
-- The configured backup subpath (including nested paths) is created on the share
-  automatically if it does not already exist.
-- Backup now detects a read-only SMB mount (server granted the user no write
-  access) and reports a clear, actionable error instead of a raw "read-only file
-  system" errno. The Test connection button surfaces this immediately.
-
-### Fixed
-- SMB mount used the invalid option `ro=false`, which `mount.cifs` interpreted as
-  read-only — every backup failed to write. Use the correct `rw` flag instead.
 - Nightly backup at 02:30 (server time) via a root `idp-backup.timer`, writing
   timestamped archives to `daily/` (and `weekly/` on Sundays) on the share, with
   30-daily / 52-weekly retention pruning.
@@ -30,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `backup_cli` privileged runner and systemd units (`idp-backup.service`,
   `idp-backup.timer`, `idp-restore@.service`) provisioned by `scripts/deploy.py`,
   plus a narrow sudoers rule so the unprivileged web app can trigger them.
+- The configured backup subpath (including nested paths) is created on the share
+  automatically if it does not already exist.
+- Backup detects a read-only SMB mount (server granted the user no write access)
+  and reports a clear, actionable error instead of a raw "read-only file system"
+  errno. The Test connection button surfaces this immediately.
+
+### Fixed
+- SMB mount used the invalid option `ro=false`, which `mount.cifs` interpreted as
+  read-only — every backup failed to write. Use the correct `rw` flag instead.
 
 ## [1.5.0] - 2026-09-07
 
