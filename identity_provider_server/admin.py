@@ -5,22 +5,28 @@ Accessible at /admin to users with the 'idpadmin' claim.
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import json
 import logging
 import secrets
 import subprocess  # nosec
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, render_template_string, request
+from flask import Flask, g, render_template_string, request
 
 from . import backup as bk
+from .tokens import PURPOSE_ADMIN, issue_token, verify_token
 from .totp import verify_code
 
 logger = logging.getLogger(__name__)
+
+
+def _now_iso() -> str:
+    """Return the current UTC time as an ISO-8601 string (lifecycle stamps)."""
+    return datetime.now(timezone.utc).isoformat()
 
 # Path to the venv python + data dir are needed to trigger the privileged
 # backup/restore units and the connection test via sudo. These match the
@@ -146,13 +152,15 @@ ADMIN_PANEL = """
         <td>{% for c in u.get('claims', []) %}<span class="badge">{{ c }}</span>{% endfor %}</td>
         <td>{% if u.get('totp_secret') %}<span class="badge badge-mfa">MFA</span>{% else %}—{% endif %}</td>
         <td class="actions">
-          <form method="post" style="display:inline">
+          <form method="post" style="display:inline-flex;align-items:center;gap:0.25rem;">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <input type="hidden" name="auth_token" value="{{ auth_token }}">
             <input type="hidden" name="action" value="reset_password">
             <input type="hidden" name="target_user" value="{{ u.username }}">
-            <button class="btn-sm btn-warning" onclick="this.form.elements.new_pw.value=prompt('New password for {{ u.username }}:');return !!this.form.elements.new_pw.value;">Reset PW</button>
-            <input type="hidden" name="new_pw" value="">
+            <input type="password" name="new_pw" placeholder="New password"
+              minlength="12" required
+              style="width:9rem;padding:0.2rem 0.4rem;margin-bottom:0;font-size:0.8rem;">
+            <button class="btn-sm btn-warning">Reset PW</button>
           </form>
           {% if u.get('totp_secret') %}
           <form method="post" style="display:inline">
@@ -163,7 +171,7 @@ ADMIN_PANEL = """
             <button class="btn-sm btn-warning">Remove MFA</button>
           </form>
           {% endif %}
-          <form method="post" style="display:inline" onsubmit="return confirm('Delete user {{ u.username }}?')">
+          <form method="post" style="display:inline" data-confirm="Delete this user?">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <input type="hidden" name="auth_token" value="{{ auth_token }}">
             <input type="hidden" name="action" value="delete_user">
@@ -204,7 +212,7 @@ ADMIN_PANEL = """
           <input type="hidden" name="auth_token" value="{{ auth_token }}">
           <input type="hidden" name="action" value="delete_claim">
           <input type="hidden" name="claim_name" value="{{ c }}">
-          <button style="background:none;border:none;color:#d13212;cursor:pointer;font-size:0.75rem;padding:0 3px;" title="Delete claim" onclick="return confirm('Delete claim {{ c }}? It will be removed from all users.')">✕</button>
+          <button style="background:none;border:none;color:#d13212;cursor:pointer;font-size:0.75rem;padding:0 3px;" title="Delete claim" data-confirm="Delete this claim? It will be removed from all users.">✕</button>
         </form>
       </span>{% endfor %}
       {% if not all_claims %}<span style="color:#888;font-size:0.85rem;">No claims defined yet.</span>{% endif %}
@@ -243,8 +251,7 @@ ADMIN_PANEL = """
           </form>
         </td>
         <td class="actions">
-          <form method="post" style="display:inline"
-            onsubmit="return confirm('Delete SP /{{ sp.path }}?')">
+          <form method="post" style="display:inline" data-confirm="Delete this service provider?">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <input type="hidden" name="auth_token" value="{{ auth_token }}">
             <input type="hidden" name="action" value="delete_sp">
@@ -290,6 +297,22 @@ ADMIN_PANEL = """
     </form>
   </div>
 </div>
+<script nonce="{{ csp_nonce }}">
+// Confirmation guard for destructive actions. The message is a static string
+// from a data-confirm attribute; no server-supplied value is ever evaluated
+// as JavaScript, which closes the previous inline-handler XSS.
+document.addEventListener("submit", function (e) {
+  var msg = e.target.getAttribute && e.target.getAttribute("data-confirm");
+  if (msg && !window.confirm(msg)) { e.preventDefault(); }
+});
+document.addEventListener("click", function (e) {
+  var el = e.target.closest ? e.target.closest("[data-confirm]") : null;
+  if (el && el.tagName === "BUTTON" && !el.form) {
+    var msg = el.getAttribute("data-confirm");
+    if (msg && !window.confirm(msg)) { e.preventDefault(); }
+  }
+});
+</script>
 </body>
 </html>
 """
@@ -415,42 +438,91 @@ def register_admin_routes(
     set_session_cookie_fn=None,
     audit_logger=None,
     data_dir: Path | None = None,
+    rate_limiter=None,
+    rate_limit_key_fn=None,
+    validate_username_fn=None,
+    validate_claim_fn=None,
+    password_policy_fn=None,
 ) -> None:
     """Register /admin routes on the Flask app."""
+
+    def _rl_key(username: str = "") -> str:
+        """Build a rate-limit key for the current request."""
+        ip = request.remote_addr or "unknown"
+        if rate_limit_key_fn:
+            return rate_limit_key_fn(ip, username)
+        return f"{ip}|{username}" if username else ip
+
+    def _rl_limited(username: str = "") -> bool:
+        return bool(rate_limiter) and rate_limiter.is_limited(_rl_key(username))
+
+    def _rl_record(username: str = "") -> None:
+        if rate_limiter:
+            rate_limiter.record(_rl_key(username))
 
     def _csrf_token() -> str:
         return secrets.token_hex(32)
 
-    def _issue_token(username: str) -> str:
-        payload = f"{username}:{int(time.time())}"
-        sig = hmac.new(app.secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
-        return f"{payload}:{sig}"
+    ADMIN_TOKEN_MAX_AGE = 3600  # 1 hour
 
-    def _verify_token(token: str, max_age: int = 3600) -> str | None:
-        parts = token.rsplit(":", 1)
-        if len(parts) != 2:
-            return None
-        payload, sig = parts
-        expected = hmac.new(app.secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected):
-            return None
-        user_parts = payload.rsplit(":", 1)
-        if len(user_parts) != 2:
-            return None
-        username, ts_str = user_parts
-        try:
-            ts = int(ts_str)
-        except ValueError:
-            return None
-        if time.time() - ts > max_age:
-            return None
-        return username
+    def _issue_token(username: str) -> str:
+        """Issue a purpose-scoped admin authorization token."""
+        return issue_token(app.secret_key, username, PURPOSE_ADMIN)
+
+    def _verify_token(token: str, max_age: int = ADMIN_TOKEN_MAX_AGE) -> str | None:
+        """Verify an admin token; rejects tokens minted for any other purpose."""
+        return verify_token(app.secret_key, token, PURPOSE_ADMIN, max_age)
 
     def _has_claim(username: str, claim: str) -> bool:
         user = users.get(username)
         if not user:
             return False
         return claim in user.get("claims", [])
+
+    def _require_admin(auth_token: str) -> str | None:
+        """Return the admin username if the token is valid and holds idpadmin.
+
+        Central authorization predicate for state-changing admin actions, so
+        the check is defined once rather than copied per handler.
+        """
+        admin_user = _verify_token(auth_token)
+        if not admin_user or not _has_claim(admin_user, "idpadmin"):
+            return None
+        return admin_user
+
+    def _audit_admin(admin_user: str, mutation: str, target: str = "") -> None:
+        """Record a privileged admin mutation in the audit log.
+
+        Args:
+            admin_user: The acting administrator.
+            mutation: A short action name (e.g. ``add_user``).
+            target: The affected object (username, claim, SP path).
+        """
+        if not audit_logger:
+            return
+        audit_logger.log(
+            username=admin_user,
+            ip=request.remote_addr or "unknown",
+            service="admin",
+            protocol="admin",
+            result="mutation",
+            reason=f"{mutation}:{target}" if target else mutation,
+            user_agent=request.headers.get("User-Agent", ""),
+        )
+
+    def _valid_username(name: str) -> bool:
+        """Charset-validate a username (defaults to allowing all if no fn)."""
+        return validate_username_fn(name) if validate_username_fn else True
+
+    def _valid_claim(name: str) -> bool:
+        """Charset-validate a claim name (defaults to allowing all if no fn)."""
+        return validate_claim_fn(name) if validate_claim_fn else True
+
+    def _password_error(pw: str) -> str | None:
+        """Return a password-policy error, or None. Falls back to length >= 8."""
+        if password_policy_fn:
+            return password_policy_fn(pw)
+        return None if len(pw) >= 8 else "Password must be at least 8 characters."
 
     def _load_claims_registry() -> list[str]:
         """Load the claims registry from claims.json (or derive from users)."""
@@ -532,7 +604,7 @@ def register_admin_routes(
 
     def _save_services_yaml(data: dict[str, dict[str, str]]) -> None:
         """Save services data to services.yaml and restart the server to register new routes."""
-        if not services_path:
+        if not services_path:  # pragma: no cover - only callable after a load that requires services_path
             return
         import yaml
         services_path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
@@ -578,6 +650,7 @@ def register_admin_routes(
             auth_token=auth_token,
             message=message,
             error=error,
+            csp_nonce=getattr(g, "csp_nonce", ""),
         ))
         resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -628,10 +701,36 @@ def register_admin_routes(
         action = request.form.get("action", "login")
 
         if action == "login":
+            login_username = request.form.get("username", "")
+            # Throttle admin credential guessing (per IP and per account).
+            if _rl_limited() or (login_username and _rl_limited(login_username)):
+                if audit_logger:
+                    audit_logger.log(
+                        username=login_username,
+                        ip=request.remote_addr or "unknown",
+                        service="admin",
+                        protocol="admin",
+                        result="failure",
+                        reason="rate_limited",
+                        user_agent=request.headers.get("User-Agent", ""),
+                    )
+                token = _csrf_token()
+                question, ch_hash = make_challenge_fn()
+                resp = app.make_response(render_template_string(
+                    ADMIN_LOGIN, error="Too many attempts. Try again later.",
+                    csrf_token=token,
+                    challenge_question=question, challenge_hash=ch_hash,
+                ))
+                resp.set_cookie(
+                    "csrf_token", token, httponly=True, samesite="Strict"
+                )
+                return resp, 429
+
             # Verify challenge
             challenge_answer = request.form.get("challenge_answer", "")
             challenge_hash_val = request.form.get("challenge_hash", "")
             if not verify_challenge_fn(challenge_answer, challenge_hash_val):
+                _rl_record(login_username)
                 if audit_logger:
                     audit_logger.log(
                         username=request.form.get("username", ""),
@@ -657,7 +756,14 @@ def register_admin_routes(
             totp_code = request.form.get("totp_code", "")
             user = users.get(username)
 
-            if not user or not check_password_fn(user["password"], password):
+            account_usable = bool(
+                user
+                and not user.get("must_set_password")
+                and user.get("enabled") is not False
+                and user.get("password")
+            )
+            if not account_usable or not check_password_fn(user["password"], password):
+                _rl_record(username)
                 if audit_logger:
                     audit_logger.log(
                         username=username,
@@ -680,6 +786,7 @@ def register_admin_routes(
             # Check MFA
             if user.get("totp_secret"):  # noqa: SIM102 - kept nested for auth-flow clarity
                 if not totp_code or not verify_code(user["totp_secret"], totp_code):
+                    _rl_record(username)
                     if audit_logger:
                         audit_logger.log(
                             username=username,
@@ -738,8 +845,8 @@ def register_admin_routes(
 
         # All other actions require a valid auth token with idpadmin
         auth_token = request.form.get("auth_token", "")
-        admin_user = _verify_token(auth_token)
-        if not admin_user or not _has_claim(admin_user, "idpadmin"):
+        admin_user = _require_admin(auth_token)
+        if not admin_user:
             token = _csrf_token()
             resp = app.make_response(render_template_string(
                 ADMIN_LOGIN, error="Session expired. Please sign in again.",
@@ -759,20 +866,34 @@ def register_admin_routes(
 
             if not new_username:
                 return _render_panel(auth_token, error="Username is required.")
+            if not _valid_username(new_username):
+                return _render_panel(
+                    auth_token,
+                    error="Username may only contain letters, digits, . _ @ - characters.",
+                )
             if new_username in users:
                 return _render_panel(auth_token, error=f"User '{new_username}' already exists.")
-            if len(new_password) < 8:
-                return _render_panel(auth_token, error="Password must be at least 8 characters.")
+            pw_err = _password_error(new_password)
+            if pw_err:
+                return _render_panel(auth_token, error=pw_err)
+
+            claims = [c.strip() for c in new_claims_str.split(",") if c.strip()]
+            bad_claim = next((c for c in claims if not _valid_claim(c)), None)
+            if bad_claim is not None:
+                return _render_panel(
+                    auth_token, error=f"Invalid claim name: '{bad_claim}'."
+                )
 
             import bcrypt
             hashed = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
-            claims = [c.strip() for c in new_claims_str.split(",") if c.strip()]
 
             new_user: dict = {
                 "username": new_username,
                 "password": hashed,
                 "roles": [],
                 "claims": claims,
+                "created_at": _now_iso(),
+                "enabled": True,
             }
             if new_email:
                 new_user["email"] = new_email
@@ -781,6 +902,9 @@ def register_admin_routes(
             if users_path:
                 save_users_fn(users_path, users)
             logger.info("Admin %s added user %s", admin_user, new_username)
+            _audit_admin(admin_user, "add_user", new_username)
+            if "idpadmin" in claims:
+                _audit_admin(admin_user, "grant_idpadmin", new_username)
             return _render_panel(auth_token, message=f"User '{new_username}' created.")
 
         elif action == "delete_user":
@@ -792,14 +916,16 @@ def register_admin_routes(
                 if users_path:
                     save_users_fn(users_path, users)
                 logger.info("Admin %s deleted user %s", admin_user, target)
+                _audit_admin(admin_user, "delete_user", target)
                 return _render_panel(auth_token, message=f"User '{target}' deleted.")
             return _render_panel(auth_token, error=f"User '{target}' not found.")
 
         elif action == "reset_password":
             target = request.form.get("target_user", "")
             new_pw = request.form.get("new_pw", "")
-            if not new_pw or len(new_pw) < 8:
-                return _render_panel(auth_token, error="Password must be at least 8 characters.")
+            pw_err = _password_error(new_pw)
+            if pw_err:
+                return _render_panel(auth_token, error=pw_err)
             user = users.get(target)
             if not user:
                 return _render_panel(auth_token, error=f"User '{target}' not found.")
@@ -808,6 +934,7 @@ def register_admin_routes(
             if users_path:
                 save_users_fn(users_path, users)
             logger.info("Admin %s reset password for %s", admin_user, target)
+            _audit_admin(admin_user, "reset_password", target)
             return _render_panel(auth_token, message=f"Password reset for '{target}'.")
 
         elif action == "remove_mfa":
@@ -819,6 +946,7 @@ def register_admin_routes(
             if users_path:
                 save_users_fn(users_path, users)
             logger.info("Admin %s removed MFA for %s", admin_user, target)
+            _audit_admin(admin_user, "remove_mfa", target)
             return _render_panel(auth_token, message=f"MFA removed for '{target}'.")
 
         elif action == "set_claims":
@@ -828,15 +956,24 @@ def register_admin_routes(
             if not user:
                 return _render_panel(auth_token, error=f"User '{target}' not found.")
             claims = [c.strip() for c in claims_str.split(",") if c.strip()]
+            bad_claim = next((c for c in claims if not _valid_claim(c)), None)
+            if bad_claim is not None:
+                return _render_panel(
+                    auth_token, error=f"Invalid claim name: '{bad_claim}'."
+                )
+            had_admin = "idpadmin" in user.get("claims", [])
             user["claims"] = claims
             if users_path:
                 save_users_fn(users_path, users)
             logger.info("Admin %s set claims for %s: %s", admin_user, target, claims)
+            _audit_admin(admin_user, "set_claims", target)
+            if "idpadmin" in claims and not had_admin:
+                _audit_admin(admin_user, "grant_idpadmin", target)
             return _render_panel(auth_token, message=f"Claims updated for '{target}'.")
 
         elif action == "add_claim":
             claim_name = request.form.get("claim_name", "").strip().lower()
-            if not claim_name or not claim_name.replace("-", "").replace("_", "").isalnum():
+            if not _valid_claim(claim_name):
                 return _render_panel(auth_token, error="Claim name must be URL-safe (letters, numbers, hyphens, underscores).")
             registry = _load_claims_registry()
             if claim_name in registry:
@@ -844,6 +981,7 @@ def register_admin_routes(
             registry.append(claim_name)
             _save_claims_registry(registry)
             logger.info("Admin %s added claim: %s", admin_user, claim_name)
+            _audit_admin(admin_user, "add_claim", claim_name)
             return _render_panel(auth_token, message=f"Claim '{claim_name}' added.")
 
         elif action == "delete_claim":
@@ -860,20 +998,8 @@ def register_admin_routes(
             if users_path:
                 save_users_fn(users_path, users)
             logger.info("Admin %s deleted claim: %s (removed from all users)", admin_user, claim_name)
+            _audit_admin(admin_user, "delete_claim", claim_name)
             return _render_panel(auth_token, message=f"Claim '{claim_name}' deleted and removed from all users.")
-
-        elif action == "set_claims":
-            target = request.form.get("claims_user", "")
-            claims_str = request.form.get("user_claims", "").strip()
-            user = users.get(target)
-            if not user:
-                return _render_panel(auth_token, error=f"User '{target}' not found.")
-            claims = [c.strip() for c in claims_str.split(",") if c.strip()]
-            user["claims"] = claims
-            if users_path:
-                save_users_fn(users_path, users)
-            logger.info("Admin %s set claims for %s: %s", admin_user, target, claims)
-            return _render_panel(auth_token, message=f"Claims updated for '{target}'.")
 
         elif action == "upsert_sp":
             sp_protocol = request.form.get("sp_protocol", "").strip().lower()
@@ -1353,8 +1479,8 @@ def register_admin_routes(
             return app.redirect("/admin")
 
         auth_token = request.form.get("auth_token", "")
-        admin_user = _verify_token(auth_token)
-        if not admin_user or not _has_claim(admin_user, "idpadmin"):
+        admin_user = _require_admin(auth_token)
+        if not admin_user:
             return app.redirect("/admin")
 
         auth_token = _issue_token(admin_user)
@@ -1375,7 +1501,15 @@ def register_admin_routes(
             new_pw = request.form.get("password", "")
             if new_pw:
                 config.password = new_pw
-            config.subpath = request.form.get("subpath", "idp-backup").strip() or "idp-backup"
+            raw_subpath = request.form.get("subpath", "idp-backup").strip() or "idp-backup"
+            try:
+                config.subpath = bk.validate_subpath(raw_subpath)
+            except bk.InvalidSubpathError:
+                return _render_backups(
+                    auth_token,
+                    error="Invalid backup subpath. Use letters, digits, . _ - and / only "
+                          "(no leading / and no '..').",
+                )
             config.enabled = request.form.get("enabled") == "1"
             try:
                 config.daily_retention = max(1, int(request.form.get("daily_retention", "30")))
@@ -1410,12 +1544,21 @@ def register_admin_routes(
         if action == "restore_backup":
             archive = request.form.get("archive", "").strip()
             confirm = request.form.get("confirm_answer", "")
-            ch_hash = request.form.get("challenge_hash", "")
-            # Confirm identity: accept the admin's MFA code or the captcha answer.
+            # Restore overwrites all authentication state as root, so require a
+            # FRESH TOTP code from the acting admin. The replayable captcha is no
+            # longer accepted as an alternative confirmation for this action.
             user = users.get(admin_user, {})
-            mfa_ok = bool(user.get("totp_secret")) and verify_code(user["totp_secret"], confirm)
-            captcha_ok = bool(verify_challenge_fn) and verify_challenge_fn(confirm, ch_hash)
-            if not (mfa_ok or captcha_ok):
+            if not user.get("totp_secret"):
+                if audit_logger:
+                    audit_logger.log(
+                        username=admin_user, ip=ip, service="restore", protocol="admin",
+                        result="failure", reason="mfa_required", user_agent=ua,
+                    )
+                return _render_backups(
+                    auth_token,
+                    error="Restore requires MFA. Enrol MFA on your account first.",
+                )
+            if not verify_code(user["totp_secret"], confirm):
                 if audit_logger:
                     audit_logger.log(
                         username=admin_user, ip=ip, service="restore", protocol="admin",
@@ -1479,8 +1622,8 @@ def register_admin_routes(
             return app.redirect("/admin")
 
         auth_token = request.form.get("auth_token", "")
-        admin_user = _verify_token(auth_token)
-        if not admin_user or not _has_claim(admin_user, "idpadmin"):
+        admin_user = _require_admin(auth_token)
+        if not admin_user:
             return app.redirect("/admin")
 
         auth_token = _issue_token(admin_user)
@@ -1491,11 +1634,18 @@ def register_admin_routes(
 
         if action == "add_user_claim":
             claim_name = request.form.get("claim_name", "").strip()
+            if claim_name and not _valid_claim(claim_name):
+                return _render_user_detail(
+                    target_username, auth_token, error=f"Invalid claim name: '{claim_name}'."
+                )
             if claim_name and claim_name not in user.get("claims", []):
                 user.setdefault("claims", []).append(claim_name)
                 if users_path:
                     save_users_fn(users_path, users)
                 logger.info("Admin %s added claim '%s' to user %s", admin_user, claim_name, target_username)
+                _audit_admin(admin_user, "add_user_claim", f"{target_username}:{claim_name}")
+                if claim_name == "idpadmin":
+                    _audit_admin(admin_user, "grant_idpadmin", target_username)
                 return _render_user_detail(target_username, auth_token, message=f"Claim '{claim_name}' added.")
             return _render_user_detail(target_username, auth_token, error="Claim already assigned or invalid.")
 
@@ -1506,6 +1656,7 @@ def register_admin_routes(
                 if users_path:
                     save_users_fn(users_path, users)
                 logger.info("Admin %s removed claim '%s' from user %s", admin_user, claim_name, target_username)
+                _audit_admin(admin_user, "remove_user_claim", f"{target_username}:{claim_name}")
                 return _render_user_detail(target_username, auth_token, message=f"Claim '{claim_name}' removed.")
             return _render_user_detail(target_username, auth_token, error=f"Claim '{claim_name}' not found on user.")
 
@@ -1513,6 +1664,7 @@ def register_admin_routes(
             token = _generate_recovery_token(target_username)
             recovery_url = f"https://idp.botthouse.net/recover/{token}"
             logger.info("Admin %s generated recovery link for %s", admin_user, target_username)
+            _audit_admin(admin_user, "generate_recovery", target_username)
             return _render_user_detail(target_username, auth_token, recovery_url=recovery_url)
 
         return _render_user_detail(target_username, auth_token)

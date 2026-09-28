@@ -7,6 +7,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-09-28
+
+### Added
+- `docs/passkey-design.md`: draft design for adding passkey (WebAuthn/FIDO2)
+  authentication — phased plan (second-factor → passwordless → admin), data
+  model, endpoints, CSP/JS approach, and test strategy. Design only; no code yet.
+- `docs/security-remediation-plan.md`: a phased plan to remediate the 25 findings
+  from the 2026-09-26 pentest code review, ordered by severity and grounded in
+  verified source locations.
+- `docs/security.md`: data inventory/classification, threat model, and
+  operational controls (time-sync, log protection, key rotation, supply chain).
+- `identity_provider_server/tokens.py`: purpose-scoped, per-purpose-keyed HMAC
+  tokens plus a single-use `NonceStore`.
+- Per-account lockout and rate limiting on every credential endpoint
+  (`/admin`, `/user`, `/recover`, and SP login), keyed on IP and username.
+- Security response headers via an `after_request` hook: HSTS, a nonce-based
+  Content-Security-Policy, `X-Content-Type-Options`, `Referrer-Policy`, and
+  `X-Frame-Options`. All cookies are now marked `Secure` by default.
+- Session inactivity timeout (30 min idle; 12 h absolute cap) with a sliding
+  window on authenticated use.
+- Password complexity policy (min 12 chars, ≥3 character classes) and a
+  first-use `must_set_password` marker for the seeded admin.
+- Account lifecycle fields on user records: `enabled`, `created_at`, `last_login`.
+- Forced password rotation: a `force_password_change` flag on a user record makes
+  the next successful login require a new password before any SAML/JWT/session is
+  issued (handled on SP login and `/user` via a dedicated change page).
+- Audit records for all privileged admin mutations (user CRUD, password reset,
+  MFA removal, claim/`idpadmin` grants, SP changes, recovery-link mint).
+- CSRF protection on `POST /recover`.
+- `constraints.txt` for pinned, reproducible dependency installs.
+- Regression tests (`tests/test_security_hardening.py`) plus a whole-tree
+  secret-scan and `scripts/` bandit gate in the security smoke tests.
+- 100% line-coverage requirement, enforced by the coverage gate
+  (`tests/test_coverage_gate.py` and `[tool.coverage.report] fail_under = 100`).
+  Added `tests/test_app_full.py`, `tests/test_admin_full.py`,
+  `tests/test_entrypoints.py`, `tests/test_coverage_fill.py`, and
+  `tests/test_remaining_coverage.py` to exercise every reachable branch;
+  genuinely-unreachable defensive lines are marked `# pragma: no cover` with a
+  justification.
+
+### Changed
+- The TOTP login step now requires a signed, single-use "password-proven"
+  ticket derived from a successful password check; a TOTP code plus a
+  form-supplied username can no longer mint credentials.
+- Session cookie, admin token, and `/user` step-up token are now distinct,
+  purpose-tagged, and signed with per-purpose keys — they are no longer
+  interchangeable.
+- Password verification accepts only bcrypt hashes; plaintext (or any
+  non-bcrypt value) is rejected, with constant-time behaviour preserved.
+- The human-verification captcha is now signed, time-bound (5 min), and
+  single-use (nonce-tracked) — a captured answer can no longer be replayed.
+- Backup `subpath` is charset-validated and containment-checked against the
+  mount at both the writer and the privileged runner (no path traversal).
+- Destructive backup restore now requires a fresh TOTP code (the replayable
+  captcha alternative was removed).
+- `change_password` now requires the current password.
+- The backup **Enabled** toggle is now enforced by the backup runner.
+- The per-account login lockout now keys on the username alone (was IP+username,
+  which failed to bound password-spraying of one account across many source
+  IPs); failed logins also increment an IP-level counter.
+- Deployment hardening: the web app runs as an unprivileged `idp` user under a
+  sandboxed systemd unit bound to loopback; the signing key is read from an
+  operator-managed EnvironmentFile (no longer committed); the restore sudoers
+  rule is constrained to the archive-name pattern. The Dockerfile runs as a
+  non-root user with a pinned base image and a single worker. Kubernetes
+  `users.json` moved from a ConfigMap to a Secret with tightened pod security.
+
+### Fixed
+- Password recovery now verifies an already-enrolled user's MFA against their
+  stored TOTP secret instead of a freshly generated one. Previously the
+  `/recover` page always issued a new enrollment secret and checked the entered
+  code against it, so an enrolled user entering their real authenticator code
+  was always rejected with "Invalid MFA code. Try again." Enrolled users are
+  now required to confirm their current code (and their secret is left
+  unchanged); only users without MFA are offered optional enrollment.
+
+### Security
+- Closes the pentest findings: password-skip authentication bypass (critical),
+  interchangeable tokens, plaintext-password acceptance and seeded default
+  credential, unthrottled credential endpoints, replayable captcha, stored XSS
+  in the admin panel, backup path traversal, missing `Secure`/security headers,
+  unaudited admin mutations, missing session idle timeout, and the unenforced
+  backup toggle.
+- Removed committed production credentials from `tests/integration/conftest.py`
+  (now required via environment, tests skip if unset) and the hardcoded
+  `SECRET_KEY` from the deploy script. Rotate the exposed `topaz` credentials,
+  TOTP seed, and signing key out of band — they must be treated as compromised.
+
 ## [1.6.0] - 2026-09-11
 
 ### Added

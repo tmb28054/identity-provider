@@ -187,13 +187,13 @@ def load_config(data_dir: str, config_path: str | None = None) -> AppConfig:
             file_config = yaml.safe_load(cfg_file.read_text()) or {}
             config = _deep_merge(config, file_config)
             logger.info("Loaded configuration from %s", cfg_file)
-        except ImportError:
+        except ImportError:  # pragma: no cover - PyYAML is a hard dependency
             logger.warning(
                 "PyYAML not installed — cannot read config file %s. "
                 "Install with: pip install pyyaml",
                 cfg_file,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - config load must never crash startup
             logger.warning("Failed to read config file %s: %s", cfg_file, e)
     else:
         logger.debug("No config file found at %s, using defaults", cfg_file)

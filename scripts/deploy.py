@@ -22,7 +22,15 @@ REMOTE_VENV = f"{REMOTE_BASE}/.venv"
 REMOTE_DATA = f"{REMOTE_BASE}/data"
 SERVICE_NAME = "identity-provider"
 IDP_URL = "https://idp.botthouse.net"
+SERVICE_USER = "idp"
+# The signing key is NOT committed here. It is read from an operator-managed
+# EnvironmentFile on the host (0600, owned by the service user). See
+# docs/installation.md. Rotate it if it is ever exposed.
+REMOTE_ENV_FILE = f"{REMOTE_BASE}/idp.env"
 
+# Runs as an unprivileged, single worker (in-memory rate-limit/nonce state is
+# per-process, so a single worker keeps those controls consistent without an
+# external store). Hardened with systemd sandboxing directives.
 SYSTEMD_UNIT = f"""\
 [Unit]
 Description=Identity Provider Server
@@ -30,11 +38,35 @@ After=network.target
 
 [Service]
 Type=exec
+User={SERVICE_USER}
+Group={SERVICE_USER}
 WorkingDirectory={REMOTE_BASE}
-ExecStart={REMOTE_VENV}/bin/gunicorn "identity_provider_server:create_app('{REMOTE_DATA}', host='idp.botthouse.net', port=443, provider_name='idp.botthouse.net')" --bind 0.0.0.0:5000 --workers 2 --access-logfile - --error-logfile -
+EnvironmentFile={REMOTE_ENV_FILE}
+# Binds on all interfaces because the origin is fronted by Cloudflare (the
+# network boundary is enforced upstream, not by loopback). If you move the
+# proxy onto this host, prefer 127.0.0.1:5000.
+ExecStart={REMOTE_VENV}/bin/gunicorn "identity_provider_server:create_app('{REMOTE_DATA}', host='idp.botthouse.net', port=443, provider_name='idp.botthouse.net')" --bind 0.0.0.0:5000 --workers 1 --access-logfile - --error-logfile -
 Restart=on-failure
 RestartSec=5
-Environment=SECRET_KEY=d218a93fdcdb0e0ec72adaf262fe759be98e887b386c5d3f188d97e158f591f8
+
+# --- Hardening ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={REMOTE_DATA}
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
@@ -84,12 +116,15 @@ ExecStartPost=/bin/systemctl restart {SERVICE_NAME}
 
 # Sudoers rule: let the unprivileged service user start ONLY these units
 # (and run the connection test), with no password. Nothing else.
-SERVICE_USER = "idp"
+#
+# The restore instance name is constrained to the archive naming pattern
+# (idp-<digits>-<digits>.tar.gz) rather than a bare wildcard, so the service
+# user cannot start an arbitrary idp-restore@<anything>.service instance.
 SUDOERS_RULE = f"""\
 # Managed by scripts/deploy.py — allow the IdP service user to trigger
 # backup/restore units and the SMB connection test, and nothing else.
 {SERVICE_USER} ALL=(root) NOPASSWD: /bin/systemctl start idp-backup.service
-{SERVICE_USER} ALL=(root) NOPASSWD: /bin/systemctl start idp-restore@*.service
+{SERVICE_USER} ALL=(root) NOPASSWD: /bin/systemctl start idp-restore@idp-[0-9]*-[0-9]*.tar.gz.service
 {SERVICE_USER} ALL=(root) NOPASSWD: {REMOTE_VENV}/bin/python -m identity_provider_server.backup_cli test --data-dir {REMOTE_DATA}
 """
 
@@ -139,12 +174,20 @@ def deploy_backup() -> bool:
 
 
 def run(cmd: str | list, *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
-    """Run a local shell command."""
+    """Run a local shell command.
+
+    String commands are built exclusively from module-level constants (host,
+    paths) — no untrusted/user input is interpolated — so shell=True is safe
+    here. Prefer passing a list (no shell) for new call sites.
+    """
     if isinstance(cmd, list):
         print(f"  $ {' '.join(cmd)}")
-        return subprocess.run(cmd, check=check, capture_output=capture, text=True)
+        return subprocess.run(cmd, check=check, capture_output=capture, text=True)  # noqa: S603
     print(f"  $ {cmd}")
-    return subprocess.run(cmd, shell=True, check=check, capture_output=capture, text=True)
+    # nosec B602: fixed, developer-authored commands from constants; no user input.
+    return subprocess.run(  # nosec B602
+        cmd, shell=True, check=check, capture_output=capture, text=True  # noqa: S602
+    )
 
 
 def ssh(cmd: str, *, check: bool = True) -> subprocess.CompletedProcess:
@@ -171,6 +214,23 @@ def deploy() -> bool:
 
     print("\n==> Installing into venv...")
     ssh(f"{REMOTE_VENV}/bin/pip install --quiet {REMOTE_CODE}")
+
+    print("\n==> Ensuring service user and data ownership...")
+    ssh(f"id -u {SERVICE_USER} >/dev/null 2>&1 || "
+        f"useradd --system --home {REMOTE_BASE} --shell /usr/sbin/nologin {SERVICE_USER}",
+        check=False)
+    ssh(f"chown -R {SERVICE_USER}:{SERVICE_USER} {REMOTE_DATA}", check=False)
+
+    print("\n==> Ensuring signing-key EnvironmentFile exists (generated once)...")
+    # Generate a random SECRET_KEY on first deploy; never overwrite an existing
+    # one, and never commit it. Rotate manually if exposed.
+    ssh(
+        f"test -f {REMOTE_ENV_FILE} || "
+        f"(printf 'SECRET_KEY=%s\\n' \"$(openssl rand -hex 32)\" > {REMOTE_ENV_FILE})",
+        check=False,
+    )
+    ssh(f"chown {SERVICE_USER}:{SERVICE_USER} {REMOTE_ENV_FILE} && chmod 600 {REMOTE_ENV_FILE}",
+        check=False)
 
     print("\n==> Writing systemd unit file...")
     with tempfile.NamedTemporaryFile(mode="w", suffix=".service", delete=False) as f:

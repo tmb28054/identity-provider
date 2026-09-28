@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import tarfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -194,7 +195,8 @@ def create_archive(data_dir: str | Path, dest_path: str | Path) -> int:
     dest_path = Path(dest_path)
     included: list[Path] = []
     for name in BACKUP_FILES:
-        if name in EXCLUDED_FILES:
+        # BACKUP_FILES and EXCLUDED_FILES do not overlap, so this is defensive.
+        if name in EXCLUDED_FILES:  # pragma: no cover
             continue
         src = data_dir / name
         if src.is_file():
@@ -288,7 +290,7 @@ def run_backup(
     status.last_attempt = when.isoformat()
 
     try:
-        base = Path(mount_dir) / config.subpath
+        base = safe_base(mount_dir, config.subpath)
         # Ensure the configured subpath (and its daily set) exists on the share.
         daily_dir = base / "daily"
         daily_dir.mkdir(parents=True, exist_ok=True)
@@ -347,6 +349,59 @@ def _is_within(base: Path, target: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+# A backup subpath is a relative path of one or more simple segments. This
+# rejects absolute paths and ``..`` traversal at the boundary.
+_SUBPATH_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
+
+
+class InvalidSubpathError(ValueError):
+    """Raised when a configured backup subpath is unsafe."""
+
+
+def validate_subpath(subpath: str) -> str:
+    """Validate and normalise a backup subpath.
+
+    Args:
+        subpath: The configured subpath within the SMB share.
+
+    Returns:
+        The validated subpath.
+
+    Raises:
+        InvalidSubpathError: If the subpath is absolute, contains ``..``, or
+            uses characters outside the allowed set.
+    """
+    candidate = (subpath or "").strip()
+    if not candidate:
+        return "idp-backup"
+    if candidate.startswith("/") or ".." in candidate.split("/"):
+        raise InvalidSubpathError(f"Unsafe backup subpath: {subpath!r}")
+    if not _SUBPATH_RE.match(candidate):
+        raise InvalidSubpathError(f"Invalid backup subpath: {subpath!r}")
+    return candidate
+
+
+def safe_base(mount_dir: str | Path, subpath: str) -> Path:
+    """Join ``subpath`` under ``mount_dir`` with containment enforcement.
+
+    Args:
+        mount_dir: The mounted SMB share root.
+        subpath: The configured subpath (validated here).
+
+    Returns:
+        The resolved ``mount_dir/subpath`` path.
+
+    Raises:
+        InvalidSubpathError: If the result escapes ``mount_dir``.
+    """
+    mount = Path(mount_dir)
+    base = mount / validate_subpath(subpath)
+    # Defense in depth: validate_subpath already rejects absolute/.. paths.
+    if not _is_within(mount, base):  # pragma: no cover
+        raise InvalidSubpathError(f"Backup subpath escapes mount: {subpath!r}")
+    return base
 
 
 def validate_archive(archive_path: str | Path) -> list[str]:

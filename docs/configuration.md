@@ -145,7 +145,7 @@ The user credentials and role mappings file. Referenced by `data.users_file` in 
 [
   {
     "username": "<string>",
-    "password": "<string — plaintext or bcrypt hash>",
+    "password": "<bcrypt hash — generate with idp-hash-password>",
     "roles": [
       {
         "account_id": "<12-digit AWS account ID>",
@@ -159,7 +159,14 @@ The user credentials and role mappings file. Referenced by `data.users_file` in 
 - Top-level JSON array — multiple users supported.
 - `roles` is an array — a user can access roles across multiple accounts.
 - Changes are picked up automatically (hot-reload on next request).
-- Passwords can be plaintext (dev only) or bcrypt hashes (recommended).
+- Passwords **must** be bcrypt hashes. Plaintext (or any non-bcrypt value) is
+  rejected at login — generate hashes with `idp-hash-password`.
+- A freshly seeded `admin` account carries `"must_set_password": true` and
+  cannot log in until a bcrypt password is set and that marker removed.
+- Optional lifecycle fields: `"enabled": false` disables login;
+  `created_at` / `last_login` are maintained automatically.
+- `"force_password_change": true` forces the user to set a new password on their
+  next login before any credential is issued. The flag clears once they do.
 
 ### Password hashing
 
@@ -190,7 +197,7 @@ idp-hash-password --rounds 14
   },
   {
     "username": "developer",
-    "password": "hunter2",
+    "password": "$2b$12$Q8k2mJ0y4b7e6r5t3u2i1O...",
     "roles": [
       {
         "account_id": "123456789012",
@@ -349,10 +356,16 @@ Session duration is configurable via `saml.session_duration_hours` (default: 1 h
 
 | Feature | Description |
 |---------|-------------|
-| CSRF protection | Login form includes a CSRF token validated on POST |
-| Rate limiting | Configurable failed login attempts per IP (default: 5 per 60s) |
-| Bcrypt passwords | Optional bcrypt hashing for stored passwords |
-| Constant-time comparison | Plaintext passwords use `hmac.compare_digest` |
+| CSRF protection | All state-changing POSTs (login, /user, /recover, /admin) validate a double-submit CSRF token |
+| Rate limiting + lockout | Failed attempts throttled per IP and per account on every credential endpoint (default 5 per 60s) |
+| MFA-bound login | The TOTP step requires a signed, single-use ticket proving the password step passed; a code alone cannot authenticate |
+| Bcrypt passwords | Only bcrypt hashes are accepted; non-bcrypt values are rejected |
+| Password policy | Minimum 12 chars and at least 3 character classes |
+| Purpose-scoped tokens | Session / admin / step-up tokens use distinct purposes and per-purpose derived keys and are not interchangeable |
+| Single-use captcha | Challenges are signed, time-bound, and consumed on use (no replay) |
+| Secure cookies + headers | Secure/HttpOnly/SameSite cookies, HSTS, CSP (nonce-based), X-Content-Type-Options, Referrer-Policy, X-Frame-Options |
+| Session idle timeout | Sessions expire after 30 min of inactivity (12 h absolute cap) |
+| Admin audit trail | Privileged admin mutations (user CRUD, resets, MFA removal, claim/idpadmin grants, SP changes, recovery mint) are audit-logged |
 | Structured logging | JSON-formatted logs with request context |
 | Read-only filesystem | Kubernetes deployment supports `readOnlyRootFilesystem` |
 

@@ -140,6 +140,9 @@ def do_backup(data_dir: str) -> int:
         _record_failure(data_dir, "Backup not configured (missing SMB settings).")
         logger.error("Backup not configured")
         return 2
+    if not config.enabled:
+        logger.info("Backups are disabled in configuration; skipping.")
+        return 0
 
     with tempfile.TemporaryDirectory(prefix="idp-mnt-") as mnt:
         mount_dir = Path(mnt)
@@ -185,7 +188,7 @@ def do_restore(data_dir: str, archive: str) -> int:
             logger.error("%s", exc)
             return 1
         try:
-            base = mount_dir / config.subpath
+            base = bk.safe_base(mount_dir, config.subpath)
             # Look in daily first, then weekly.
             candidates = [base / "daily" / archive, base / "weekly" / archive]
             src = next((c for c in candidates if c.is_file()), None)
@@ -225,7 +228,7 @@ def test_connection(data_dir: str) -> tuple[bool, str]:
             return False, str(exc)
         try:
             _check_writable(mount_dir)
-            base = mount_dir / config.subpath
+            base = bk.safe_base(mount_dir, config.subpath)
             base.mkdir(parents=True, exist_ok=True)
             count = len(bk.list_archives(base / "daily"))
             return True, f"Connected and writable. {count} daily archive(s) present."
@@ -270,7 +273,9 @@ def main(argv: list[str] | None = None) -> int:
         ok, msg = test_connection(args.data_dir)
         print(msg)
         return 0 if ok else 1
-    return 2
+    # pragma-justified: subparser is required, so argparse rejects unknown
+    # commands before this fallthrough is ever reached.
+    return 2  # pragma: no cover
 
 
 if __name__ == "__main__":

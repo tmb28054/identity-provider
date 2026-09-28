@@ -6,18 +6,27 @@ import json
 import logging
 import os
 import random
+import re
 import secrets
 import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, redirect, render_template_string, request
+from flask import Flask, g, redirect, render_template_string, request
 
 from .audit import AuditLogger
 from .oauth_builder import build_oauth_token
 from .saml_builder import ACS_URL, build_saml_response
 from .services import ServiceProvider, load_services
+from .tokens import (
+    PURPOSE_MFA_PENDING,
+    PURPOSE_SESSION,
+    PURPOSE_USER,
+    NonceStore,
+    issue_token,
+    verify_token,
+)
 from .totp import generate_secret, provisioning_uri, qr_code_data_uri, verify_code
 
 logger = logging.getLogger(__name__)
@@ -194,20 +203,27 @@ RECOVERY_PAGE = """
 <body>
   <div class="card">
     <h1>Account Recovery</h1>
-    <p class="subtitle">Hello, {{ username }}. Set your new password{% if qr_data_uri %} and enable MFA{% endif %}.</p>
+    <p class="subtitle">Hello, {{ username }}. Set your new password{% if qr_data_uri %} and enable MFA{% elif mfa_required %} and confirm your MFA code{% endif %}.</p>
     {% if error %}<p class="error">{{ error }}</p>{% endif %}
     {% if success %}<p class="success">{{ success }}</p>{% endif %}
 
     {% if not success %}
     <form method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <input type="hidden" name="recovery_token" value="{{ recovery_token }}">
 
-      <label for="new_password">New password (min 8 characters)</label>
+      <label for="new_password">New password (min 12 characters)</label>
       <input type="password" id="new_password" name="new_password" required minlength="8">
       <label for="confirm_password">Confirm password</label>
       <input type="password" id="confirm_password" name="confirm_password" required minlength="8">
 
-      {% if qr_data_uri %}
+      {% if mfa_required %}
+      <h2 style="border-top:none;margin-top:1rem;padding-top:0;">Confirm MFA</h2>
+      <p style="font-size:0.85rem;color:#555;margin-bottom:0.75rem;">Enter the current 6-digit code from your authenticator app.</p>
+      <label for="totp_code">Authenticator code</label>
+      <input type="text" id="totp_code" name="totp_code" maxlength="6" pattern="[0-9]{6}"
+             autocomplete="one-time-code" inputmode="numeric" required placeholder="123456">
+      {% elif qr_data_uri %}
       <h2 style="border-top:none;margin-top:1rem;padding-top:0;">Set up MFA (optional)</h2>
       <p style="font-size:0.85rem;color:#555;margin-bottom:0.75rem;">Scan with your authenticator app:</p>
       <div class="qr"><img src="{{ qr_data_uri }}" alt="QR Code" width="180" height="180"></div>
@@ -258,7 +274,7 @@ TOTP_FORM = """
     <form method="post">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <input type="hidden" name="totp_step" value="1">
-      <input type="hidden" name="username" value="{{ username }}">
+      <input type="hidden" name="mfa_ticket" value="{{ mfa_ticket }}">
       <input type="hidden" name="service_path" value="{{ service_path }}">
       <label for="totp_code">Verification code</label>
       <input type="text" id="totp_code" name="totp_code" maxlength="6" pattern="[0-9]{6}"
@@ -397,10 +413,12 @@ USER_PAGE_ENROLL = """
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <input type="hidden" name="action" value="change_password">
       <input type="hidden" name="auth_token" value="{{ auth_token }}">
+      <label for="current_password">Current password</label>
+      <input type="password" id="current_password" name="current_password" required>
       <label for="new_password">New password</label>
-      <input type="password" id="new_password" name="new_password" required minlength="8">
+      <input type="password" id="new_password" name="new_password" required minlength="12">
       <label for="confirm_password">Confirm new password</label>
-      <input type="password" id="confirm_password" name="confirm_password" required minlength="8">
+      <input type="password" id="confirm_password" name="confirm_password" required minlength="12">
       <button type="submit">Change Password</button>
     </form>
   </div>
@@ -409,19 +427,112 @@ USER_PAGE_ENROLL = """
 """
 
 
-def _check_password(stored: str, provided: str) -> bool:
-    """Check a password against a stored value.
+# Shown after a successful authentication when the account is flagged for a
+# forced password change. No SAML/JWT/session is issued until the change
+# completes. It carries a short-lived step-up token proving the user just
+# authenticated, so the change is bound to this session.
+FORCED_CHANGE_PAGE = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Password Change Required</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f4f6f9; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .card { background: #fff; border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+      padding: 2rem; width: 100%; max-width: 400px; }
+    h1 { font-size: 1.3rem; margin-bottom: 0.75rem; color: #232f3e; }
+    p.note { font-size: 0.9rem; color: #555; margin-bottom: 1.25rem; }
+    label { display: block; font-size: 0.85rem; color: #555; margin: 0.5rem 0 0.3rem; }
+    input[type="password"] { width: 100%; padding: 0.6rem 0.75rem; border: 1px solid #ccc;
+      border-radius: 4px; font-size: 1rem; }
+    button { width: 100%; padding: 0.7rem; margin-top: 1rem; background: #0073bb; color: #fff;
+      border: none; border-radius: 4px; font-size: 1rem; cursor: pointer; }
+    button:hover { background: #005a94; }
+    .error { color: #d13212; font-size: 0.85rem; margin-bottom: 1rem; }
+    .success { color: #1a7f37; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Password change required</h1>
+    {% if success %}
+      <p class="success">{{ success }}</p>
+    {% else %}
+      <p class="note">Your administrator requires you to set a new password before continuing.</p>
+      {% if error %}<p class="error">{{ error }}</p>{% endif %}
+      <form method="post" action="/user">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="action" value="force_change">
+        <input type="hidden" name="auth_token" value="{{ auth_token }}">
+        <label for="current_password">Current password</label>
+        <input type="password" id="current_password" name="current_password" required>
+        <label for="new_password">New password (min 12 characters)</label>
+        <input type="password" id="new_password" name="new_password" required minlength="12">
+        <label for="confirm_password">Confirm new password</label>
+        <input type="password" id="confirm_password" name="confirm_password" required minlength="12">
+        <button type="submit">Change password</button>
+      </form>
+    {% endif %}
+  </div>
+</body>
+</html>
+"""
 
-    Supports both bcrypt hashes (starting with $2b$) and plaintext passwords
-    (for backward compatibility). Plaintext comparison uses constant-time
-    comparison to avoid timing attacks.
+
+_BCRYPT_PREFIXES = ("$2a$", "$2b$", "$2y$")
+# A valid but non-matching bcrypt hash, used to equalise timing when the stored
+# value is unusable so an attacker cannot distinguish that case from a wrong
+# password. It is never expected to match any real input.
+_DUMMY_BCRYPT_HASH = b"$2b$12$xqbTfXWMEaMp3sym0SL0/.xghcHMx7WPgGncfpJYimAFLypk8ddDm"
+
+
+def _user_can_login(user: dict[str, Any]) -> bool:
+    """Return True if the account is permitted to authenticate.
+
+    Accounts flagged ``must_set_password`` (a freshly seeded admin), explicitly
+    disabled (``enabled == False``), or lacking any stored password are refused.
+
+    Args:
+        user: The user record.
+
+    Returns:
+        Whether the account may proceed to a password check.
     """
-    if stored.startswith("$2b$"):
-        import bcrypt
+    if user.get("must_set_password"):
+        return False
+    if user.get("enabled") is False:
+        return False
+    return bool(user.get("password"))
 
+
+def _check_password(stored: str, provided: str) -> bool:
+    """Check a password against a stored bcrypt hash.
+
+    Only bcrypt hashes are accepted. Any stored value that is not a recognised
+    bcrypt hash (a seeded plaintext password, or a foreign digest that would
+    otherwise be usable as a literal password) is treated as unusable and
+    authentication fails. A dummy bcrypt check is still performed so timing does
+    not distinguish "no usable hash" from "wrong password".
+
+    Args:
+        stored: The stored password value (expected to be a bcrypt hash).
+        provided: The candidate password.
+
+    Returns:
+        True only if ``stored`` is a bcrypt hash and ``provided`` matches it.
+    """
+    import bcrypt
+
+    if stored.startswith(_BCRYPT_PREFIXES):
         return bcrypt.checkpw(provided.encode(), stored.encode())
-    # Plaintext fallback — constant-time comparison
-    return hmac.compare_digest(stored, provided)
+    # Non-bcrypt stored value: refuse, but spend comparable time.
+    logger.warning("Rejected login for account with non-bcrypt stored password")
+    bcrypt.checkpw(provided.encode(), _DUMMY_BCRYPT_HASH)
+    return False
 
 
 class _RateLimiter:
@@ -443,11 +554,98 @@ class _RateLimiter:
         self._attempts[key].append(time.time())
 
 
-def _generate_challenge(secret: str) -> tuple[str, str, str]:
-    """Generate a math challenge and its signed hash.
+MIN_PASSWORD_LENGTH = 12
 
-    Returns (question_text, correct_answer, challenge_hash).
-    The hash is HMAC(secret, answer) so the server can verify without storing state.
+
+def _now_iso() -> str:
+    """Return the current UTC time as an ISO-8601 string (lifecycle stamps)."""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _password_policy_error(password: str) -> str | None:
+    """Validate a password against the complexity policy.
+
+    Requires at least ``MIN_PASSWORD_LENGTH`` characters and a mix of character
+    classes (lower, upper, digit, symbol — at least three of the four).
+
+    Args:
+        password: The candidate password.
+
+    Returns:
+        An error message if the password is unacceptable, else ``None``.
+    """
+    if not password or len(password) < MIN_PASSWORD_LENGTH:
+        return f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
+    classes = sum(
+        bool(match)
+        for match in (
+            any(c.islower() for c in password),
+            any(c.isupper() for c in password),
+            any(c.isdigit() for c in password),
+            any(not c.isalnum() for c in password),
+        )
+    )
+    if classes < 3:
+        return (
+            "Password must include at least three of: lowercase, uppercase, "
+            "digit, symbol."
+        )
+    return None
+
+
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9._@-]+$")
+_CLAIM_RE = re.compile(r"^[a-z0-9_-]+$")
+
+
+def _validate_username(username: str) -> bool:
+    """Return True if ``username`` matches the allowed character set.
+
+    Restricting the charset prevents values that could break out of a JS/HTML
+    context in the admin panel and keeps identifiers predictable.
+    """
+    return bool(username) and bool(_USERNAME_RE.match(username))
+
+
+def _validate_claim(claim: str) -> bool:
+    """Return True if ``claim`` matches the allowed character set."""
+    return bool(claim) and bool(_CLAIM_RE.match(claim))
+
+
+def _rl_key(client_ip: str, username: str = "") -> str:
+    """Build a rate-limit key.
+
+    Keying on both the client IP and the username bounds password spraying
+    against a single account across many source IPs as well as brute force
+    from a single IP.
+
+    Args:
+        client_ip: The requesting client IP.
+        username: The account being targeted, if known.
+
+    Returns:
+        A composite string key.
+    """
+    return f"{client_ip}|{username}" if username else client_ip
+
+
+CAPTCHA_MAX_AGE = 300  # seconds a challenge stays valid
+
+
+def _generate_challenge(secret: str) -> tuple[str, str, str]:
+    """Generate a math challenge and its signed, single-use token.
+
+    The token binds the answer to a random nonce and an issue timestamp:
+    ``nonce:issued_at:HMAC(secret, "nonce:issued_at:answer")``. This makes a
+    captured (answer, token) pair non-replayable (the nonce is recorded on
+    first use) and short-lived, closing the previous stateless-captcha bypass.
+
+    Args:
+        secret: The application secret used to sign the challenge.
+
+    Returns:
+        ``(question_text, correct_answer, challenge_token)``.
     """
     ops = [
         ("+", lambda a, b: a + b),
@@ -464,24 +662,65 @@ def _generate_challenge(secret: str) -> tuple[str, str, str]:
 
     answer = str(op_func(a, b))
     question = f"What is {a} {op_symbol} {b}?"
-    challenge_hash = hmac.new(
-        secret.encode(), answer.encode(), hashlib.sha256
+    nonce = secrets.token_urlsafe(9)
+    issued_at = int(time.time())
+    sig = hmac.new(
+        secret.encode(), f"{nonce}:{issued_at}:{answer}".encode(), hashlib.sha256
     ).hexdigest()
+    challenge_token = f"{nonce}:{issued_at}:{sig}"
 
-    return question, answer, challenge_hash
+    return question, answer, challenge_token
 
 
-def _verify_challenge(secret: str, answer: str, expected_hash: str) -> bool:
-    """Verify a challenge answer against its signed hash."""
-    computed = hmac.new(
-        secret.encode(), answer.strip().encode(), hashlib.sha256
+def _verify_challenge(
+    secret: str, answer: str, challenge_token: str, nonces: NonceStore | None = None
+) -> bool:
+    """Verify a challenge answer against its single-use, time-bound token.
+
+    Args:
+        secret: The application secret.
+        answer: The answer the user submitted.
+        challenge_token: The ``nonce:issued_at:sig`` token from the form.
+        nonces: Optional nonce store; when provided, a token can be used once.
+
+    Returns:
+        True only if the signature matches, the token is not expired, and (when
+        a nonce store is provided) the nonce has not been used before.
+    """
+    parts = challenge_token.split(":")
+    if len(parts) != 3:
+        return False
+    nonce, ts_str, sig = parts
+    try:
+        issued_at = int(ts_str)
+    except ValueError:
+        return False
+    if issued_at < 0 or time.time() - issued_at > CAPTCHA_MAX_AGE:
+        return False
+    expected = hmac.new(
+        secret.encode(), f"{nonce}:{issued_at}:{answer.strip()}".encode(), hashlib.sha256
     ).hexdigest()
-    return hmac.compare_digest(computed, expected_hash)
+    if not hmac.compare_digest(sig, expected):
+        return False
+    return not (nonces is not None and not nonces.consume(nonce))
 
 
 def _load_users(users_path: Path) -> dict[str, Any]:
     """Load users from a JSON file."""
     return {u["username"]: u for u in json.loads(users_path.read_text())}
+
+
+def _users_digest(users_path: Path) -> str | None:
+    """Return a content hash of the users file, or None if unreadable.
+
+    Hashing the bytes (rather than trusting mtime/size) means any out-of-band
+    edit is detected on the next request, even if the size is unchanged or the
+    modification time is coincidentally equal.
+    """
+    try:
+        return hashlib.sha256(users_path.read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
 def _save_users(users_path: Path, users: dict[str, Any]) -> None:
@@ -506,6 +745,8 @@ def create_app(
     adfs_config: dict[str, str] | None = None,
     group_role_map: dict[str, list[dict[str, str]]] | None = None,
     skip_ldap_ssl_verify: bool = False,
+    secure_cookies: bool = True,
+    trust_proxy: bool = True,
 ) -> Flask:
     """Flask application factory.
 
@@ -524,6 +765,11 @@ def create_app(
         adfs_config: ADFS/LDAP connection config dict (enables ADFS auth mode).
         group_role_map: Mapping of AD group names to AWS role dicts (used with ADFS).
         skip_ldap_ssl_verify: If True, disable TLS certificate verification for LDAP.
+        secure_cookies: If True (default), set the Secure flag on all cookies.
+            Set False only for local HTTP development.
+        trust_proxy: If True (default), honour X-Forwarded-For/Proto from a
+            single upstream reverse proxy so rate limiting keys on the real
+            client IP.
     """
     data = Path(data_dir)
 
@@ -539,16 +785,15 @@ def create_app(
     if use_adfs:
         users = {}
         users_path = None
-        users_mtime = 0.0
-        users_size = 0
+        users_digest = None
         _group_role_map = group_role_map or {}
         logger.info("ADFS authentication mode enabled (host=%s)", adfs_config.get("host"))
     else:
         users_path = _resolve(users_file)
         users = _load_users(users_path)
-        _stat = users_path.stat()
-        users_mtime = _stat.st_mtime
-        users_size = _stat.st_size
+        # Track the file by content hash so any out-of-band edit is detected
+        # on the next request (mtime/size alone can miss same-size rewrites).
+        users_digest = _users_digest(users_path)
         _group_role_map = {}
 
     idp_entity_id = f"http://{host}:{port}/metadata"
@@ -561,9 +806,38 @@ def create_app(
     app = Flask(__name__)
     app.secret_key = secret_key or os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 
+    # Trust exactly one upstream proxy for the client IP / scheme so rate
+    # limiting keys on the real client rather than the proxy address.
+    if trust_proxy:
+        from werkzeug.middleware.proxy_fix import ProxyFix
+
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)  # type: ignore[method-assign]
+
+    # Whether to mark cookies Secure. On by default; callers disable only for
+    # local plain-HTTP development.
+    _cookies_secure = secure_cookies
+
+    app.config.update(
+        SESSION_COOKIE_SECURE=secure_cookies,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Strict",
+    )
+
     rate_limiter = _RateLimiter(
         max_attempts=rate_limit_max_attempts, window_seconds=rate_limit_window_seconds
     )
+
+    # Single-use nonce store backing the short-lived MFA "password proven"
+    # ticket, so an observed ticket cannot be replayed within its window.
+    MFA_TICKET_MAX_AGE = 120  # seconds
+    mfa_nonces = NonceStore(ttl_seconds=MFA_TICKET_MAX_AGE)
+
+    # Single-use nonce store for captcha challenges (replay protection).
+    captcha_nonces = NonceStore(ttl_seconds=CAPTCHA_MAX_AGE)
+
+    def _check_challenge(answer: str, token: str) -> bool:
+        """Verify a captcha answer/token, consuming the nonce on success."""
+        return _verify_challenge(app.secret_key, answer, token, captcha_nonces)
 
     audit = AuditLogger(data_dir)
 
@@ -576,25 +850,72 @@ def create_app(
         """Generate a CSRF token tied to the app secret."""
         return secrets.token_hex(32)
 
+    @app.after_request
+    def _security_headers(resp):  # type: ignore[no-untyped-def]
+        """Add hardening headers and enforce the Secure cookie flag.
+
+        Setting Secure here (rather than at each ``set_cookie`` call site)
+        guarantees no handler can accidentally emit a credential cookie without
+        it. HSTS is only emitted when cookies are Secure (i.e. an HTTPS
+        deployment) to avoid pinning HTTPS during local HTTP development.
+
+        The Content-Security-Policy uses a per-request nonce for the single
+        inline ``<script>`` block the admin panel needs; inline event-handler
+        attributes are disallowed, which is what neutralises reflected/stored
+        script in interpolated values.
+        """
+        if _cookies_secure:
+            resp.headers.setdefault(
+                "Strict-Transport-Security",
+                "max-age=31536000; includeSubDomains",
+            )
+            # Ensure every cookie carries Secure even if a handler omitted it.
+            cookies = resp.headers.getlist("Set-Cookie")
+            if cookies:
+                resp.headers.pop("Set-Cookie")
+                for cookie in cookies:
+                    if "secure" not in cookie.lower():
+                        cookie = f"{cookie}; Secure"
+                    resp.headers.add("Set-Cookie", cookie)
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("Referrer-Policy", "no-referrer")
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        nonce = getattr(g, "csp_nonce", "")
+        script_src = f"script-src 'self' 'nonce-{nonce}'" if nonce else "script-src 'self'"
+        resp.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+            f"{script_src}; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+        )
+        return resp
+
     def _make_challenge() -> tuple[str, str]:
         """Generate a challenge question and its verification hash."""
         question, _answer, challenge_hash = _generate_challenge(app.secret_key)
         return question, challenge_hash
 
     def _reload_users_if_changed() -> None:
-        """Reload users.json if the file has been modified."""
-        nonlocal users, users_mtime, users_size
+        """Reload users.json if its content hash has changed.
+
+        Comparing a content digest (rather than mtime/size) guarantees that any
+        edit — including out-of-band writes that keep the same size or mtime — is
+        picked up on the next request, so the in-memory copy can never go stale.
+        """
+        nonlocal users, users_digest
         if use_adfs or users_path is None:
             return
-        try:
-            stat = users_path.stat()
-            if stat.st_mtime != users_mtime or stat.st_size != users_size:
+        current = _users_digest(users_path)
+        if current is None:
+            logger.warning("Could not read users.json for hot-reload check")
+            return
+        if current != users_digest:
+            try:
                 users = _load_users(users_path)
-                users_mtime = stat.st_mtime
-                users_size = stat.st_size
-                logger.info("Reloaded users.json (file changed)")
-        except OSError:
-            logger.warning("Could not stat users.json for hot-reload check")
+            except (OSError, ValueError) as exc:
+                logger.warning("Could not reload users.json: %s", exc)
+                return
+            users_digest = current
+            logger.info("Reloaded users.json (content changed)")
 
     @app.get("/health")
     def health():
@@ -657,6 +978,7 @@ def create_app(
 
     @app.before_request
     def _before_request() -> None:
+        g.csp_nonce = secrets.token_urlsafe(16)
         _reload_users_if_changed()
         _reload_services_if_changed()
 
@@ -682,7 +1004,9 @@ def create_app(
             return True, groups
         else:
             user = users.get(username)
-            if not user or not _check_password(user["password"], password):
+            if not user or not _user_can_login(user):
+                return False, None
+            if not _check_password(user.get("password", ""), password):
                 return False, None
             return True, _resolve_roles_from_claims(user)
 
@@ -713,7 +1037,10 @@ def create_app(
                         email=user.get("email"),
                     )
                     separator = "&" if "?" in sp.url else "?"
-                    return redirect(f"{sp.url}{separator}token={token}")
+                    resp = app.make_response(redirect(f"{sp.url}{separator}token={token}"))
+                    # Slide the idle window on each authenticated use.
+                    _set_session_cookie(resp, session_user)
+                    return resp
                 else:
                     sp_acs_url = sp.url if sp else ACS_URL
                     sp_provider = sp.provider_name if sp else provider_name
@@ -724,7 +1051,11 @@ def create_app(
                         provider_name=sp_provider, session_duration_hours=sp_duration,
                         acs_url=sp_acs_url, audience=sp_audience,
                     )
-                    return render_template_string(SAML_POST, acs=sp_acs_url, saml=saml_b64)
+                    resp = app.make_response(
+                        render_template_string(SAML_POST, acs=sp_acs_url, saml=saml_b64)
+                    )
+                    _set_session_cookie(resp, session_user)
+                    return resp
 
         sp = _get_service(service_path)
         title = service_path.upper() if sp else "AWS Console"
@@ -792,9 +1123,22 @@ def create_app(
         # Check if this is a TOTP verification step (second factor) — skip challenge
         totp_step = request.form.get("totp_step", "")
         if totp_step == "1":
-            # Verify TOTP code
+            # The username comes from a signed, single-use ticket proving the
+            # password step already passed — never from an unauthenticated form
+            # field. A ticket alone (without a prior password) cannot exist.
             totp_code = request.form.get("totp_code", "")
-            auth_username = request.form.get("username", "")
+            ticket_info = _read_mfa_ticket(request.form.get("mfa_ticket", ""))
+            if ticket_info is None:
+                question, new_hash = _make_challenge()
+                return render_template_string(
+                    LOGIN_FORM,
+                    error="Your session expired. Please sign in again.",
+                    csrf_token=_generate_csrf_token(),
+                    challenge_question=question,
+                    challenge_hash=new_hash,
+                    service_title=title,
+                ), 401
+            auth_username, ticket_nonce = ticket_info
             user = users.get(auth_username)
             if not user or not user.get("totp_secret"):
                 question, new_hash = _make_challenge()
@@ -808,7 +1152,7 @@ def create_app(
                 ), 401
 
             if not verify_code(user["totp_secret"], totp_code):
-                rate_limiter.record(client_ip)
+                rate_limiter.record(_rl_key(client_ip, auth_username))
                 audit.log(
                     username=auth_username,
                     ip=client_ip,
@@ -823,15 +1167,28 @@ def create_app(
                     TOTP_FORM,
                     error="Invalid code. Try again.",
                     csrf_token=token,
-                    username=auth_username,
+                    mfa_ticket=request.form.get("mfa_ticket", ""),
                     service_path=service_path,
                 ))
-                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                resp.set_cookie(
+                    "csrf_token", token, httponly=True,
+                    samesite="Strict", secure=_cookies_secure,
+                )
                 return resp, 401
 
-            # TOTP verified — proceed with token issuance
+            # TOTP verified — burn the single-use ticket, then issue credentials.
+            if not _consume_mfa_nonce(auth_username, ticket_nonce):
+                question, new_hash = _make_challenge()
+                return render_template_string(
+                    LOGIN_FORM,
+                    error="Your session expired. Please sign in again.",
+                    csrf_token=_generate_csrf_token(),
+                    challenge_question=question,
+                    challenge_hash=new_hash,
+                    service_title=title,
+                ), 401
             username = auth_username
-            if use_adfs:
+            if use_adfs:  # pragma: no cover - ADFS accounts never carry a local totp_secret, so this MFA-ticket branch is unreachable in ADFS mode
                 from .adfs import groups_to_roles
                 roles = groups_to_roles([], _group_role_map)
                 groups = []
@@ -843,6 +1200,7 @@ def create_app(
                 "Successful MFA login: user=%s service=%s from ip=%s",
                 username, service_path, client_ip,
             )
+            _record_login(username)
             audit.log(
                 username=username,
                 ip=client_ip,
@@ -851,6 +1209,10 @@ def create_app(
                 result="success",
                 user_agent=request.headers.get("User-Agent", ""),
             )
+
+            # Forced rotation: block credential issuance until the password is changed.
+            if _needs_password_change(username):
+                return _forced_change_response(username)
 
             # Issue the token
             if sp and sp.protocol == "oauth":
@@ -866,7 +1228,7 @@ def create_app(
                 _set_session_cookie(resp, username)
                 return resp
             else:
-                if use_adfs and not roles:
+                if use_adfs and not roles:  # pragma: no cover - unreachable: ADFS accounts have no local totp_secret to reach this MFA-ticket branch
                     question, new_hash = _make_challenge()
                     return render_template_string(
                         LOGIN_FORM,
@@ -894,9 +1256,33 @@ def create_app(
         username = request.form.get("username", "")
         password = request.form.get("password", "")
 
+        # Per-account lockout check (bounds spraying one account from many IPs).
+        if username and rate_limiter.is_limited(f"acct:{username}"):
+            audit.log(
+                username=username,
+                ip=client_ip,
+                service=service_path,
+                protocol=sp.protocol if sp else "saml",
+                result="failure",
+                reason="rate_limited",
+                user_agent=request.headers.get("User-Agent", ""),
+            )
+            question, new_hash = _make_challenge()
+            return render_template_string(
+                LOGIN_FORM,
+                error="Too many attempts. Try again later.",
+                csrf_token=_generate_csrf_token(),
+                challenge_question=question,
+                challenge_hash=new_hash,
+                service_title=title,
+            ), 429
+
         success, auth_result = _authenticate_user(username, password)
         if not success:
-            rate_limiter.record(client_ip)
+            rate_limiter.record(_rl_key(client_ip, username))
+            rate_limiter.record(client_ip)  # also throttle at the IP level
+            if username:
+                rate_limiter.record(f"acct:{username}")  # per-account lockout
             logger.info("Failed login for user=%s from ip=%s", username, client_ip)
             audit.log(
                 username=username,
@@ -925,8 +1311,8 @@ def create_app(
             user_has_mfa = bool(user and user.get("totp_secret"))
 
         if not user_has_mfa:  # noqa: SIM102 - kept nested for auth-flow clarity
-            if not _verify_challenge(app.secret_key, challenge_answer, challenge_hash_val):
-                rate_limiter.record(client_ip)
+            if not _check_challenge(challenge_answer, challenge_hash_val):
+                rate_limiter.record(_rl_key(client_ip, username))
                 logger.info("Failed challenge from ip=%s", client_ip)
                 audit.log(
                     username=username,
@@ -961,22 +1347,28 @@ def create_app(
         if not use_adfs:
             user = users.get(username)
             if user and user.get("totp_secret"):
-                # Show TOTP form instead of issuing token
+                # Password proven — hand out a single-use ticket that the TOTP
+                # step will verify. The username is NOT trusted from the form on
+                # the second step; it is derived from this signed ticket.
                 token = _generate_csrf_token()
                 resp = app.make_response(render_template_string(
                     TOTP_FORM,
                     error=None,
                     csrf_token=token,
-                    username=username,
+                    mfa_ticket=_issue_mfa_ticket(username),
                     service_path=service_path,
                 ))
-                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                resp.set_cookie(
+                    "csrf_token", token, httponly=True,
+                    samesite="Strict", secure=_cookies_secure,
+                )
                 return resp
 
         logger.info(
             "Successful login: user=%s service=%s from ip=%s",
             username, service_path, client_ip,
         )
+        _record_login(username)
         audit.log(
             username=username,
             ip=client_ip,
@@ -985,6 +1377,10 @@ def create_app(
             result="success",
             user_agent=request.headers.get("User-Agent", ""),
         )
+
+        # Forced rotation: block credential issuance until the password is changed.
+        if _needs_password_change(username):
+            return _forced_change_response(username)
 
         # Determine protocol and respond accordingly
         if sp and sp.protocol == "oauth":
@@ -1033,73 +1429,77 @@ def create_app(
             )
             return render_template_string(SAML_POST, acs=sp_acs_url, saml=saml_b64)
 
-    def _issue_auth_token(username: str) -> str:
-        """Issue a short-lived HMAC token proving the user authenticated."""
-        payload = f"{username}:{int(time.time())}"
-        sig = hmac.new(app.secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
-        return f"{payload}:{sig}"
+    # Step-up token lifetime for the self-service /user flow.
+    USER_STEPUP_MAX_AGE = 300  # 5 minutes
 
-    def _verify_auth_token(token: str, max_age: int = 300) -> str | None:
-        """Verify an auth token and return the username if valid (within max_age seconds)."""
-        parts = token.rsplit(":", 1)
-        if len(parts) != 2:
+    def _issue_auth_token(username: str) -> str:
+        """Issue a short-lived, purpose-scoped self-service step-up token."""
+        return issue_token(app.secret_key, username, PURPOSE_USER)
+
+    def _verify_auth_token(token: str, max_age: int = USER_STEPUP_MAX_AGE) -> str | None:
+        """Verify a self-service step-up token; return the username if valid."""
+        return verify_token(app.secret_key, token, PURPOSE_USER, max_age)
+
+    def _issue_mfa_ticket(username: str) -> str:
+        """Issue a single-use ticket proving the password step already passed.
+
+        The ticket embeds a random nonce so a second use is rejected by the
+        nonce store, and it is purpose-scoped so it cannot be replayed as a
+        session or step-up credential.
+        """
+        nonce = secrets.token_urlsafe(16)
+        return issue_token(app.secret_key, f"{username}|{nonce}", PURPOSE_MFA_PENDING)
+
+    def _read_mfa_ticket(ticket: str) -> tuple[str, str] | None:
+        """Verify an MFA ticket's signature/age/purpose without consuming it.
+
+        Returns ``(username, nonce)`` if valid, else ``None``. The nonce is
+        consumed separately (only when credentials are actually issued) so a
+        mistyped TOTP code does not invalidate the ticket.
+        """
+        subject = verify_token(
+            app.secret_key, ticket, PURPOSE_MFA_PENDING, MFA_TICKET_MAX_AGE
+        )
+        if subject is None or "|" not in subject:
             return None
-        payload, sig = parts
-        expected = hmac.new(app.secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected):
-            return None
-        user_parts = payload.rsplit(":", 1)
-        if len(user_parts) != 2:
-            return None
-        username, ts_str = user_parts
-        try:
-            ts = int(ts_str)
-        except ValueError:
-            return None
-        if time.time() - ts > max_age:
-            return None
-        return username
+        username, nonce = subject.rsplit("|", 1)
+        return username, nonce
+
+    def _consume_mfa_nonce(username: str, nonce: str) -> bool:
+        """Consume the ticket nonce; False if already used (replay)."""
+        if not mfa_nonces.consume(nonce):
+            logger.warning("Rejected replayed MFA ticket for user=%s", username)
+            return False
+        return True
 
     SESSION_COOKIE_NAME = "idp_session"
-    SESSION_MAX_AGE = 12 * 3600  # 12 hours
+    SESSION_MAX_AGE = 12 * 3600  # 12 hours (absolute cap)
+    SESSION_IDLE_MAX_AGE = 30 * 60  # 30 minutes of inactivity
 
     def _issue_session_cookie(username: str) -> str:
-        """Issue a signed session cookie value (username + timestamp + HMAC)."""
-        payload = f"{username}:{int(time.time())}"
-        sig = hmac.new(app.secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
-        return f"{payload}:{sig}"
+        """Issue a signed, purpose-scoped session cookie value."""
+        return issue_token(app.secret_key, username, PURPOSE_SESSION)
 
     def _verify_session_cookie(cookie_val: str) -> str | None:
-        """Verify session cookie. Returns username if valid and not expired."""
-        if not cookie_val:
-            return None
-        parts = cookie_val.rsplit(":", 1)
-        if len(parts) != 2:
-            return None
-        payload, sig = parts
-        expected = hmac.new(app.secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected):
-            return None
-        user_parts = payload.rsplit(":", 1)
-        if len(user_parts) != 2:
-            return None
-        username, ts_str = user_parts
-        try:
-            ts = int(ts_str)
-        except ValueError:
-            return None
-        if time.time() - ts > SESSION_MAX_AGE:
-            return None
-        return username
+        """Verify a session cookie against both the idle and absolute limits.
+
+        The signed timestamp is treated as the last-activity marker (the cookie
+        is re-issued on each authenticated request), so exceeding the idle
+        window invalidates the session even within the absolute cap.
+        """
+        return verify_token(
+            app.secret_key, cookie_val, PURPOSE_SESSION, SESSION_IDLE_MAX_AGE
+        )
 
     def _set_session_cookie(resp, username: str):
-        """Set the session cookie on a response."""
+        """Set the session cookie on a response (Secure in non-debug mode)."""
         resp.set_cookie(
             SESSION_COOKIE_NAME,
             _issue_session_cookie(username),
             max_age=SESSION_MAX_AGE,
             httponly=True,
             samesite="Strict",
+            secure=_cookies_secure,
         )
 
     # --- /user route for MFA enrollment ---
@@ -1125,16 +1525,47 @@ def create_app(
             resp = app.make_response(render_template_string(
                 USER_PAGE_LOGIN, error="Invalid request (CSRF)", csrf_token=token,
             ))
-            resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+            resp.set_cookie(
+                "csrf_token", token, httponly=True,
+                samesite="Strict", secure=_cookies_secure,
+            )
             return resp, 403
 
         action = request.form.get("action", "login")
+        client_ip = request.remote_addr or "unknown"
+
+        # Throttle credential-bearing actions on the self-service endpoint.
+        if action == "login" and rate_limiter.is_limited(client_ip):
+            token = _generate_csrf_token()
+            question, ch_hash = _make_challenge()
+            resp = app.make_response(render_template_string(
+                USER_PAGE_LOGIN, error="Too many attempts. Try again later.",
+                csrf_token=token, challenge_question=question, challenge_hash=ch_hash,
+            ))
+            resp.set_cookie(
+                "csrf_token", token, httponly=True,
+                samesite="Strict", secure=_cookies_secure,
+            )
+            return resp, 429
 
         # Handle TOTP verification for /user access (from TOTP_FORM)
         totp_step = request.form.get("totp_step", "")
         if totp_step == "1" and request.form.get("service_path") == "user":
-            username = request.form.get("username", "")
             totp_code = request.form.get("totp_code", "")
+            # Username is derived from the signed single-use ticket, never the form.
+            ticket_info = _read_mfa_ticket(request.form.get("mfa_ticket", ""))
+            if ticket_info is None:
+                token = _generate_csrf_token()
+                resp = app.make_response(render_template_string(
+                    USER_PAGE_LOGIN, error="Your session expired. Please sign in again.",
+                    csrf_token=token,
+                ))
+                resp.set_cookie(
+                    "csrf_token", token, httponly=True,
+                    samesite="Strict", secure=_cookies_secure,
+                )
+                return resp, 401
+            username, ticket_nonce = ticket_info
             user = users.get(username)
             if not user or not user.get("totp_secret"):
                 token = _generate_csrf_token()
@@ -1142,19 +1573,38 @@ def create_app(
                     USER_PAGE_LOGIN, error="Invalid request. Please sign in again.",
                     csrf_token=token,
                 ))
-                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                resp.set_cookie(
+                    "csrf_token", token, httponly=True,
+                    samesite="Strict", secure=_cookies_secure,
+                )
                 return resp, 401
 
             if not verify_code(user["totp_secret"], totp_code):
+                rate_limiter.record(_rl_key(client_ip, username))
                 token = _generate_csrf_token()
                 resp = app.make_response(render_template_string(
                     TOTP_FORM,
                     error="Invalid code. Try again.",
                     csrf_token=token,
-                    username=username,
+                    mfa_ticket=request.form.get("mfa_ticket", ""),
                     service_path="user",
                 ))
-                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                resp.set_cookie(
+                    "csrf_token", token, httponly=True,
+                    samesite="Strict", secure=_cookies_secure,
+                )
+                return resp, 401
+
+            if not _consume_mfa_nonce(username, ticket_nonce):
+                token = _generate_csrf_token()
+                resp = app.make_response(render_template_string(
+                    USER_PAGE_LOGIN, error="Your session expired. Please sign in again.",
+                    csrf_token=token,
+                ))
+                resp.set_cookie(
+                    "csrf_token", token, httponly=True,
+                    samesite="Strict", secure=_cookies_secure,
+                )
                 return resp, 401
 
             # TOTP verified — show settings page
@@ -1176,7 +1626,7 @@ def create_app(
             # Verify challenge
             challenge_answer = request.form.get("challenge_answer", "")
             challenge_hash_val = request.form.get("challenge_hash", "")
-            if not _verify_challenge(app.secret_key, challenge_answer, challenge_hash_val):
+            if not _check_challenge(challenge_answer, challenge_hash_val):
                 token = _generate_csrf_token()
                 question, ch_hash = _make_challenge()
                 resp = app.make_response(render_template_string(
@@ -1188,15 +1638,38 @@ def create_app(
 
             username = request.form.get("username", "")
             password = request.form.get("password", "")
+            if username and rate_limiter.is_limited(f"acct:{username}"):
+                token = _generate_csrf_token()
+                question, ch_hash = _make_challenge()
+                resp = app.make_response(render_template_string(
+                    USER_PAGE_LOGIN, error="Too many attempts. Try again later.",
+                    csrf_token=token, challenge_question=question, challenge_hash=ch_hash,
+                ))
+                resp.set_cookie(
+                    "csrf_token", token, httponly=True,
+                    samesite="Strict", secure=_cookies_secure,
+                )
+                return resp, 429
             user = users.get(username)
-            if not user or not _check_password(user["password"], password):
+            if (
+                not user
+                or not _user_can_login(user)
+                or not _check_password(user.get("password", ""), password)
+            ):
+                rate_limiter.record(_rl_key(client_ip, username))
+                rate_limiter.record(client_ip)  # also throttle at the IP level
+                if username:
+                    rate_limiter.record(f"acct:{username}")  # per-account lockout
                 token = _generate_csrf_token()
                 question, ch_hash = _make_challenge()
                 resp = app.make_response(render_template_string(
                     USER_PAGE_LOGIN, error="Invalid credentials", csrf_token=token,
                     challenge_question=question, challenge_hash=ch_hash,
                 ))
-                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                resp.set_cookie(
+                    "csrf_token", token, httponly=True,
+                    samesite="Strict", secure=_cookies_secure,
+                )
                 return resp, 401
 
             # If MFA is enabled, require TOTP before granting access
@@ -1207,10 +1680,13 @@ def create_app(
                     TOTP_FORM,
                     error=None,
                     csrf_token=token,
-                    username=username,
+                    mfa_ticket=_issue_mfa_ticket(username),
                     service_path="user",
                 ))
-                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                resp.set_cookie(
+                    "csrf_token", token, httponly=True,
+                    samesite="Strict", secure=_cookies_secure,
+                )
                 return resp
 
             # No MFA — go straight to enrollment page
@@ -1316,6 +1792,79 @@ def create_app(
             resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
             return resp
 
+        elif action == "force_change":
+            # Complete a forced password rotation. Requires the step-up token
+            # from the forced-change page, the current password, and a new
+            # policy-compliant password. Clears the rotation flag on success.
+            auth_token = request.form.get("auth_token", "")
+            username = _verify_auth_token(auth_token)
+            if not username:
+                token = _generate_csrf_token()
+                resp = app.make_response(render_template_string(
+                    USER_PAGE_LOGIN, error="Session expired. Please sign in again.",
+                    csrf_token=token,
+                ))
+                resp.set_cookie(
+                    "csrf_token", token, httponly=True,
+                    samesite="Strict", secure=_cookies_secure,
+                )
+                return resp, 401
+
+            current_password = request.form.get("current_password", "")
+            new_password = request.form.get("new_password", "")
+            confirm_password = request.form.get("confirm_password", "")
+            user = users.get(username)
+
+            error = None
+            policy_error = _password_policy_error(new_password)
+            if not user or not _check_password(user.get("password", ""), current_password):
+                error = "Current password is incorrect."
+            elif policy_error is not None:
+                error = policy_error
+            elif new_password != confirm_password:
+                error = "Passwords do not match."
+            elif _check_password(user.get("password", ""), new_password):
+                error = "New password must differ from the current password."
+
+            if error:
+                token = _generate_csrf_token()
+                resp = app.make_response(render_template_string(
+                    FORCED_CHANGE_PAGE,
+                    csrf_token=token,
+                    auth_token=_issue_auth_token(username),
+                    error=error,
+                    success=None,
+                ))
+                resp.set_cookie(
+                    "csrf_token", token, httponly=True,
+                    samesite="Strict", secure=_cookies_secure,
+                )
+                return resp, 400
+
+            import bcrypt as _bcrypt
+            user["password"] = _bcrypt.hashpw(
+                new_password.encode(), _bcrypt.gensalt()
+            ).decode()
+            user.pop("force_password_change", None)
+            user.pop("must_set_password", None)
+            if users_path:
+                _save_users_and_update_mtime(users_path, users)
+            logger.info("Forced password rotation completed for user=%s", username)
+
+            token = _generate_csrf_token()
+            resp = app.make_response(render_template_string(
+                FORCED_CHANGE_PAGE,
+                csrf_token=token,
+                auth_token="",
+                error=None,
+                success="Password updated. Please sign in again to continue.",
+            ))
+            resp.set_cookie(
+                "csrf_token", token, httponly=True,
+                samesite="Strict", secure=_cookies_secure,
+            )
+            return resp
+
         elif action == "change_password":
             auth_token = request.form.get("auth_token", "")
             username = _verify_auth_token(auth_token)
@@ -1328,18 +1877,23 @@ def create_app(
                 resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
                 return resp, 401
 
+            current_password = request.form.get("current_password", "")
             new_password = request.form.get("new_password", "")
             confirm_password = request.form.get("confirm_password", "")
 
-            # Validation
-            password_error = None
-            if not new_password or len(new_password) < 8:
-                password_error = "Password must be at least 8 characters."
-            elif new_password != confirm_password:
-                password_error = "Passwords do not match."
-
             user = users.get(username)
             mfa_enabled = bool(user.get("totp_secret")) if user else False
+
+            # Validation. Proof of the current password is required so a stolen
+            # step-up token alone cannot silently reset the password.
+            password_error = None
+            policy_error = _password_policy_error(new_password)
+            if not user or not _check_password(user["password"], current_password):
+                password_error = "Current password is incorrect."
+            elif policy_error is not None:
+                password_error = policy_error
+            elif new_password != confirm_password:
+                password_error = "Passwords do not match."
 
             if password_error:
                 token = _generate_csrf_token()
@@ -1489,63 +2043,122 @@ def create_app(
         username = validate_recovery_token(recovery_token)
         if not username:
             return render_template_string(
-                RECOVERY_PAGE, username="", recovery_token="",
+                RECOVERY_PAGE, username="", recovery_token="", csrf_token="",
                 error="This recovery link is invalid or has expired.",
-                success=None, qr_data_uri="", totp_secret="",
+                success=None, qr_data_uri="", totp_secret="", mfa_required=False,
             ), 404
 
-        # Generate TOTP secret for optional MFA enrollment
-        totp_secret = generate_secret()
-        uri = provisioning_uri(totp_secret, username, issuer="idp.botthouse.net")
-        qr_uri = qr_code_data_uri(uri)
+        csrf = _generate_csrf_token()
+        if users.get(username, {}).get("totp_secret"):
+            # Already enrolled: verify against the existing secret, do not
+            # re-enroll. Show a "confirm current MFA code" field, not a QR.
+            page = render_template_string(
+                RECOVERY_PAGE, username=username, recovery_token=recovery_token,
+                csrf_token=csrf, error=None, success=None,
+                qr_data_uri="", totp_secret="", mfa_required=True,
+            )
+        else:
+            # Not enrolled: offer optional MFA enrollment with a fresh secret.
+            totp_secret = generate_secret()
+            uri = provisioning_uri(
+                totp_secret, username, issuer="idp.botthouse.net"
+            )
+            page = render_template_string(
+                RECOVERY_PAGE, username=username, recovery_token=recovery_token,
+                csrf_token=csrf, error=None, success=None,
+                qr_data_uri=qr_code_data_uri(uri), totp_secret=totp_secret,
+                mfa_required=False,
+            )
 
-        return render_template_string(
-            RECOVERY_PAGE, username=username, recovery_token=recovery_token,
-            error=None, success=None, qr_data_uri=qr_uri, totp_secret=totp_secret,
+        resp = app.make_response(page)
+        resp.set_cookie(
+            "csrf_token", csrf, httponly=True, samesite="Strict", secure=_cookies_secure
         )
+        return resp
 
     @app.post("/recover/<recovery_token>")
     def recover_post(recovery_token: str):
         from .admin import consume_recovery_token, validate_recovery_token
+
+        # CSRF: double-submit check (was missing entirely).
+        form_token = request.form.get("csrf_token", "")
+        cookie_token = request.cookies.get("csrf_token", "")
+        if not form_token or not hmac.compare_digest(form_token, cookie_token):
+            return render_template_string(
+                RECOVERY_PAGE, username="", recovery_token="", csrf_token="",
+                error="Invalid request (CSRF). Reload the page and try again.",
+                success=None, qr_data_uri="", totp_secret="", mfa_required=False,
+            ), 403
+
+        # Rate limit recovery attempts per IP.
+        client_ip = request.remote_addr or "unknown"
+        if rate_limiter.is_limited(client_ip):
+            return render_template_string(
+                RECOVERY_PAGE, username="", recovery_token="", csrf_token="",
+                error="Too many attempts. Try again later.",
+                success=None, qr_data_uri="", totp_secret="", mfa_required=False,
+            ), 429
+
         username = validate_recovery_token(recovery_token)
         if not username:
+            rate_limiter.record(client_ip)
             return render_template_string(
-                RECOVERY_PAGE, username="", recovery_token="",
+                RECOVERY_PAGE, username="", recovery_token="", csrf_token="",
                 error="This recovery link is invalid or has expired.",
-                success=None, qr_data_uri="", totp_secret="",
+                success=None, qr_data_uri="", totp_secret="", mfa_required=False,
             ), 404
 
         new_password = request.form.get("new_password", "")
         confirm_password = request.form.get("confirm_password", "")
-        totp_secret = request.form.get("totp_secret", "")
         totp_code = request.form.get("totp_code", "")
 
-        # Validate password
-        if len(new_password) < 8:
-            uri = provisioning_uri(totp_secret, username, issuer="idp.botthouse.net")
-            return render_template_string(
-                RECOVERY_PAGE, username=username, recovery_token=recovery_token,
-                error="Password must be at least 8 characters.",
-                success=None, qr_data_uri=qr_code_data_uri(uri), totp_secret=totp_secret,
+        # Determine MFA mode from the user's existing enrollment, NOT from the
+        # form. An already-enrolled user must confirm their CURRENT authenticator
+        # code (verified against their stored secret); a not-yet-enrolled user
+        # may optionally enroll a fresh secret shown as a QR on the page.
+        enrolled_secret = users.get(username, {}).get("totp_secret", "")
+        is_enrolled = bool(enrolled_secret)
+        # The enrollment secret only comes from the form for non-enrolled users.
+        enroll_secret = "" if is_enrolled else request.form.get("totp_secret", "")
+
+        def _rerender(error: str):
+            """Re-render the recovery page in the correct MFA mode on error."""
+            if is_enrolled:
+                return render_template_string(
+                    RECOVERY_PAGE, username=username,
+                    recovery_token=recovery_token, csrf_token=form_token,
+                    error=error, success=None, qr_data_uri="", totp_secret="",
+                    mfa_required=True,
+                )
+            uri = provisioning_uri(
+                enroll_secret, username, issuer="idp.botthouse.net"
             )
-        if new_password != confirm_password:
-            uri = provisioning_uri(totp_secret, username, issuer="idp.botthouse.net")
             return render_template_string(
                 RECOVERY_PAGE, username=username, recovery_token=recovery_token,
-                error="Passwords do not match.",
-                success=None, qr_data_uri=qr_code_data_uri(uri), totp_secret=totp_secret,
+                csrf_token=form_token, error=error, success=None,
+                qr_data_uri=qr_code_data_uri(uri), totp_secret=enroll_secret,
+                mfa_required=False,
             )
 
-        # Validate TOTP if provided
+        # Validate password against the complexity policy.
+        policy_error = _password_policy_error(new_password)
+        if policy_error is not None:
+            return _rerender(policy_error)
+        if new_password != confirm_password:
+            return _rerender("Passwords do not match.")
+
+        # MFA handling.
         mfa_enrolled = False
-        if totp_code and totp_secret:
-            if not verify_code(totp_secret, totp_code):
-                uri = provisioning_uri(totp_secret, username, issuer="idp.botthouse.net")
-                return render_template_string(
-                    RECOVERY_PAGE, username=username, recovery_token=recovery_token,
-                    error="Invalid MFA code. Try again.",
-                    success=None, qr_data_uri=qr_code_data_uri(uri), totp_secret=totp_secret,
-                )
+        if is_enrolled:
+            # Enrolled users must prove their existing MFA to reset.
+            if not verify_code(enrolled_secret, totp_code):
+                rate_limiter.record(client_ip)
+                return _rerender("Invalid MFA code. Try again.")
+        elif totp_code and enroll_secret:
+            # Optional enrollment for users without MFA.
+            if not verify_code(enroll_secret, totp_code):
+                rate_limiter.record(client_ip)
+                return _rerender("Invalid MFA code. Try again.")
             mfa_enrolled = True
 
         # Apply changes
@@ -1553,8 +2166,9 @@ def create_app(
         user = users.get(username)
         if user:
             user["password"] = _bcrypt.hashpw(new_password.encode(), _bcrypt.gensalt()).decode()
+            user.pop("must_set_password", None)
             if mfa_enrolled:
-                user["totp_secret"] = totp_secret
+                user["totp_secret"] = enroll_secret
             if users_path:
                 _save_users_and_update_mtime(users_path, users)
             logger.info("Recovery completed for user=%s (MFA=%s)", username, mfa_enrolled)
@@ -1564,30 +2178,75 @@ def create_app(
 
         mfa_msg = " MFA has been enabled." if mfa_enrolled else ""
         return render_template_string(
-            RECOVERY_PAGE, username=username, recovery_token="",
+            RECOVERY_PAGE, username=username, recovery_token="", csrf_token="",
             error=None, success=f"Password updated successfully.{mfa_msg} You can now log in.",
-            qr_data_uri="", totp_secret="",
+            qr_data_uri="", totp_secret="", mfa_required=False,
         )
 
     # --- Admin panel ---
     def _save_users_and_update_mtime(path: Path, user_dict: dict[str, Any]) -> None:
-        """Save users and update mtime/size tracker so this worker doesn't re-read."""
-        nonlocal users_mtime, users_size
+        """Save users and refresh the content-hash tracker after our own write."""
+        nonlocal users_digest
         _save_users(path, user_dict)
-        _stat = path.stat()
-        users_mtime = _stat.st_mtime
-        users_size = _stat.st_size
+        users_digest = _users_digest(path)
+
+    def _record_login(username: str) -> None:
+        """Stamp the account's last-login time for lifecycle/inactivity review."""
+        if use_adfs or users_path is None:
+            return
+        user = users.get(username)
+        if not user:  # pragma: no cover - defensive: user is always present here (just authenticated)
+            return
+        user["last_login"] = _now_iso()
+        try:
+            _save_users_and_update_mtime(users_path, users)
+        except OSError:
+            logger.warning("Could not persist last_login for user=%s", username)
+
+    def _needs_password_change(username: str) -> bool:
+        """True if the account must change its password before proceeding."""
+        if use_adfs:
+            return False
+        user = users.get(username)
+        return bool(user and user.get("force_password_change"))
+
+    def _forced_change_response(username: str):
+        """Render the forced password-change page instead of issuing credentials.
+
+        The user has already authenticated (password + MFA), so a short-lived
+        step-up token is issued to bind the subsequent change to this session.
+        No SAML/JWT/session cookie is set until the password is changed.
+        """
+        auth_token = _issue_auth_token(username)
+        token = _generate_csrf_token()
+        resp = app.make_response(render_template_string(
+            FORCED_CHANGE_PAGE,
+            csrf_token=token,
+            auth_token=auth_token,
+            error=None,
+            success=None,
+        ))
+        resp.set_cookie(
+            "csrf_token", token, httponly=True,
+            samesite="Strict", secure=_cookies_secure,
+        )
+        return resp
 
     from .admin import register_admin_routes
     register_admin_routes(
         app, users, users_path, _check_password, _save_users_and_update_mtime,
         make_challenge_fn=_make_challenge,
-        verify_challenge_fn=lambda answer, h: _verify_challenge(app.secret_key, answer, h),
+        verify_challenge_fn=_check_challenge,
         services_path=services_path,
         verify_session_cookie_fn=_verify_session_cookie,
         set_session_cookie_fn=_set_session_cookie,
         audit_logger=audit,
         data_dir=data,
+        rate_limiter=rate_limiter,
+        rate_limit_key_fn=_rl_key,
+        validate_username_fn=_validate_username,
+        validate_claim_fn=_validate_claim,
+        password_policy_fn=_password_policy_error,
     )
 
     return app

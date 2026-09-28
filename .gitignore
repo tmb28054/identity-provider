@@ -1,14 +1,42 @@
+# --- Secrets / local data (never commit) ---
 data/idp.key
 data/users.json
-*.egg-info/
-__pycache__/
-*.pyc
-.venv/
-.coverage
-.env
-.mypy_cache/
-.ruff_cache/
-.pytest_cache/
-scripts/deploy.py
-trash/
 data/audit.log
+data/backup_config.json
+data/recovery_tokens.json
+data/backup_status.json
+data/backup_archives.json
+data/*.bak-*
+.env
+*.env
+idp.env
+
+# --- Python bytecode / packaging ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.whl
+
+# --- Virtual environments ---
+.venv/
+venv/
+
+# --- Test / coverage / lint caches and artifacts ---
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- Operator deployment tooling (host/creds — kept out of the repo) ---
+scripts/deploy.py
+
+# --- Pentest / security review reports (not source) ---
+*.pdf
+
+# --- Scratch working files ---
+trash/

@@ -27,7 +27,7 @@ def test_do_backup_happy_path(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
     _seed(data)
-    bk.save_config(data, bk.BackupConfig(server="s", share="sh", username="u"))
+    bk.save_config(data, bk.BackupConfig(server="s", share="sh", username="u", enabled=True))
 
     # Simulate a successful mount by writing into the mount dir when _mount_smb
     # is called; the real backup then archives into it.
@@ -59,7 +59,7 @@ def test_do_backup_readonly_share_records_clear_status(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
     _seed(data)
-    bk.save_config(data, bk.BackupConfig(server="s", share="sh", username="u"))
+    bk.save_config(data, bk.BackupConfig(server="s", share="sh", username="u", enabled=True))
 
     # Simulate a successful mount onto a read-only directory: mount creates the
     # dir, then we make it unwritable so the write-probe fails.
@@ -118,7 +118,7 @@ def test_do_backup_mount_failure_records_status(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
     _seed(data)
-    bk.save_config(data, bk.BackupConfig(server="s", share="sh", username="u"))
+    bk.save_config(data, bk.BackupConfig(server="s", share="sh", username="u", enabled=True))
 
     with mock.patch.object(
         backup_cli, "_mount_smb", side_effect=backup_cli.MountError("no route")

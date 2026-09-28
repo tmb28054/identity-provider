@@ -9,10 +9,29 @@ import pyotp
 import pytest
 
 
+# Integration credentials are supplied ONLY via the environment — never
+# committed as defaults. If any are missing, the integration tests are skipped
+# rather than run against a hardcoded (and previously leaked) account. Use a
+# dedicated, non-admin test account.
 IDP_BASE = os.environ.get("IDP_BASE_URL", "https://idp.botthouse.net")
-USERNAME = os.environ.get("IDP_TEST_USER", "topaz")
-PASSWORD = os.environ.get("IDP_TEST_PASSWORD", ":3-i&^MsPMzc")
-TOTP_SECRET = os.environ.get("IDP_TEST_TOTP_SECRET", "P422OG7E3IJIL23SNS3DW6JWG6PCCJER")
+USERNAME = os.environ.get("IDP_TEST_USER")
+PASSWORD = os.environ.get("IDP_TEST_PASSWORD")
+TOTP_SECRET = os.environ.get("IDP_TEST_TOTP_SECRET")
+
+
+def _require_credentials() -> None:
+    """Skip integration tests unless all credentials are provided via env."""
+    missing = [
+        name
+        for name, val in (
+            ("IDP_TEST_USER", USERNAME),
+            ("IDP_TEST_PASSWORD", PASSWORD),
+            ("IDP_TEST_TOTP_SECRET", TOTP_SECRET),
+        )
+        if not val
+    ]
+    if missing:
+        pytest.skip(f"Integration credentials not set: {', '.join(missing)}")
 
 
 @pytest.fixture(scope="session")
@@ -23,14 +42,9 @@ def idp_base():
 
 @pytest.fixture(scope="session")
 def credentials():
-    """Test user credentials."""
+    """Test user credentials (from the environment; skips if unset)."""
+    _require_credentials()
     return {"username": USERNAME, "password": PASSWORD, "totp_secret": TOTP_SECRET}
-
-
-@pytest.fixture(scope="session")
-def browser_context_args(browser_context_args):
-    """Playwright browser context args — ignore TLS errors for self-signed certs."""
-    return {**browser_context_args, "ignore_https_errors": True}
 
 
 def solve_challenge(text: str) -> int:
@@ -48,9 +62,12 @@ def solve_challenge(text: str) -> int:
     raise ValueError(f"Unknown operator: {op}")
 
 
-def get_totp_code(secret: str = TOTP_SECRET) -> str:
-    """Generate a current TOTP code."""
-    return pyotp.TOTP(secret).now()
+def get_totp_code(secret: str | None = None) -> str:
+    """Generate a current TOTP code from the given (or env) secret."""
+    resolved = secret or TOTP_SECRET
+    if not resolved:
+        raise ValueError("No TOTP secret provided (set IDP_TEST_TOTP_SECRET).")
+    return pyotp.TOTP(resolved).now()
 
 
 def login_to_service(page, idp_base: str, path: str, creds: dict) -> None:

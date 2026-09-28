@@ -178,7 +178,11 @@ logging:
 
 # Security
 security:
-  secret_key: ""           # Leave empty to auto-generate. Set this for consistent CSRF tokens.
+  # Signing key for session cookies, admin/step-up tokens, and captcha HMACs.
+  # Leave empty to auto-generate a per-process key (fine for single-worker dev;
+  # in production set a strong, secret value so tokens survive restarts/workers).
+  # Treat this like a private key: never commit it, and rotate it if exposed.
+  secret_key: ""
   rate_limit_max_attempts: 5
   rate_limit_window_seconds: 60
 
@@ -249,13 +253,14 @@ _USERS_TEMPLATE = """\
 [
   {
     "username": "admin",
-    "password": "changeme",
-    "roles": [
-      {
-        "account_id": "123456789012",
-        "role": "AdminRole"
-      }
-    ]
+    "must_set_password": true,
+    "claims": ["idpadmin"],
+    "roles": []
   }
 ]
 """
+# NOTE: The seeded admin has NO usable password. Set one before first login with:
+#     idp-hash-password
+# then paste the resulting bcrypt hash into the "password" field (and remove the
+# "must_set_password" marker). The account is disabled for login until then, so
+# the IdP cannot ship with a working default credential.

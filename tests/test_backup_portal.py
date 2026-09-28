@@ -24,8 +24,15 @@ def _make_app(tmp: Path):
     shutil.copy(src / "idp.crt", tmp / "idp.crt")
     shutil.copy(src / "idp.key", tmp / "idp.key")
     pw = bcrypt.hashpw(b"adminpass1", bcrypt.gensalt()).decode()
+    # Restore now requires a fresh TOTP code, so the admin must have MFA enrolled.
     (tmp / "users.json").write_text(json.dumps([
-        {"username": "admin", "password": pw, "roles": [], "claims": ["idpadmin"]}
+        {
+            "username": "admin",
+            "password": pw,
+            "roles": [],
+            "claims": ["idpadmin"],
+            "totp_secret": "JBSWY3DPEHPK3PXP",
+        }
     ]))
     app = create_app(str(tmp), secret_key="testsecret")
     app.config["TESTING"] = True
@@ -33,14 +40,10 @@ def _make_app(tmp: Path):
 
 
 def _admin_session_cookie(app) -> str:
-    """Forge a valid idp_session cookie for the admin user."""
-    import hashlib
-    import hmac
-    import time
+    """Mint a valid idp_session cookie for the admin user (new token scheme)."""
+    from identity_provider_server.tokens import PURPOSE_SESSION, issue_token
 
-    payload = f"admin:{int(time.time())}"
-    sig = hmac.new(app.secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return f"{payload}:{sig}"
+    return issue_token(app.secret_key, "admin", PURPOSE_SESSION)
 
 
 def _client_with_session(app):
@@ -160,7 +163,7 @@ def test_run_backup_now_trigger_failure(tmp_path):
 
 
 def test_restore_requires_confirmation(tmp_path):
-    """Restore with a wrong captcha/MFA answer is aborted (no unit started)."""
+    """Restore with a wrong MFA code is aborted (no unit started)."""
     app = _make_app(tmp_path)
     # Make an archive available in the listing.
     bk.write_archive_listing(tmp_path, ["idp-20260101-000000.tar.gz"])
@@ -169,37 +172,35 @@ def test_restore_requires_confirmation(tmp_path):
 
     with (
         mock.patch("identity_provider_server.admin.subprocess.run") as run,
-        mock.patch("identity_provider_server.app._verify_challenge", return_value=False),
+        mock.patch("identity_provider_server.admin.verify_code", return_value=False),
     ):
         resp = client.post("/admin/backups", data={
             "csrf_token": token, "auth_token": auth,
             "action": "restore_backup",
             "archive": "idp-20260101-000000.tar.gz",
-            "confirm_answer": "wrong",
-            "challenge_hash": "x",
+            "confirm_answer": "000000",
         })
     assert "Confirmation failed" in resp.data.decode()
     run.assert_not_called()
 
 
-def test_restore_with_valid_captcha_triggers_unit(tmp_path):
+def test_restore_with_valid_mfa_triggers_unit(tmp_path):
     app = _make_app(tmp_path)
     bk.write_archive_listing(tmp_path, ["idp-20260101-000000.tar.gz"])
     client = _client_with_session(app)
     token, auth = _get_csrf(client)
 
-    # A valid captcha answer confirms identity (admin has no MFA here).
+    # A valid, fresh TOTP code from the admin confirms the destructive restore.
     fake = mock.Mock(returncode=0, stdout="", stderr="")
     with (
         mock.patch("identity_provider_server.admin.subprocess.run", return_value=fake) as run,
-        mock.patch("identity_provider_server.app._verify_challenge", return_value=True),
+        mock.patch("identity_provider_server.admin.verify_code", return_value=True),
     ):
         resp = client.post("/admin/backups", data={
             "csrf_token": token, "auth_token": auth,
             "action": "restore_backup",
             "archive": "idp-20260101-000000.tar.gz",
-            "confirm_answer": "42",
-            "challenge_hash": "x",
+            "confirm_answer": "123456",
         })
     assert resp.status_code == 200
     assert "Restore" in resp.data.decode()
@@ -215,14 +216,13 @@ def test_restore_rejects_bad_archive_name(tmp_path):
 
     with (
         mock.patch("identity_provider_server.admin.subprocess.run") as run,
-        mock.patch("identity_provider_server.app._verify_challenge", return_value=True),
+        mock.patch("identity_provider_server.admin.verify_code", return_value=True),
     ):
         resp = client.post("/admin/backups", data={
             "csrf_token": token, "auth_token": auth,
             "action": "restore_backup",
             "archive": "../../etc/passwd",
-            "confirm_answer": "42",
-            "challenge_hash": "x",
+            "confirm_answer": "123456",
         })
     assert "Invalid archive name" in resp.data.decode()
     run.assert_not_called()

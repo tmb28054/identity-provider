@@ -30,30 +30,6 @@ data:
       rate_limit_max_attempts: 5
       rate_limit_window_seconds: 60
 
-  users.json: |
-    [
-      {
-        "username": "admin",
-        "password": "$2b$12$EXAMPLE_BCRYPT_HASH_HERE",
-        "roles": [
-          {
-            "account_id": "123456789012",
-            "role": "AdminRole"
-          }
-        ]
-      },
-      {
-        "username": "developer",
-        "password": "$2b$12$EXAMPLE_BCRYPT_HASH_HERE",
-        "roles": [
-          {
-            "account_id": "123456789012",
-            "role": "DeveloperRole"
-          },
-          {
-            "account_id": "987654321098",
-            "role": "ReadOnlyRole"
-          }
-        ]
-      }
-    ]
+# NOTE: users.json contains bcrypt password hashes and TOTP secrets, so it is
+# delivered via the Secret (see secret.yaml), NOT this ConfigMap. ConfigMaps are
+# stored unencrypted in etcd and readable by anyone with namespace read access.

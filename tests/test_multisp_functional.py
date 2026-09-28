@@ -5,9 +5,13 @@ import shutil
 import tempfile
 from pathlib import Path
 
+import bcrypt
 import yaml
 
 from identity_provider_server.app import create_app
+
+# bcrypt hash of "pass" — the app only accepts bcrypt-hashed passwords now.
+_PW_HASH = bcrypt.hashpw(b"pass", bcrypt.gensalt(rounds=4)).decode()
 
 
 def test_multi_sp_routes_registered():
@@ -74,7 +78,7 @@ def test_oauth_sp_redirects_with_token():
         shutil.copy(src / "idp.crt", tmp / "idp.crt")
         shutil.copy(src / "idp.key", tmp / "idp.key")
         (tmp / "users.json").write_text(json.dumps([
-            {"username": "alice", "password": "pass", "roles": []}
+            {"username": "alice", "password": _PW_HASH, "roles": []}
         ]))
         (tmp / "services.yaml").write_text(yaml.dump({
             "oauth": {"docs": "https://docs.example.com/"},

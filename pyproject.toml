@@ -46,6 +46,17 @@ markers = [
     "integration: end-to-end tests against live IdP (requires network)",
 ]
 
+[tool.coverage.run]
+source = ["identity_provider_server"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 100
+exclude_also = [
+    # Module-level script guards are only executed when run as a script.
+    'if __name__ == .__main__.:',
+]
+
 [tool.setuptools.dynamic]
 version = {attr = "identity_provider_server._version.__version__"}
 

@@ -32,7 +32,9 @@ spec:
               mountPath: /data/config.yaml
               subPath: config.yaml
               readOnly: true
-            - name: config
+            # users.json comes from the Secret (holds password hashes + TOTP
+            # secrets), not the ConfigMap.
+            - name: certs
               mountPath: /data/users.json
               subPath: users.json
               readOnly: true
@@ -68,6 +70,12 @@ spec:
             runAsUser: 1000
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+      automountServiceAccountToken: false
       volumes:
         - name: config
           configMap:
@@ -75,9 +83,12 @@ spec:
         - name: certs
           secret:
             secretName: idp-secrets
+            defaultMode: 0400
             items:
               - key: idp.crt
                 path: idp.crt
               - key: idp.key
                 path: idp.key
                 mode: 0400
+              - key: users.json
+                path: users.json
