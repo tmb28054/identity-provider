@@ -1056,7 +1056,10 @@ def create_app(
         js_path = _static_dir / "passkey.js"
         body = js_path.read_text(encoding="utf-8")
         resp = Response(body, mimetype="text/javascript")
-        resp.headers["Cache-Control"] = "public, max-age=86400"
+        # Short TTL + revalidation: the script changes with releases, so a long
+        # cache would serve stale client code after a deploy. 5 minutes bounds
+        # how long an intermediary/browser can hold an outdated copy.
+        resp.headers["Cache-Control"] = "public, max-age=300, must-revalidate"
         return resp
 
     # --- Load service providers ---
