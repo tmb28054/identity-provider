@@ -45,7 +45,7 @@ EnvironmentFile={REMOTE_ENV_FILE}
 # Binds on all interfaces because the origin is fronted by Cloudflare (the
 # network boundary is enforced upstream, not by loopback). If you move the
 # proxy onto this host, prefer 127.0.0.1:5000.
-ExecStart={REMOTE_VENV}/bin/gunicorn "identity_provider_server:create_app('{REMOTE_DATA}', host='idp.botthouse.net', port=443, provider_name='idp.botthouse.net')" --bind 0.0.0.0:5000 --workers 1 --access-logfile - --error-logfile -
+ExecStart={REMOTE_VENV}/bin/gunicorn "identity_provider_server:create_app('{REMOTE_DATA}', host='idp.botthouse.net', port=443, provider_name='idp.botthouse.net', webauthn_enabled=True, webauthn_rp_id='idp.botthouse.net', webauthn_rp_name='Botthouse Identity Provider', webauthn_expected_origin='https://idp.botthouse.net')" --bind 0.0.0.0:5000 --workers 1 --access-logfile - --error-logfile -
 Restart=on-failure
 RestartSec=5
 
