@@ -467,7 +467,7 @@ USER_PAGE_ENROLL = """
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="action" value="set_passwordless">
         <input type="hidden" name="auth_token" value="{{ auth_token }}">
-        <button type="submit"{% if not passwordless_eligible|default(false) %} disabled{% endif %}>Enable password-less sign-in</button>
+        <button type="submit" id="passkey-set"{% if not passwordless_eligible|default(false) %} disabled{% endif %}>Enable password-less sign-in</button>
       </form>
     {% endif %}
     {% endif %}
@@ -2296,6 +2296,9 @@ def create_app(
                 "credential_id": cred["credential_id"],
                 "label": "passkey",
             },
+            # Let the page enable the "go password-less" control without a
+            # reload once the account meets the minimum-factor policy.
+            "passwordless_eligible": wf.meets_passwordless_minimum(user),
         })
 
     def _issue_passkey_login(username: str, service_path: str):

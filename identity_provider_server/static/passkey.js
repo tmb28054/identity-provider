@@ -169,6 +169,14 @@
         if (result.credential) {
           appendCredential(btn, result.credential);
         }
+        // The account may now meet the password-less minimum; enable the
+        // toggle without requiring a page reload.
+        if (result.passwordless_eligible) {
+          const setBtn = document.getElementById("passkey-set");
+          if (setBtn) {
+            setBtn.disabled = false;
+          }
+        }
         if (status) {
           status.style.color = "#1d8102";
           status.textContent = "Passkey registered.";

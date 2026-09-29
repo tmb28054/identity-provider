@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The "Enable password-less sign-in" button stayed disabled right after
+  registering a first passkey (the enroll page is reached via POST and is not
+  reloaded). The `register/finish` response now reports `passwordless_eligible`
+  and the client re-enables the toggle in place once the account meets the
+  minimum-factor policy.
+
 ## [1.8.0] - 2026-09-26
 
 ### Added

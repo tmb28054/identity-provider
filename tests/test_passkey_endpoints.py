@@ -151,7 +151,11 @@ def test_register_and_authenticate_roundtrip(client, data_dir):
     auth_token, csrf = _user_step_up(data_dir, client)
     finish = _register_passkey(client, device, auth_token, csrf)
     assert finish.status_code == 200
-    assert finish.get_json()["status"] == "ok"
+    body = finish.get_json()
+    assert body["status"] == "ok"
+    # topaztest keeps its password, so one passkey already meets the
+    # password-less minimum — the client uses this to enable the toggle.
+    assert body["passwordless_eligible"] is True
 
     # The credential is now persisted for topaztest.
     users = json.loads((data_dir / "users.json").read_text())
