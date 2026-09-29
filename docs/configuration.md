@@ -44,6 +44,13 @@ security:
   secret_key: ""                   # Flask CSRF secret. Empty = auto-generate.
   rate_limit_max_attempts: 5       # Failed logins before rate limiting
   rate_limit_window_seconds: 60    # Rate limit window
+
+# Passkey (WebAuthn/FIDO2)
+webauthn:
+  enabled: false                   # Turn passkey endpoints/UI on
+  rp_id: ""                        # Effective domain (e.g. idp.botthouse.net)
+  rp_name: "Identity Provider"     # Name authenticators show to the user
+  expected_origin: ""              # Full https origin (e.g. https://idp.botthouse.net)
 ```
 
 All fields are optional — omitted fields use built-in defaults.
@@ -79,6 +86,10 @@ Environment variables override config file values. Useful for injecting secrets 
 | `SECRET_KEY` | `security.secret_key` | Flask CSRF secret key |
 | `IDP_RATE_LIMIT_MAX_ATTEMPTS` | `security.rate_limit_max_attempts` | Rate limit threshold |
 | `IDP_RATE_LIMIT_WINDOW_SECONDS` | `security.rate_limit_window_seconds` | Rate limit window |
+| `IDP_WEBAUTHN_ENABLED` | `webauthn.enabled` | `true`/`false` — enable passkeys |
+| `IDP_WEBAUTHN_RP_ID` | `webauthn.rp_id` | Relying-party ID (effective domain) |
+| `IDP_WEBAUTHN_RP_NAME` | `webauthn.rp_name` | Relying-party display name |
+| `IDP_WEBAUTHN_EXPECTED_ORIGIN` | `webauthn.expected_origin` | Full https origin |
 
 ---
 
@@ -368,6 +379,73 @@ Session duration is configurable via `saml.session_duration_hours` (default: 1 h
 | Admin audit trail | Privileged admin mutations (user CRUD, resets, MFA removal, claim/idpadmin grants, SP changes, recovery mint) are audit-logged |
 | Structured logging | JSON-formatted logs with request context |
 | Read-only filesystem | Kubernetes deployment supports `readOnlyRootFilesystem` |
+| Passkeys (WebAuthn) | Optional second factor bound to the origin; sign-count monotonicity detects cloned authenticators |
+
+---
+
+## Passkey (WebAuthn) authentication
+
+When enabled, users can register a passkey (Touch ID, Windows Hello, or a
+hardware security key) as a **second factor** alongside TOTP. A passkey proves
+possession of a private key that never leaves the authenticator and is bound to
+the server's origin, so a phished password alone cannot complete a login.
+
+Passkeys are only available in local-user mode (not ADFS mode).
+
+### Enable passkeys
+
+Set all three values — `rp_id` and `expected_origin` have no defaults and are
+required once `enabled` is true:
+
+```yaml
+webauthn:
+  enabled: true
+  rp_id: "idp.botthouse.net"
+  rp_name: "Botthouse Identity Provider"
+  expected_origin: "https://idp.botthouse.net"
+```
+
+Or via environment:
+
+```bash
+export IDP_WEBAUTHN_ENABLED=true
+export IDP_WEBAUTHN_RP_ID=idp.botthouse.net
+export IDP_WEBAUTHN_EXPECTED_ORIGIN=https://idp.botthouse.net
+```
+
+### Field meanings
+
+| Field | Meaning |
+|-------|---------|
+| `rp_id` | The Relying-Party ID — the effective domain credentials are bound to. Usually the bare host (`idp.botthouse.net`). |
+| `expected_origin` | The full origin the browser reports, including scheme (`https://idp.botthouse.net`). |
+| `rp_name` | A human-friendly label authenticators may show during registration. |
+
+Startup validation rejects an enabled config that is missing `rp_id` or
+`expected_origin`, or whose `expected_origin` host is neither `rp_id` nor a
+subdomain of it.
+
+### Domain-binding caveat
+
+A passkey is cryptographically bound to `rp_id`. **If you change the domain the
+server is served under, previously enrolled passkeys stop validating** and users
+must re-enroll. Choose a stable `rp_id` (the registrable domain, e.g.
+`botthouse.net` or a fixed subdomain) before rolling passkeys out widely. The
+same applies if you move from `http://localhost` in development to a real
+`https://` origin — those are different origins.
+
+### How it works
+
+- The client JS (`/static/passkey.js`) runs the `navigator.credentials`
+  ceremonies; it is served from the app's own origin so it loads under the
+  strict `script-src 'self'` CSP with no relaxation.
+- Registration is gated by the same step-up token as TOTP enrollment; it happens
+  on the **Account Settings** page (`/user`).
+- Login is username-first: after entering a username on the login form, the user
+  clicks "Use a passkey"; a successful assertion issues SAML/OAuth and the SSO
+  session cookie exactly like a password + TOTP login.
+- Each credential's signature counter is checked for monotonic increase; a
+  regression (a sign of a cloned authenticator) is rejected.
 
 ---
 

@@ -1312,3 +1312,414 @@ def test_services_reload_error(tmp_path, monkeypatch):
                         mock.Mock(side_effect=ValueError("bad services")))
     # Request triggers _reload_services_if_changed which swallows the error.
     assert client.get("/health").status_code == 200
+
+
+# --- passkey (WebAuthn) coverage: OAuth issuance, forced change, fallback ---
+
+import base64  # noqa: E402
+
+from soft_webauthn import SoftWebauthnDevice  # noqa: E402
+
+PK_RP_ID = "localhost"
+PK_ORIGIN = "https://localhost"
+
+
+def _pk_b64url_to_bytes(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _pk_bytes_to_b64url(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def _pk_options_to_soft(options: dict) -> dict:
+    opts = json.loads(json.dumps(options))
+    opts["challenge"] = _pk_b64url_to_bytes(opts["challenge"])
+    if "user" in opts and "id" in opts["user"]:
+        opts["user"]["id"] = _pk_b64url_to_bytes(opts["user"]["id"])
+    for key in ("excludeCredentials", "allowCredentials"):
+        for desc in opts.get(key, []) or []:
+            desc["id"] = _pk_b64url_to_bytes(desc["id"])
+    return {"publicKey": opts}
+
+
+def _pk_att_to_dict(att: dict) -> dict:
+    def enc(b):
+        return _pk_bytes_to_b64url(b) if isinstance(b, (bytes, bytearray)) else b
+
+    resp = att["response"]
+    return {
+        "id": enc(att["rawId"]),
+        "rawId": enc(att["rawId"]),
+        "type": att["type"],
+        "response": {k: enc(v) for k, v in resp.items()},
+    }
+
+
+def _pk_step_up(client, username="bob"):
+    """Sign in on /user (no MFA) and return (auth_token, csrf_token)."""
+    resp = client.get("/user")
+    csrf = _csrf(resp.data)
+    ans, ch = _solve(resp.data)
+    resp = client.post("/user", data={
+        "action": "login", "username": username, "password": PW,
+        "csrf_token": csrf, "challenge_answer": ans, "challenge_hash": ch,
+    })
+    auth_token = re.search(
+        rb'name="auth_token" value="([^"]+)"', resp.data
+    ).group(1).decode()
+    return auth_token, _csrf(resp.data)
+
+
+def _pk_register(client, device, auth_token, csrf):
+    begin = client.post("/user/passkey/register/begin",
+                        json={"csrf_token": csrf, "auth_token": auth_token}).get_json()
+    att = device.create(_pk_options_to_soft(begin["options"]), PK_ORIGIN)
+    return client.post("/user/passkey/register/finish", json={
+        "csrf_token": csrf, "auth_token": auth_token,
+        "handle": begin["handle"], "credential": _pk_att_to_dict(att),
+    })
+
+
+def _pk_authenticate(client, device, path):
+    csrf = re.search(rb'name="csrf_token" value="([^"]+)"',
+                     client.get(path).data).group(1).decode()
+    begin = client.post(f"{path}/passkey/begin",
+                        json={"csrf_token": csrf, "username": "bob"}).get_json()
+    assertion = device.get(_pk_options_to_soft(begin["options"]), PK_ORIGIN)
+    return client.post(f"{path}/passkey/finish", json={
+        "csrf_token": csrf, "handle": begin["handle"],
+        "credential": _pk_att_to_dict(assertion),
+    })
+
+
+def test_passkey_oauth_issuance(tmp_path):
+    app = _write_app(
+        tmp_path,
+        [{"username": "bob", "password": _hash(), "roles": [], "claims": ["dev"],
+          "email": "b@e.com"}],
+        services={"oauth": {"wiki": {"url": "https://wiki.example/cb",
+                                     "token_expiry_minutes": 60}}},
+        webauthn_enabled=True, webauthn_rp_id=PK_RP_ID,
+        webauthn_expected_origin=PK_ORIGIN,
+    )
+    client = app.test_client()
+    device = SoftWebauthnDevice()
+    auth_token, csrf = _pk_step_up(client)
+    assert _pk_register(client, device, auth_token, csrf).status_code == 200
+    finish = _pk_authenticate(client, device, "/wiki")
+    assert finish.status_code == 200
+    assert "token=" in finish.get_json()["redirect"]
+    assert "idp_session" in finish.headers.get("Set-Cookie", "")
+
+
+def test_passkey_forced_password_change(tmp_path):
+    app = _write_app(
+        tmp_path,
+        [{"username": "bob", "password": _hash(), "roles": [], "claims": [],
+          "force_password_change": True}],
+        services={"saml": {"aws": "https://signin.aws.amazon.com/saml"}},
+        webauthn_enabled=True, webauthn_rp_id=PK_RP_ID,
+        webauthn_expected_origin=PK_ORIGIN,
+    )
+    client = app.test_client()
+    device = SoftWebauthnDevice()
+    auth_token, csrf = _pk_step_up(client)
+    _pk_register(client, device, auth_token, csrf)
+    finish = _pk_authenticate(client, device, "/aws")
+    assert finish.status_code == 200
+    assert finish.get_json()["redirect"] == "/aws"
+
+
+def test_passkey_fallback_aws_routes(tmp_path):
+    # No services.yaml -> the /aws fallback passkey routes are registered.
+    app = _write_app(
+        tmp_path,
+        [{"username": "bob", "password": _hash(),
+          "roles": [{"account_id": "1", "role": "R"}], "claims": []}],
+        webauthn_enabled=True, webauthn_rp_id=PK_RP_ID,
+        webauthn_expected_origin=PK_ORIGIN,
+    )
+    client = app.test_client()
+    device = SoftWebauthnDevice()
+    auth_token, csrf = _pk_step_up(client)
+    assert _pk_register(client, device, auth_token, csrf).status_code == 200
+    finish = _pk_authenticate(client, device, "/aws")
+    assert finish.status_code == 200
+    assert "SAMLResponse" in finish.get_json()["html"]
+
+
+def test_passkey_begin_rate_limited(tmp_path):
+    app = _write_app(
+        tmp_path,
+        [{"username": "bob", "password": _hash(), "roles": [], "claims": []}],
+        webauthn_enabled=True, webauthn_rp_id=PK_RP_ID,
+        webauthn_expected_origin=PK_ORIGIN,
+        rate_limit_max_attempts=1,
+    )
+    client = app.test_client()
+    ip = {"REMOTE_ADDR": "10.9.9.9"}
+    # Trip the per-IP limiter with a failed password login first.
+    form = client.get("/aws", environ_overrides=ip)
+    ans, ch = _solve(form.data)
+    client.post("/aws", environ_overrides=ip, data={
+        "username": "bob", "password": "WRONG", "csrf_token": _csrf(form.data),
+        "challenge_answer": ans, "challenge_hash": ch,
+    })
+    # Fresh csrf cookie so the passkey call passes CSRF and reaches the limiter.
+    csrf = re.search(rb'name="csrf_token" value="([^"]+)"',
+                     client.get("/aws", environ_overrides=ip).data).group(1).decode()
+    begin = client.post("/aws/passkey/begin", environ_overrides=ip,
+                        json={"csrf_token": csrf, "username": "bob"})
+    assert begin.status_code == 429
+    finish = client.post("/aws/passkey/finish", environ_overrides=ip,
+                         json={"csrf_token": csrf, "handle": "x", "credential": {}})
+    assert finish.status_code == 429
+
+
+def test_passkey_auth_blocked_when_account_disabled(tmp_path):
+    """A disabled account cannot start a passkey login even with a credential."""
+    app = _write_app(
+        tmp_path,
+        [{"username": "bob", "password": _hash(), "roles": [], "claims": []}],
+        webauthn_enabled=True, webauthn_rp_id=PK_RP_ID,
+        webauthn_expected_origin=PK_ORIGIN,
+    )
+    client = app.test_client()
+    device = SoftWebauthnDevice()
+    auth_token, csrf = _pk_step_up(client)
+    _pk_register(client, device, auth_token, csrf)
+
+    # Disable the account out-of-band; hot-reload picks it up.
+    users = json.loads((tmp_path / "users.json").read_text())
+    for u in users:
+        if u["username"] == "bob":
+            u["enabled"] = False
+    (tmp_path / "users.json").write_text(json.dumps(users))
+
+    csrf = re.search(rb'name="csrf_token" value="([^"]+)"',
+                     client.get("/aws").data).group(1).decode()
+    begin = client.post("/aws/passkey/begin",
+                        json={"csrf_token": csrf, "username": "bob"})
+    assert begin.status_code == 400
+    assert "no passkey" in begin.get_json()["error"].lower()
+
+
+def test_passkey_finish_blocked_if_disabled_after_begin(tmp_path):
+    """Disabling the account between begin and finish rejects the assertion."""
+    app = _write_app(
+        tmp_path,
+        [{"username": "bob", "password": _hash(),
+          "roles": [{"account_id": "1", "role": "R"}], "claims": []}],
+        webauthn_enabled=True, webauthn_rp_id=PK_RP_ID,
+        webauthn_expected_origin=PK_ORIGIN,
+    )
+    client = app.test_client()
+    device = SoftWebauthnDevice()
+    auth_token, csrf = _pk_step_up(client)
+    _pk_register(client, device, auth_token, csrf)
+
+    csrf = re.search(rb'name="csrf_token" value="([^"]+)"',
+                     client.get("/aws").data).group(1).decode()
+    begin = client.post("/aws/passkey/begin",
+                        json={"csrf_token": csrf, "username": "bob"}).get_json()
+    assertion = device.get(_pk_options_to_soft(begin["options"]), PK_ORIGIN)
+
+    # Disable the account after begin, before finish.
+    users = json.loads((tmp_path / "users.json").read_text())
+    for u in users:
+        if u["username"] == "bob":
+            u["enabled"] = False
+    (tmp_path / "users.json").write_text(json.dumps(users))
+
+    finish = client.post("/aws/passkey/finish", json={
+        "csrf_token": csrf, "handle": begin["handle"],
+        "credential": _pk_att_to_dict(assertion),
+    })
+    assert finish.status_code == 400
+    assert "unknown passkey" in finish.get_json()["error"].lower()
+
+
+# --- P2.3: no-MFA session-cookie consistency + passkey-aware forced rotation ---
+
+def test_saml_no_mfa_sets_session_cookie(tmp_path):
+    """A password-only (no-MFA) SAML login now establishes the SSO session."""
+    app = _write_app(tmp_path, [
+        {"username": "bob", "password": _hash(),
+         "roles": [{"account_id": "1", "role": "R"}], "claims": []}
+    ])
+    client = app.test_client()
+    form = client.get("/aws")
+    ans, ch = _solve(form.data)
+    resp = client.post("/aws", data={
+        "username": "bob", "password": PW, "csrf_token": _csrf(form.data),
+        "challenge_answer": ans, "challenge_hash": ch,
+    })
+    assert b"SAMLResponse" in resp.data
+    assert "idp_session" in resp.headers.get("Set-Cookie", "")
+
+
+def test_oauth_no_mfa_sets_session_cookie(tmp_path):
+    """A password-only (no-MFA) OAuth login now establishes the SSO session."""
+    app = _write_app(
+        tmp_path,
+        [{"username": "bob", "password": _hash(), "roles": [], "claims": ["dev"],
+          "email": "b@e.com"}],
+        services={"oauth": {"wiki": {"url": "https://wiki.example/cb",
+                                     "token_expiry_minutes": 60}}},
+    )
+    client = app.test_client()
+    form = client.get("/wiki")
+    ans, ch = _solve(form.data)
+    resp = client.post("/wiki", data={
+        "username": "bob", "password": PW, "csrf_token": _csrf(form.data),
+        "challenge_answer": ans, "challenge_hash": ch,
+    })
+    assert resp.status_code == 302
+    assert "idp_session" in resp.headers.get("Set-Cookie", "")
+
+
+def test_passwordless_account_skips_forced_rotation(tmp_path):
+    """force_password_change is ignored for a passwordless passkey login."""
+    app = _write_app(
+        tmp_path,
+        [{"username": "bob", "password": _hash(),
+          "roles": [{"account_id": "1", "role": "R"}], "claims": [],
+          "force_password_change": True}],
+        webauthn_enabled=True, webauthn_rp_id=PK_RP_ID,
+        webauthn_expected_origin=PK_ORIGIN,
+    )
+    client = app.test_client()
+    device = SoftWebauthnDevice()
+    auth_token, csrf = _pk_step_up(client)
+    _pk_register(client, device, auth_token, csrf)
+
+    # Mark the account passwordless out-of-band (P2.4 sets this via UI; here we
+    # assert the forced-rotation gate is skipped once it is passwordless).
+    users = json.loads((tmp_path / "users.json").read_text())
+    for u in users:
+        if u["username"] == "bob":
+            u["passwordless"] = True
+    (tmp_path / "users.json").write_text(json.dumps(users))
+
+    finish = _pk_authenticate(client, device, "/aws")
+    assert finish.status_code == 200
+    # Not redirected to the forced-change page; a SAML assertion is issued.
+    assert "SAMLResponse" in finish.get_json()["html"]
+
+
+# --- P2.4: passwordless entry point + lockout guard -------------------------
+
+def _pk_app(tmp_path, extra_user=None):
+    user = {"username": "bob", "password": _hash(),
+            "roles": [{"account_id": "1", "role": "R"}], "claims": []}
+    if extra_user:
+        user.update(extra_user)
+    return _write_app(
+        tmp_path, [user],
+        webauthn_enabled=True, webauthn_rp_id=PK_RP_ID,
+        webauthn_expected_origin=PK_ORIGIN,
+    )
+
+
+def test_set_passwordless_refused_without_recovery_path(tmp_path):
+    """One passkey + password is enough; but a single passkey and nothing else
+    (simulated by removing the password) is refused."""
+    app = _pk_app(tmp_path)
+    client = app.test_client()
+    device = SoftWebauthnDevice()
+    auth_token, csrf = _pk_step_up(client)
+    _pk_register(client, device, auth_token, csrf)
+
+    # Drop the password so the sole factor is one passkey (lockout risk).
+    users = json.loads((tmp_path / "users.json").read_text())
+    for u in users:
+        if u["username"] == "bob":
+            u.pop("password", None)
+    (tmp_path / "users.json").write_text(json.dumps(users))
+
+    resp = client.post("/user", data={
+        "action": "set_passwordless", "auth_token": auth_token, "csrf_token": csrf,
+    })
+    assert resp.status_code == 400
+    assert b"second passkey" in resp.data
+    users = json.loads((tmp_path / "users.json").read_text())
+    assert not any(u.get("passwordless") for u in users)
+
+
+def test_set_passwordless_ok_with_password_retained(tmp_path):
+    """One passkey + retained password satisfies the minimum-factor policy."""
+    app = _pk_app(tmp_path)
+    client = app.test_client()
+    device = SoftWebauthnDevice()
+    auth_token, csrf = _pk_step_up(client)
+    _pk_register(client, device, auth_token, csrf)
+
+    resp = client.post("/user", data={
+        "action": "set_passwordless", "auth_token": auth_token, "csrf_token": csrf,
+    })
+    assert resp.status_code == 200
+    users = json.loads((tmp_path / "users.json").read_text())
+    assert any(u["username"] == "bob" and u.get("passwordless") for u in users)
+
+
+def test_unset_passwordless(tmp_path):
+    app = _pk_app(tmp_path, {"passwordless": True})
+    client = app.test_client()
+    auth_token, csrf = _pk_step_up(client)
+    resp = client.post("/user", data={
+        "action": "unset_passwordless", "auth_token": auth_token, "csrf_token": csrf,
+    })
+    assert resp.status_code == 200
+    users = json.loads((tmp_path / "users.json").read_text())
+    assert not any(u.get("passwordless") for u in users)
+
+
+def test_set_passwordless_expired_token(tmp_path):
+    app = _pk_app(tmp_path)
+    client = app.test_client()
+    csrf = re.search(rb'name="csrf_token" value="([^"]+)"',
+                     client.get("/user").data).group(1).decode()
+    resp = client.post("/user", data={
+        "action": "set_passwordless", "auth_token": "bad", "csrf_token": csrf,
+    })
+    assert resp.status_code == 401
+
+
+def test_passwordless_login_without_password(tmp_path):
+    """A no-password account with a passkey logs in via the SP passkey flow."""
+    app = _pk_app(tmp_path)
+    client = app.test_client()
+    device = SoftWebauthnDevice()
+    auth_token, csrf = _pk_step_up(client)
+    _pk_register(client, device, auth_token, csrf)
+
+    # Go fully password-less: flag on, password removed.
+    users = json.loads((tmp_path / "users.json").read_text())
+    for u in users:
+        if u["username"] == "bob":
+            u["passwordless"] = True
+            u.pop("password", None)
+    (tmp_path / "users.json").write_text(json.dumps(users))
+
+    finish = _pk_authenticate(client, device, "/aws")
+    assert finish.status_code == 200
+    assert "SAMLResponse" in finish.get_json()["html"]
+    assert "idp_session" in finish.headers.get("Set-Cookie", "")
+
+
+def test_enroll_page_shows_passwordless_toggle(tmp_path):
+    app = _pk_app(tmp_path)
+    client = app.test_client()
+    device = SoftWebauthnDevice()
+    auth_token, csrf = _pk_step_up(client)
+    reg = _pk_register(client, device, auth_token, csrf)
+    assert reg.status_code == 200
+    # Re-fetch the enroll page via a fresh step-up to see the rendered toggle.
+    auth_token, csrf = _pk_step_up(client)
+    # The step-up landing page is the enroll page itself.
+    page = client.post("/user", data={
+        "action": "unset_passwordless", "auth_token": auth_token, "csrf_token": csrf,
+    })
+    assert b"Password-less sign-in" in page.data
+    assert b'value="set_passwordless"' in page.data

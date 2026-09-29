@@ -154,6 +154,10 @@ def main() -> None:
         adfs_config=adfs_cfg,
         group_role_map=group_role_map,
         skip_ldap_ssl_verify=skip_ssl,
+        webauthn_enabled=config.webauthn.enabled,
+        webauthn_rp_id=config.webauthn.rp_id,
+        webauthn_rp_name=config.webauthn.rp_name,
+        webauthn_expected_origin=config.webauthn.expected_origin,
     )
     app.run(host=config.server.host, port=config.server.port, debug=config.server.debug)
 

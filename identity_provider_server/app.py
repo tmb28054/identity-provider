@@ -13,8 +13,9 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, g, redirect, render_template_string, request
+from flask import Flask, Response, g, jsonify, redirect, render_template_string, request
 
+from . import webauthn_flows as wf
 from .audit import AuditLogger
 from .oauth_builder import build_oauth_token
 from .saml_builder import ACS_URL, build_saml_response
@@ -125,6 +126,16 @@ LOGIN_FORM = """
 
       <button type="submit">Sign in</button>
     </form>
+    {% if passkey_available|default(false) %}
+    <p style="text-align:center;margin:1rem 0 0.5rem;font-size:0.8rem;color:#888;">or</p>
+    <button type="button" id="passkey-login"
+            data-begin-url="/{{ service_path }}/passkey/begin"
+            data-finish-url="/{{ service_path }}/passkey/finish"
+            data-csrf="{{ csrf_token }}"
+            style="background:#232f3e;">Use a passkey</button>
+    <p id="passkey-status" class="error" style="margin-top:0.75rem;"></p>
+    <script src="/static/passkey.js" defer></script>
+    {% endif %}
   </div>
 </body>
 </html>
@@ -408,6 +419,59 @@ USER_PAGE_ENROLL = """
       </form>
     {% endif %}
 
+    {% if passkey_available|default(false) %}
+    <h2>Passkeys</h2>
+    <p style="margin-bottom:1rem;font-size:0.9rem;color:#555;">
+      Register a passkey (Touch ID, Windows Hello, or a security key) as an
+      additional second factor.</p>
+    {% set passkeys = passkeys|default([]) %}
+    <p id="passkey-empty" style="font-size:0.85rem;color:#777;margin-bottom:1rem;{% if passkeys %}display:none;{% endif %}">No passkeys registered yet.</p>
+    <ul id="passkey-list" style="list-style:none;margin-bottom:1rem;">
+      {% for pk in passkeys %}
+      <li style="display:flex;justify-content:space-between;align-items:center;
+                 border:1px solid #eee;border-radius:4px;padding:0.5rem 0.75rem;margin-bottom:0.5rem;">
+        <span style="font-size:0.9rem;">{{ pk.label }}</span>
+        <form method="post" style="margin:0;width:auto;">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="action" value="remove_passkey">
+          <input type="hidden" name="auth_token" value="{{ auth_token }}">
+          <input type="hidden" name="credential_id" value="{{ pk.credential_id }}">
+          <button class="btn-danger" style="width:auto;padding:0.35rem 0.75rem;margin:0;font-size:0.8rem;">Remove</button>
+        </form>
+      </li>
+      {% endfor %}
+    </ul>
+    <button type="button" id="passkey-register"
+            data-begin-url="/user/passkey/register/begin"
+            data-finish-url="/user/passkey/register/finish"
+            data-csrf="{{ csrf_token }}"
+            data-auth-token="{{ auth_token }}">Register a passkey</button>
+    <p id="passkey-status" class="error" style="margin-top:0.75rem;"></p>
+    <script src="/static/passkey.js" defer></script>
+
+    <h2 style="border-top:1px dashed #eee;">Password-less sign-in</h2>
+    {% if passwordless_error|default('') %}<p class="error">{{ passwordless_error }}</p>{% endif %}
+    {% if passwordless_enabled|default(false) %}
+      <div class="status">Password-less sign-in is <strong>enabled</strong>. You can sign in with just a passkey.</div>
+      <form method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="action" value="unset_passwordless">
+        <input type="hidden" name="auth_token" value="{{ auth_token }}">
+        <button class="btn-danger">Disable password-less sign-in</button>
+      </form>
+    {% else %}
+      <p style="margin-bottom:1rem;font-size:0.9rem;color:#555;">
+        Sign in with only a passkey (no password). Requires a recovery path:
+        two passkeys, or one passkey plus a password or TOTP.</p>
+      <form method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="action" value="set_passwordless">
+        <input type="hidden" name="auth_token" value="{{ auth_token }}">
+        <button type="submit"{% if not passwordless_eligible|default(false) %} disabled{% endif %}>Enable password-less sign-in</button>
+      </form>
+    {% endif %}
+    {% endif %}
+
     <h2>Change Password</h2>
     <form method="post">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -493,20 +557,27 @@ _DUMMY_BCRYPT_HASH = b"$2b$12$xqbTfXWMEaMp3sym0SL0/.xghcHMx7WPgGncfpJYimAFLypk8d
 def _user_can_login(user: dict[str, Any]) -> bool:
     """Return True if the account is permitted to authenticate.
 
-    Accounts flagged ``must_set_password`` (a freshly seeded admin), explicitly
-    disabled (``enabled == False``), or lacking any stored password are refused.
+    Accounts flagged ``must_set_password`` (a freshly seeded admin) or explicitly
+    disabled (``enabled == False``) are always refused. Otherwise the account
+    must have a usable authentication factor: a stored password, or — for a
+    password-less account (Phase 2) — at least one registered passkey.
+
+    This gate is factor-agnostic; the caller still verifies the actual factor
+    (a password check, or a passkey assertion). A password-less account with a
+    passkey returns True here but fails any password check, so the password path
+    stays closed while the passkey path stays open.
 
     Args:
         user: The user record.
 
     Returns:
-        Whether the account may proceed to a password check.
+        Whether the account may proceed to a credential check.
     """
     if user.get("must_set_password"):
         return False
     if user.get("enabled") is False:
         return False
-    return bool(user.get("password"))
+    return bool(user.get("password")) or wf.has_passkey(user)
 
 
 def _check_password(stored: str, provided: str) -> bool:
@@ -747,6 +818,10 @@ def create_app(
     skip_ldap_ssl_verify: bool = False,
     secure_cookies: bool = True,
     trust_proxy: bool = True,
+    webauthn_enabled: bool = False,
+    webauthn_rp_id: str = "",
+    webauthn_rp_name: str = "Identity Provider",
+    webauthn_expected_origin: str = "",
 ) -> Flask:
     """Flask application factory.
 
@@ -770,6 +845,10 @@ def create_app(
         trust_proxy: If True (default), honour X-Forwarded-For/Proto from a
             single upstream reverse proxy so rate limiting keys on the real
             client IP.
+        webauthn_enabled: If True, enable passkey (WebAuthn) endpoints and UI.
+        webauthn_rp_id: WebAuthn Relying Party ID (the effective domain).
+        webauthn_rp_name: Human-readable RP name shown by authenticators.
+        webauthn_expected_origin: The full https origin browsers report.
     """
     data = Path(data_dir)
 
@@ -834,6 +913,47 @@ def create_app(
 
     # Single-use nonce store for captcha challenges (replay protection).
     captcha_nonces = NonceStore(ttl_seconds=CAPTCHA_MAX_AGE)
+
+    # --- Passkey (WebAuthn) setup ---
+    _webauthn_rp = wf.RelyingParty(
+        rp_id=webauthn_rp_id,
+        rp_name=webauthn_rp_name,
+        expected_origin=webauthn_expected_origin,
+    )
+    _passkey_challenges = wf.ChallengeStore(ttl_seconds=120)
+
+    def _passkey_available() -> bool:
+        """True if passkeys are enabled and configured (local-user mode only)."""
+        return bool(
+            webauthn_enabled and webauthn_rp_id and webauthn_expected_origin
+            and not use_adfs
+        )
+
+    def _enroll_passkey_context(username: str) -> dict[str, Any]:
+        """Template context for the passkey section of ``USER_PAGE_ENROLL``.
+
+        Returns the availability flag and the user's registered credentials
+        (id + label only — never the public key) so the enroll page can list
+        and manage them. Empty/harmless defaults when passkeys are disabled.
+        """
+        if not _passkey_available():
+            return {
+                "passkey_available": False,
+                "passkeys": [],
+                "passwordless_enabled": False,
+                "passwordless_eligible": False,
+            }
+        user = users.get(username) or {}
+        creds = [
+            {"credential_id": c.get("credential_id", ""), "label": c.get("label", "passkey")}
+            for c in wf.get_credentials(user)
+        ]
+        return {
+            "passkey_available": True,
+            "passkeys": creds,
+            "passwordless_enabled": bool(user.get(wf.PASSWORDLESS_FIELD)),
+            "passwordless_eligible": wf.meets_passwordless_minimum(user),
+        }
 
     def _check_challenge(answer: str, token: str) -> bool:
         """Verify a captcha answer/token, consuming the nonce on success."""
@@ -921,6 +1041,23 @@ def create_app(
     def health():
         """Health check endpoint."""
         return {"status": "healthy"}, 200
+
+    _static_dir = Path(__file__).resolve().parent / "static"
+
+    @app.get("/static/passkey.js")
+    def passkey_js():
+        """Serve the passkey client script under the app's own origin.
+
+        Serving from ``'self'`` means the file loads under the existing strict
+        ``script-src 'self'`` CSP with no relaxation (no inline script, no
+        external host). The file is small and immutable per release, so it is
+        cached for a day.
+        """
+        js_path = _static_dir / "passkey.js"
+        body = js_path.read_text(encoding="utf-8")
+        resp = Response(body, mimetype="text/javascript")
+        resp.headers["Cache-Control"] = "public, max-age=86400"
+        return resp
 
     # --- Load service providers ---
     services_path = data / "services.yaml"
@@ -1068,6 +1205,8 @@ def create_app(
             challenge_question=question,
             challenge_hash=challenge_hash,
             service_title=title,
+            passkey_available=_passkey_available(),
+            service_path=service_path,
         )
         resp = app.make_response(response)
         resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
@@ -1397,7 +1536,12 @@ def create_app(
                 email=users.get(username, {}).get("email"),
             )
             separator = "&" if "?" in sp.url else "?"
-            return redirect(f"{sp.url}{separator}token={token}")
+            resp = app.make_response(redirect(f"{sp.url}{separator}token={token}"))
+            # Establish the SSO session cookie here too — the MFA-ticket and
+            # passkey paths already do, and omitting it on the no-MFA path was a
+            # known inconsistency that broke SSO for password-only accounts.
+            _set_session_cookie(resp, username)
+            return resp
         else:
             # SAML: build assertion and auto-POST
             if use_adfs and not roles:
@@ -1427,7 +1571,11 @@ def create_app(
                 acs_url=sp_acs_url,
                 audience=sp_audience,
             )
-            return render_template_string(SAML_POST, acs=sp_acs_url, saml=saml_b64)
+            resp = app.make_response(
+                render_template_string(SAML_POST, acs=sp_acs_url, saml=saml_b64)
+            )
+            _set_session_cookie(resp, username)
+            return resp
 
     # Step-up token lifetime for the self-service /user flow.
     USER_STEPUP_MAX_AGE = 300  # 5 minutes
@@ -1618,6 +1766,7 @@ def create_app(
                 qr_data_uri="",
                 totp_secret="",
                 error=None,
+                **_enroll_passkey_context(username),
             ))
             resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
             return resp
@@ -1703,6 +1852,7 @@ def create_app(
                 qr_data_uri=qr_uri,
                 totp_secret=secret,
                 error=None,
+                **_enroll_passkey_context(username),
             ))
             resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
             return resp
@@ -1735,6 +1885,7 @@ def create_app(
                     qr_data_uri=qr_uri,
                     totp_secret=totp_secret,
                     error="Invalid code. Try again.",
+                    **_enroll_passkey_context(username),
                 ))
                 resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
                 return resp, 401
@@ -1755,6 +1906,7 @@ def create_app(
                 qr_data_uri="",
                 totp_secret="",
                 error=None,
+                **_enroll_passkey_context(username),
             ))
             resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
             return resp
@@ -1788,6 +1940,7 @@ def create_app(
                 ),
                 totp_secret=generate_secret(),
                 error=None,
+                **_enroll_passkey_context(username),
             ))
             resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
             return resp
@@ -1865,6 +2018,112 @@ def create_app(
             )
             return resp
 
+        elif action == "remove_passkey":
+            auth_token = request.form.get("auth_token", "")
+            username = _verify_auth_token(auth_token)
+            if not username:
+                token = _generate_csrf_token()
+                resp = app.make_response(render_template_string(
+                    USER_PAGE_LOGIN, error="Session expired. Please sign in again.",
+                    csrf_token=token,
+                ))
+                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                return resp, 401
+
+            credential_id = request.form.get("credential_id", "")
+            user = users.get(username)
+            if user and users_path and wf.remove_credential(user, credential_id):
+                _save_users_and_update_mtime(users_path, users)
+                logger.info("Passkey removed for user=%s", username)
+                audit.log(
+                    username=username,
+                    ip=client_ip,
+                    service="user",
+                    protocol="webauthn",
+                    result="success",
+                    reason="passkey_removed",
+                    user_agent=request.headers.get("User-Agent", ""),
+                )
+
+            mfa_enabled = bool(user.get("totp_secret")) if user else False
+            token = _generate_csrf_token()
+            resp = app.make_response(render_template_string(
+                USER_PAGE_ENROLL,
+                mfa_enabled=mfa_enabled,
+                csrf_token=token,
+                auth_token=_issue_auth_token(username),
+                qr_data_uri="" if mfa_enabled else qr_code_data_uri(
+                    provisioning_uri(generate_secret(), username, issuer="idp.botthouse.net")
+                ),
+                totp_secret="" if mfa_enabled else generate_secret(),
+                error=None,
+                **_enroll_passkey_context(username),
+            ))
+            resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+            return resp
+
+        elif action in ("set_passwordless", "unset_passwordless"):
+            auth_token = request.form.get("auth_token", "")
+            username = _verify_auth_token(auth_token)
+            if not username:
+                token = _generate_csrf_token()
+                resp = app.make_response(render_template_string(
+                    USER_PAGE_LOGIN, error="Session expired. Please sign in again.",
+                    csrf_token=token,
+                ))
+                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                return resp, 401
+
+            user = users.get(username)
+            passwordless_error = None
+            if action == "set_passwordless":
+                # Anti-lockout guard (design §10): only allow going password-less
+                # if the account retains a recovery path — two passkeys, or one
+                # passkey plus a password or TOTP.
+                if not user or not wf.meets_passwordless_minimum(user):
+                    passwordless_error = (
+                        "Register a second passkey (or keep a password/TOTP) "
+                        "before enabling password-less sign-in."
+                    )
+                elif users_path:
+                    user[wf.PASSWORDLESS_FIELD] = True
+                    _save_users_and_update_mtime(users_path, users)
+                    logger.info("Passwordless enabled for user=%s", username)
+                    audit.log(
+                        username=username, ip=client_ip, service="user",
+                        protocol="webauthn", result="success",
+                        reason="passwordless_enabled",
+                        user_agent=request.headers.get("User-Agent", ""),
+                    )
+            elif user and users_path:  # unset_passwordless
+                user.pop(wf.PASSWORDLESS_FIELD, None)
+                _save_users_and_update_mtime(users_path, users)
+                logger.info("Passwordless disabled for user=%s", username)
+                audit.log(
+                    username=username, ip=client_ip, service="user",
+                    protocol="webauthn", result="success",
+                    reason="passwordless_disabled",
+                    user_agent=request.headers.get("User-Agent", ""),
+                )
+
+            mfa_enabled = bool(user.get("totp_secret")) if user else False
+            token = _generate_csrf_token()
+            resp = app.make_response(render_template_string(
+                USER_PAGE_ENROLL,
+                mfa_enabled=mfa_enabled,
+                csrf_token=token,
+                auth_token=_issue_auth_token(username),
+                qr_data_uri="" if mfa_enabled else qr_code_data_uri(
+                    provisioning_uri(generate_secret(), username, issuer="idp.botthouse.net")
+                ),
+                totp_secret="" if mfa_enabled else generate_secret(),
+                error=None,
+                passwordless_error=passwordless_error,
+                **_enroll_passkey_context(username),
+            ))
+            resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+            return resp, (400 if passwordless_error else 200)
+
         elif action == "change_password":
             auth_token = request.form.get("auth_token", "")
             username = _verify_auth_token(auth_token)
@@ -1908,6 +2167,7 @@ def create_app(
                     totp_secret="" if mfa_enabled else generate_secret(),
                     error=None,
                     password_error=password_error,
+                    **_enroll_passkey_context(username),
                 ))
                 resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
                 return resp
@@ -1932,6 +2192,7 @@ def create_app(
                 totp_secret="" if mfa_enabled else generate_secret(),
                 error=None,
                 password_success=True,
+                **_enroll_passkey_context(username),
             ))
             resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
             return resp
@@ -1943,6 +2204,230 @@ def create_app(
         ))
         resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
         return resp
+
+    # --- Passkey (WebAuthn) JSON endpoints ---
+    def _json_csrf_ok(payload: dict[str, Any]) -> bool:
+        """Validate the CSRF double-submit token from a JSON passkey request."""
+        form_token = payload.get("csrf_token", "")
+        cookie_token = request.cookies.get("csrf_token", "")
+        return bool(form_token) and hmac.compare_digest(str(form_token), cookie_token)
+
+    def _passkey_error(message: str, status: int) -> tuple[Response, int]:
+        """Return a JSON error response for a passkey endpoint."""
+        return jsonify({"error": message}), status
+
+    @app.post("/user/passkey/register/begin")
+    def passkey_register_begin():
+        """Begin passkey registration for the signed-in self-service user.
+
+        Gated by the same ``PURPOSE_USER`` step-up token as TOTP enrollment. The
+        challenge is stashed in the single-use challenge store and its handle is
+        returned so ``finish`` can bind the two halves of the ceremony.
+        """
+        if not _passkey_available():
+            return _passkey_error("Passkeys are not enabled.", 404)
+        payload = request.get_json(silent=True) or {}
+        if not _json_csrf_ok(payload):
+            return _passkey_error("Invalid request (CSRF).", 403)
+        username = _verify_auth_token(payload.get("auth_token", ""))
+        if not username:
+            return _passkey_error("Session expired. Please sign in again.", 401)
+        user = users.get(username) or {}
+        options_json, challenge = wf.begin_registration(
+            _webauthn_rp, username, wf.get_credentials(user)
+        )
+        handle = _passkey_challenges.put(
+            challenge=challenge, username=username, purpose="register"
+        )
+        return jsonify({"handle": handle, "options": json.loads(options_json)})
+
+    @app.post("/user/passkey/register/finish")
+    def passkey_register_finish():
+        """Verify a registration response and persist the new credential."""
+        if not _passkey_available():
+            return _passkey_error("Passkeys are not enabled.", 404)
+        payload = request.get_json(silent=True) or {}
+        if not _json_csrf_ok(payload):
+            return _passkey_error("Invalid request (CSRF).", 403)
+        username = _verify_auth_token(payload.get("auth_token", ""))
+        if not username:
+            return _passkey_error("Session expired. Please sign in again.", 401)
+        entry = _passkey_challenges.consume(
+            payload.get("handle", ""), purpose="register"
+        )
+        if entry is None or entry.get("username") != username:
+            return _passkey_error("Registration session expired.", 400)
+        credential_json = json.dumps(payload.get("credential", {}))
+        try:
+            cred = wf.finish_registration(
+                _webauthn_rp, credential_json, entry["challenge"]
+            )
+        except wf.WebAuthnError as exc:
+            logger.info("Passkey registration failed for user=%s: %s", username, exc)
+            return _passkey_error("Passkey registration failed.", 400)
+        user = users.get(username)
+        if not user or not users_path:  # pragma: no cover - user present post step-up
+            return _passkey_error("Account not found.", 400)
+        transports = (payload.get("credential", {}).get("response", {}) or {}).get(
+            "transports", []
+        )
+        wf.add_credential(
+            user,
+            credential_id=cred["credential_id"],
+            public_key=cred["public_key"],
+            sign_count=cred["sign_count"],
+            transports=transports if isinstance(transports, list) else [],
+            now_iso=_now_iso(),
+        )
+        _save_users_and_update_mtime(users_path, users)
+        logger.info("Passkey registered for user=%s", username)
+        audit.log(
+            username=username,
+            ip=request.remote_addr or "unknown",
+            service="user",
+            protocol="webauthn",
+            result="success",
+            reason="passkey_registered",
+            user_agent=request.headers.get("User-Agent", ""),
+        )
+        return jsonify({
+            "status": "ok",
+            "credential": {
+                "credential_id": cred["credential_id"],
+                "label": "passkey",
+            },
+        })
+
+    def _issue_passkey_login(username: str, service_path: str):
+        """Funnel a verified passkey login into the standard issuance path.
+
+        Mirrors the password→TOTP success tail: stamp last-login, audit, honour
+        the forced-rotation gate, then issue SAML or OAuth and set the SSO
+        session cookie. Returns a JSON body telling the client where to go.
+        """
+        sp = _get_service(service_path)
+        client_ip = request.remote_addr or "unknown"
+        roles = _resolve_roles_from_claims(users.get(username, {}))
+        logger.info(
+            "Successful passkey login: user=%s service=%s from ip=%s",
+            username, service_path, client_ip,
+        )
+        _record_login(username)
+        audit.log(
+            username=username,
+            ip=client_ip,
+            service=service_path,
+            protocol=sp.protocol if sp else "saml",
+            result="success",
+            reason="passkey",
+            user_agent=request.headers.get("User-Agent", ""),
+        )
+        if _needs_password_change(username):
+            return jsonify({"redirect": f"/{service_path}"})
+        if sp and sp.protocol == "oauth":
+            token = build_oauth_token(
+                username, key_pem, idp_entity_id,
+                client_id=sp.client_id, scopes=sp.scopes,
+                token_expiry_minutes=sp.token_expiry_minutes, groups=None,
+                claims=users.get(username, {}).get("claims", []),
+                email=users.get(username, {}).get("email"),
+            )
+            separator = "&" if "?" in sp.url else "?"
+            resp = jsonify({"redirect": f"{sp.url}{separator}token={token}"})
+            _set_session_cookie(resp, username)
+            return resp
+        sp_acs_url = sp.url if sp else ACS_URL
+        sp_provider = sp.provider_name if sp else provider_name
+        sp_duration = sp.session_duration_hours if sp else session_duration_hours
+        sp_audience = sp.audience if sp and sp.audience else "urn:amazon:webservices"
+        saml_b64 = build_saml_response(
+            username, roles, cert_pem, key_pem, idp_entity_id,
+            provider_name=sp_provider, session_duration_hours=sp_duration,
+            acs_url=sp_acs_url, audience=sp_audience,
+        )
+        html = render_template_string(SAML_POST, acs=sp_acs_url, saml=saml_b64)
+        resp = jsonify({"html": html})
+        _set_session_cookie(resp, username)
+        return resp
+
+    def _passkey_auth_begin(service_path: str):
+        """Begin a username-first passkey authentication for an SP flow."""
+        if not _passkey_available():
+            return _passkey_error("Passkeys are not enabled.", 404)
+        payload = request.get_json(silent=True) or {}
+        if not _json_csrf_ok(payload):
+            return _passkey_error("Invalid request (CSRF).", 403)
+        client_ip = request.remote_addr or "unknown"
+        if rate_limiter.is_limited(client_ip):
+            return _passkey_error("Too many attempts. Try again later.", 429)
+        username = payload.get("username", "")
+        user = users.get(username)
+        # Disabled / must-set-password accounts cannot use a passkey either.
+        # Always mint options against the user's real credentials; an unknown
+        # or ineligible user yields the same generic error so existence and
+        # account state aren't leaked by the response shape.
+        credentials = (
+            wf.get_credentials(user) if user and _user_can_login(user) else []
+        )
+        if not credentials:
+            return _passkey_error("No passkey registered for this account.", 400)
+        options_json, challenge = wf.begin_authentication(_webauthn_rp, credentials)
+        handle = _passkey_challenges.put(
+            challenge=challenge, username=username, purpose="authenticate"
+        )
+        return jsonify({"handle": handle, "options": json.loads(options_json)})
+
+    def _passkey_auth_finish(service_path: str):
+        """Verify a passkey assertion and issue credentials for the SP."""
+        if not _passkey_available():
+            return _passkey_error("Passkeys are not enabled.", 404)
+        payload = request.get_json(silent=True) or {}
+        if not _json_csrf_ok(payload):
+            return _passkey_error("Invalid request (CSRF).", 403)
+        client_ip = request.remote_addr or "unknown"
+        if rate_limiter.is_limited(client_ip):
+            return _passkey_error("Too many attempts. Try again later.", 429)
+        entry = _passkey_challenges.consume(
+            payload.get("handle", ""), purpose="authenticate"
+        )
+        if entry is None:
+            return _passkey_error("Authentication session expired.", 400)
+        username = entry["username"]
+        user = users.get(username)
+        # Re-check eligibility at finish: the account could have been disabled
+        # between begin and finish (they are separate requests).
+        if not user or not _user_can_login(user):
+            rate_limiter.record(_rl_key(client_ip, username))
+            return _passkey_error("Unknown passkey.", 400)
+        credential_json = json.dumps(payload.get("credential", {}))
+        cred_id = wf.credential_id_from_response(credential_json)
+        stored = wf.find_credential(user, cred_id) if cred_id else None
+        if stored is None:
+            rate_limiter.record(_rl_key(client_ip, username))
+            return _passkey_error("Unknown passkey.", 400)
+        try:
+            new_sign_count = wf.finish_authentication(
+                _webauthn_rp, credential_json, entry["challenge"], stored
+            )
+            wf.update_credential_usage(
+                stored, new_sign_count=new_sign_count, now_iso=_now_iso()
+            )
+        except wf.WebAuthnError as exc:
+            rate_limiter.record(_rl_key(client_ip, username))
+            logger.info("Passkey auth failed for user=%s: %s", username, exc)
+            audit.log(
+                username=username,
+                ip=client_ip,
+                service=service_path,
+                protocol="webauthn",
+                result="failure",
+                reason="invalid_passkey",
+                user_agent=request.headers.get("User-Agent", ""),
+            )
+            return _passkey_error("Passkey authentication failed.", 401)
+        if users_path:
+            _save_users_and_update_mtime(users_path, users)
+        return _issue_passkey_login(username, service_path)
 
     # --- Register routes ---
     if _services:
@@ -1972,6 +2457,18 @@ def create_app(
                 _logout.__name__ = f"logout_{path}"
                 return _logout
 
+            def _make_pk_begin(path: str):
+                def _begin():
+                    return _passkey_auth_begin(path)
+                _begin.__name__ = f"passkey_begin_{path}"
+                return _begin
+
+            def _make_pk_finish(path: str):
+                def _finish():
+                    return _passkey_auth_finish(path)
+                _finish.__name__ = f"passkey_finish_{path}"
+                return _finish
+
             app.add_url_rule(
                 f"/{sp.path}", endpoint=f"get_{sp.path}",
                 view_func=_make_get(sp.path), methods=["GET"],
@@ -1984,6 +2481,14 @@ def create_app(
                 f"/{sp.path}/logout", endpoint=f"logout_{sp.path}",
                 view_func=_make_logout(sp.path), methods=["GET"],
             )
+            app.add_url_rule(
+                f"/{sp.path}/passkey/begin", endpoint=f"passkey_begin_{sp.path}",
+                view_func=_make_pk_begin(sp.path), methods=["POST"],
+            )
+            app.add_url_rule(
+                f"/{sp.path}/passkey/finish", endpoint=f"passkey_finish_{sp.path}",
+                view_func=_make_pk_finish(sp.path), methods=["POST"],
+            )
     else:
         # Fallback: single /aws route (backward compatible)
         @app.get("/aws")
@@ -1993,6 +2498,14 @@ def create_app(
         @app.post("/aws")
         def login_post():
             return _handle_login_post("aws")
+
+        @app.post("/aws/passkey/begin")
+        def aws_passkey_begin():
+            return _passkey_auth_begin("aws")
+
+        @app.post("/aws/passkey/finish")
+        def aws_passkey_finish():
+            return _passkey_auth_finish("aws")
 
         @app.get("/aws/logout")
         def logout_aws():
@@ -2204,11 +2717,18 @@ def create_app(
             logger.warning("Could not persist last_login for user=%s", username)
 
     def _needs_password_change(username: str) -> bool:
-        """True if the account must change its password before proceeding."""
+        """True if the account must change its password before proceeding.
+
+        A forced password rotation is meaningless for a password-less (passkey-
+        only) account — there is no password to change and the forced-change
+        page requires the current password — so the gate is skipped for those.
+        """
         if use_adfs:
             return False
         user = users.get(username)
-        return bool(user and user.get("force_password_change"))
+        if not user or not user.get("force_password_change"):
+            return False
+        return not wf.is_passwordless(user)
 
     def _forced_change_response(username: str):
         """Render the forced password-change page instead of issuing credentials.
@@ -2247,6 +2767,9 @@ def create_app(
         validate_username_fn=_validate_username,
         validate_claim_fn=_validate_claim,
         password_policy_fn=_password_policy_error,
+        webauthn_rp=_webauthn_rp,
+        passkey_challenges=_passkey_challenges,
+        passkey_available_fn=_passkey_available,
     )
 
     return app

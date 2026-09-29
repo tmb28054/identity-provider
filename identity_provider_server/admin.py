@@ -15,9 +15,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, g, render_template_string, request
+from flask import Flask, g, jsonify, render_template_string, request
 
 from . import backup as bk
+from . import webauthn_flows as wf
 from .tokens import PURPOSE_ADMIN, issue_token, verify_token
 from .totp import verify_code
 
@@ -85,6 +86,15 @@ ADMIN_LOGIN = """
              placeholder="Type the answer" required autocomplete="off">
       <button type="submit">Sign in</button>
     </form>
+    {% if passkey_available|default(false) %}
+    <p style="text-align:center;margin:1rem 0 0.5rem;font-size:0.8rem;color:#888;">or</p>
+    <button type="button" id="passkey-login"
+            data-begin-url="/admin/passkey/begin"
+            data-finish-url="/admin/passkey/finish"
+            data-csrf="{{ csrf_token }}">Use a passkey</button>
+    <p id="passkey-status" class="error" style="margin-top:0.75rem;"></p>
+    <script src="/static/passkey.js" defer></script>
+    {% endif %}
   </div>
 </body>
 </html>
@@ -443,8 +453,17 @@ def register_admin_routes(
     validate_username_fn=None,
     validate_claim_fn=None,
     password_policy_fn=None,
+    webauthn_rp=None,
+    passkey_challenges=None,
+    passkey_available_fn=None,
 ) -> None:
-    """Register /admin routes on the Flask app."""
+    """Register /admin routes on the Flask app.
+
+    The optional ``webauthn_rp`` / ``passkey_challenges`` /
+    ``passkey_available_fn`` arguments enable admin passkey login (Phase 3): a
+    two-step WebAuthn ceremony that funnels into the same ``idpadmin`` check and
+    shared ``idp_session`` issuance as the password + TOTP form.
+    """
 
     def _rl_key(username: str = "") -> str:
         """Build a rate-limit key for the current request."""
@@ -679,9 +698,120 @@ def register_admin_routes(
         resp = app.make_response(render_template_string(
             ADMIN_LOGIN, error=None, csrf_token=token,
             challenge_question=question, challenge_hash=ch_hash,
+            passkey_available=_admin_passkey_enabled(),
         ))
         resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
+
+    def _admin_passkey_enabled() -> bool:
+        """True if admin passkey login is wired up and enabled."""
+        return bool(
+            webauthn_rp is not None
+            and passkey_challenges is not None
+            and passkey_available_fn is not None
+            and passkey_available_fn()
+        )
+
+    def _admin_passkey_csrf_ok(payload: dict) -> bool:
+        """Validate the CSRF double-submit token on a JSON passkey request."""
+        form_token = payload.get("csrf_token", "")
+        cookie_token = request.cookies.get("csrf_token", "")
+        return bool(form_token) and hmac.compare_digest(str(form_token), cookie_token)
+
+    @app.post("/admin/passkey/begin")
+    def admin_passkey_begin():
+        """Begin a username-first admin passkey authentication.
+
+        Only accounts that hold the ``idpadmin`` claim and are otherwise usable
+        may start the ceremony; ineligible or unknown users get the same generic
+        error so admin membership isn't leaked.
+        """
+        if not _admin_passkey_enabled():
+            return jsonify({"error": "Passkeys are not enabled."}), 404
+        payload = request.get_json(silent=True) or {}
+        if not _admin_passkey_csrf_ok(payload):
+            return jsonify({"error": "Invalid request (CSRF)."}), 403
+        username = payload.get("username", "")
+        # Throttle per IP and per account, mirroring the password login path.
+        if _rl_limited() or (username and _rl_limited(username)):
+            return jsonify({"error": "Too many attempts. Try again later."}), 429
+        user = users.get(username)
+        eligible = bool(
+            user
+            and user.get("enabled") is not False
+            and not user.get("must_set_password")
+            and _has_claim(username, "idpadmin")
+        )
+        credentials = wf.get_credentials(user) if eligible else []
+        if not credentials:
+            return jsonify({"error": "No admin passkey for this account."}), 400
+        options_json, challenge = wf.begin_authentication(webauthn_rp, credentials)
+        handle = passkey_challenges.put(
+            challenge=challenge, username=username, purpose="admin",
+        )
+        return jsonify({"handle": handle, "options": json.loads(options_json)})
+
+    @app.post("/admin/passkey/finish")
+    def admin_passkey_finish():
+        """Verify an admin passkey assertion and establish the admin session."""
+        if not _admin_passkey_enabled():
+            return jsonify({"error": "Passkeys are not enabled."}), 404
+        payload = request.get_json(silent=True) or {}
+        if not _admin_passkey_csrf_ok(payload):
+            return jsonify({"error": "Invalid request (CSRF)."}), 403
+        # Per-IP throttle: the username is only known after the challenge is
+        # consumed, so failures below also record the IP bucket.
+        if _rl_limited():
+            return jsonify({"error": "Too many attempts. Try again later."}), 429
+        entry = passkey_challenges.consume(payload.get("handle", ""), purpose="admin")
+        if entry is None:
+            _rl_record()
+            return jsonify({"error": "Authentication session expired."}), 400
+        username = entry["username"]
+        user = users.get(username)
+        # Re-check idpadmin at finish (begin/finish are separate requests).
+        if not user or not _has_claim(username, "idpadmin"):
+            _rl_record()
+            _rl_record(username)
+            return jsonify({"error": "Unknown passkey."}), 400
+        credential_json = json.dumps(payload.get("credential", {}))
+        cred_id = wf.credential_id_from_response(credential_json)
+        stored = wf.find_credential(user, cred_id) if cred_id else None
+        if stored is None:
+            _rl_record()
+            _rl_record(username)
+            return jsonify({"error": "Unknown passkey."}), 400
+        try:
+            new_sign_count = wf.finish_authentication(
+                webauthn_rp, credential_json, entry["challenge"], stored,
+            )
+            wf.update_credential_usage(
+                stored, new_sign_count=new_sign_count, now_iso=_now_iso(),
+            )
+        except wf.WebAuthnError:
+            _rl_record()
+            _rl_record(username)
+            if audit_logger:
+                audit_logger.log(
+                    username=username, ip=request.remote_addr or "unknown",
+                    service="admin", protocol="webauthn", result="failure",
+                    reason="invalid_passkey",
+                    user_agent=request.headers.get("User-Agent", ""),
+                )
+            return jsonify({"error": "Passkey authentication failed."}), 401
+        if users_path:
+            save_users_fn(users_path, users)
+        if audit_logger:
+            audit_logger.log(
+                username=username, ip=request.remote_addr or "unknown",
+                service="admin", protocol="webauthn", result="success",
+                reason="passkey",
+                user_agent=request.headers.get("User-Agent", ""),
+            )
+        resp = jsonify({"redirect": "/admin"})
+        if set_session_cookie_fn:
+            set_session_cookie_fn(resp, username)
         return resp
 
     @app.post("/admin")

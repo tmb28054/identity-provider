@@ -378,6 +378,60 @@ oauth:
 
 ---
 
+## Enable and use passkeys (WebAuthn)
+
+Passkeys add a phishing-resistant second factor (Touch ID, Windows Hello, or a
+hardware security key) alongside TOTP. See
+[Configuration › Passkey authentication](configuration.md#passkey-webauthn-authentication)
+for the full option reference and the domain-binding caveat.
+
+**1. Turn passkeys on** (config file or environment):
+
+```yaml
+webauthn:
+  enabled: true
+  rp_id: "idp.botthouse.net"
+  rp_name: "Botthouse Identity Provider"
+  expected_origin: "https://idp.botthouse.net"
+```
+
+`rp_id` and `expected_origin` must match the domain users actually visit.
+Changing the domain later invalidates every enrolled passkey.
+
+**2. Enroll a passkey** (each user, once):
+
+- Sign in at `https://<host>/user` with username and password (complete TOTP if
+  enabled).
+- On the Account Settings page, under **Passkeys**, click **Register a passkey**
+  and follow the browser prompt.
+- Registered passkeys are listed with a **Remove** button.
+
+**3. Sign in with a passkey:**
+
+- On any service login page (e.g. `/aws`), enter your username.
+- Click **Use a passkey** and complete the browser prompt.
+- On success you are issued the SAML/OAuth credential and an SSO session, just
+  like a password + TOTP login.
+
+Passkeys require local-user mode; they are unavailable when the server runs in
+ADFS mode.
+
+**Admin sign-in:** the `/admin` page also offers **Use a passkey**. Enroll a
+passkey (step 2) on an account that holds the `idpadmin` claim, then use it to
+sign in to the admin panel — the `idpadmin` check and shared session are
+identical to the password + MFA form.
+
+**4. (Optional) Go password-less:**
+
+On the Account Settings page, under **Password-less sign-in**, click **Enable
+password-less sign-in**. Afterwards you can authenticate with a passkey alone
+(no password). To avoid being locked out if a device is lost, the toggle is only
+available once the account has a recovery path — **two passkeys**, or **one
+passkey plus a password or TOTP**. The account-recovery link flow remains the
+fallback if all passkeys are lost.
+
+---
+
 ## Set up ADFS/LDAP authentication
 
 Instead of managing users in `users.json`, authenticate against Active Directory:

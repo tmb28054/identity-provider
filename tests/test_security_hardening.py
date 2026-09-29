@@ -130,6 +130,20 @@ def test_user_cannot_login_no_password():
     assert not _user_can_login({"roles": []})
 
 
+def test_user_can_login_passwordless_with_passkey():
+    # A password-less account with a registered passkey may authenticate.
+    user = {"webauthn_credentials": [{"credential_id": "c", "public_key": "p",
+                                       "sign_count": 0}]}
+    assert _user_can_login(user)
+
+
+def test_user_cannot_login_disabled_even_with_passkey():
+    user = {"enabled": False,
+            "webauthn_credentials": [{"credential_id": "c", "public_key": "p",
+                                      "sign_count": 0}]}
+    assert not _user_can_login(user)
+
+
 # --- rate-limit key ---------------------------------------------------------
 
 def test_rl_key_includes_username():

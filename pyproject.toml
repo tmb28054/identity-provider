@@ -18,6 +18,7 @@ dependencies = [
     "qrcode>=8.0,<9.0",
     "pillow>=10.0",
     "requests>=2.31,<3.0",
+    "webauthn>=3.0,<4.0",
 ]
 
 [project.optional-dependencies]
@@ -31,12 +32,14 @@ dev = [
     "mypy>=1.10,<2.0",
     "bandit>=1.7,<2.0",
     "pip-audit>=2.7,<3.0",
+    "soft-webauthn>=0.1,<1.0",
 ]
 integration = [
     "pytest>=8.0,<9.0",
     "playwright>=1.40",
     "pytest-playwright>=0.5",
     "pyotp>=2.9,<3.0",
+    "soft-webauthn>=0.1,<1.0",
 ]
 
 [tool.pytest.ini_options]
@@ -62,6 +65,9 @@ version = {attr = "identity_provider_server._version.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["identity_provider_server*"]
+
+[tool.setuptools.package-data]
+identity_provider_server = ["static/*.js"]
 
 [project.scripts]
 identity-provider-server = "identity_provider_server.__main__:main"

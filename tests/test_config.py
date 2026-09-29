@@ -15,7 +15,6 @@ from identity_provider_server.config import (
     load_config,
 )
 
-
 # --- _deep_merge ---
 
 
@@ -172,3 +171,84 @@ def test_app_config_properties():
     assert config.users_path == Path("/data/users.json")
     assert config.certificate_path == Path("/data/idp.crt")
     assert config.private_key_path == Path("/data/idp.key")
+
+
+
+# --- WebAuthnConfig ---
+def test_webauthn_config_disabled_skips_validation():
+    from identity_provider_server.config import WebAuthnConfig
+
+    WebAuthnConfig(enabled=False).validate()  # no raise even with empty fields
+
+
+def test_webauthn_config_valid():
+    from identity_provider_server.config import WebAuthnConfig
+
+    WebAuthnConfig(
+        enabled=True, rp_id="idp.example.com",
+        expected_origin="https://idp.example.com",
+    ).validate()
+
+
+def test_webauthn_config_subdomain_origin_ok():
+    from identity_provider_server.config import WebAuthnConfig
+
+    WebAuthnConfig(
+        enabled=True, rp_id="example.com",
+        expected_origin="https://idp.example.com",
+    ).validate()
+
+
+def test_webauthn_config_requires_rp_id():
+    from identity_provider_server.config import WebAuthnConfig
+
+    try:
+        WebAuthnConfig(enabled=True, expected_origin="https://x.com").validate()
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "rp_id" in str(exc)
+
+
+def test_webauthn_config_requires_origin():
+    from identity_provider_server.config import WebAuthnConfig
+
+    try:
+        WebAuthnConfig(enabled=True, rp_id="x.com").validate()
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "expected_origin" in str(exc)
+
+
+def test_webauthn_config_origin_must_be_url():
+    from identity_provider_server.config import WebAuthnConfig
+
+    try:
+        WebAuthnConfig(enabled=True, rp_id="x.com", expected_origin="x.com").validate()
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "http" in str(exc)
+
+
+def test_webauthn_config_origin_host_must_match_rp_id():
+    from identity_provider_server.config import WebAuthnConfig
+
+    try:
+        WebAuthnConfig(
+            enabled=True, rp_id="idp.example.com",
+            expected_origin="https://evil.test",
+        ).validate()
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "rp_id" in str(exc)
+
+
+def test_webauthn_config_loaded_from_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("IDP_WEBAUTHN_ENABLED", "true")
+    monkeypatch.setenv("IDP_WEBAUTHN_RP_ID", "idp.example.com")
+    monkeypatch.setenv("IDP_WEBAUTHN_RP_NAME", "Example IdP")
+    monkeypatch.setenv("IDP_WEBAUTHN_EXPECTED_ORIGIN", "https://idp.example.com")
+    cfg = load_config(str(tmp_path))
+    assert cfg.webauthn.enabled is True
+    assert cfg.webauthn.rp_id == "idp.example.com"
+    assert cfg.webauthn.rp_name == "Example IdP"
+    cfg.webauthn.validate()  # should not raise

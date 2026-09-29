@@ -23,6 +23,12 @@ def test_coverage_minimum_threshold():
             "pytest",
             "tests/",
             "--ignore=tests/test_coverage_gate.py",
+            # Integration tests run the app in a subprocess (contributing no
+            # measured coverage) and are network/browser-gated; exclude them so
+            # the coverage gate measures the in-process unit + smoke suite.
+            "--ignore=tests/integration",
+            "-m",
+            "not integration",
             "--cov=identity_provider_server",
             f"--cov-fail-under={REQUIRED_COVERAGE}",
             "-q",

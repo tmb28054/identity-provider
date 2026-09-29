@@ -39,6 +39,12 @@ _DEFAULTS: dict[str, Any] = {
         "rate_limit_max_attempts": 5,
         "rate_limit_window_seconds": 60,
     },
+    "webauthn": {
+        "enabled": False,
+        "rp_id": "",
+        "rp_name": "Identity Provider",
+        "expected_origin": "",
+    },
 }
 
 CONFIG_FILENAME = "config.yaml"
@@ -77,6 +83,43 @@ class SecurityConfig:
 
 
 @dataclass
+class WebAuthnConfig:
+    """Passkey (WebAuthn/FIDO2) relying-party configuration.
+
+    ``rp_id`` is the effective domain credentials are bound to (e.g.
+    ``idp.botthouse.net``). ``expected_origin`` is the full https origin the
+    browser reports (e.g. ``https://idp.botthouse.net``). Both must match the
+    domain users actually visit, or enrolled passkeys stop validating.
+    """
+
+    enabled: bool = False
+    rp_id: str = ""
+    rp_name: str = "Identity Provider"
+    expected_origin: str = ""
+
+    def validate(self) -> None:
+        """Raise ValueError if enabled but misconfigured or inconsistent."""
+        if not self.enabled:
+            return
+        if not self.rp_id:
+            raise ValueError("webauthn.rp_id is required when webauthn.enabled is true")
+        if not self.expected_origin:
+            raise ValueError(
+                "webauthn.expected_origin is required when webauthn.enabled is true"
+            )
+        origin = self.expected_origin
+        if not origin.startswith("https://") and not origin.startswith("http://"):
+            raise ValueError("webauthn.expected_origin must be an http(s) URL")
+        # The origin host must equal rp_id or be a subdomain of it.
+        host = origin.split("://", 1)[1].split("/", 1)[0].split(":", 1)[0]
+        if host != self.rp_id and not host.endswith("." + self.rp_id):
+            raise ValueError(
+                f"webauthn.expected_origin host ({host}) is not rp_id "
+                f"({self.rp_id}) or a subdomain of it"
+            )
+
+
+@dataclass
 class AppConfig:
     """Complete application configuration."""
 
@@ -85,6 +128,7 @@ class AppConfig:
     data: DataConfig = field(default_factory=DataConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
+    webauthn: WebAuthnConfig = field(default_factory=WebAuthnConfig)
     data_dir: str = ""
 
     def resolve_path(self, relative_path: str) -> Path:
@@ -141,6 +185,10 @@ def _apply_env_overrides(config: dict) -> dict:
         "SECRET_KEY": ("security", "secret_key"),
         "IDP_RATE_LIMIT_MAX_ATTEMPTS": ("security", "rate_limit_max_attempts"),
         "IDP_RATE_LIMIT_WINDOW_SECONDS": ("security", "rate_limit_window_seconds"),
+        "IDP_WEBAUTHN_ENABLED": ("webauthn", "enabled"),
+        "IDP_WEBAUTHN_RP_ID": ("webauthn", "rp_id"),
+        "IDP_WEBAUTHN_RP_NAME": ("webauthn", "rp_name"),
+        "IDP_WEBAUTHN_EXPECTED_ORIGIN": ("webauthn", "expected_origin"),
     }
 
     for env_var, (section, key) in env_map.items():
@@ -208,5 +256,6 @@ def load_config(data_dir: str, config_path: str | None = None) -> AppConfig:
         data=DataConfig(**config.get("data", {})),
         logging=LoggingConfig(**config.get("logging", {})),
         security=SecurityConfig(**config.get("security", {})),
+        webauthn=WebAuthnConfig(**config.get("webauthn", {})),
         data_dir=str(data_path),
     )

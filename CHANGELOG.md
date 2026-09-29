@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-09-26
+
+### Added
+- Passkey (WebAuthn/FIDO2) support — Phase 1 (second factor). Users can register
+  a passkey on the Account Settings page and use it as a second factor at login
+  alongside TOTP. Implemented `identity_provider_server/webauthn_flows.py`
+  (ceremony core, credential data model, single-use challenge store), a
+  `WebAuthnConfig` (`webauthn.enabled` / `rp_id` / `rp_name` / `expected_origin`,
+  with `IDP_WEBAUTHN_*` env overrides and startup validation), JSON registration
+  endpoints (`POST /user/passkey/register/begin|finish`), a `remove_passkey`
+  self-service action, username-first authentication endpoints
+  (`POST /<sp>/passkey/begin|finish`) that funnel into the existing SAML/OAuth
+  and SSO-session issuance path, and a static client script served under the
+  strict `script-src 'self'` CSP. Sign-count monotonicity rejects cloned
+  authenticators. Passkeys are available in local-user mode only.
+- `docs/passkey-tasks.md`: the phased implementation task breakdown derived from
+  the design doc.
+- End-to-end passkey integration test (`tests/integration/test_passkey_e2e.py`)
+  driving register → authenticate in a real browser via the Chrome DevTools
+  Protocol virtual authenticator against a self-launched local IdP.
+- Passkey support — Phase 2 (password-less). Accounts can opt into password-less
+  sign-in (username → passkey, no password) from the Account Settings page. An
+  anti-lockout guard requires a recovery path first — two passkeys, or one
+  passkey plus a password or TOTP. `_user_can_login` now admits password-less
+  accounts that hold a valid passkey; the no-MFA login path issues the SSO
+  session cookie consistently; and forced password rotation is skipped for
+  password-less accounts. The recovery-token flow remains the fallback.
+- Passkey support — Phase 3 (admin). The `/admin` login page offers a "Use a
+  passkey" option backed by a two-step `POST /admin/passkey/begin|finish`
+  ceremony. It re-checks the `idpadmin` claim at finish, issues the same shared
+  `idp_session` as the password + TOTP form, and is per-IP/per-account
+  rate-limited. The existing password + TOTP admin login is unchanged.
+
+### Changed
+- `docs/configuration.md` and `docs/howto.md` document passkey configuration,
+  enrollment/use, and the domain-binding caveat (changing the served domain
+  invalidates enrolled passkeys).
+
 ## [1.7.0] - 2026-09-28
 
 ### Added

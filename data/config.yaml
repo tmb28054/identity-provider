@@ -28,3 +28,12 @@ security:
   secret_key: ""  # Flask secret key for CSRF. Leave empty to auto-generate.
   rate_limit_max_attempts: 5
   rate_limit_window_seconds: 60
+
+# Passkey (WebAuthn/FIDO2) — optional second factor. Disabled by default.
+# rp_id and expected_origin are required once enabled and must match the
+# domain users actually visit (changing it invalidates enrolled passkeys).
+# webauthn:
+#   enabled: true
+#   rp_id: "idp.botthouse.net"
+#   rp_name: "Identity Provider"
+#   expected_origin: "https://idp.botthouse.net"
