@@ -93,7 +93,7 @@ ADMIN_LOGIN = """
             data-finish-url="/admin/passkey/finish"
             data-csrf="{{ csrf_token }}">Use a passkey</button>
     <p id="passkey-status" class="error" style="margin-top:0.75rem;"></p>
-    <script src="/static/passkey.js" defer></script>
+    <script src="/static/passkey.js?v={{ passkey_js_version }}" defer></script>
     {% endif %}
   </div>
 </body>

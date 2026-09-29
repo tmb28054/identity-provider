@@ -393,8 +393,9 @@ def test_csp_unchanged_and_self_only(client):
     csp = resp.headers["Content-Security-Policy"]
     assert "script-src 'self'" in csp
     assert "unsafe-inline" not in csp.split("script-src")[1].split(";")[0]
-    # The login page references the static script under 'self'.
-    assert b'src="/static/passkey.js"' in resp.data
+    # The login page references the static script under 'self' (cache-busted
+    # with a ?v=<version> query per release).
+    assert b'src="/static/passkey.js?v=' in resp.data
 
 
 def test_login_form_offers_passkey_when_enabled(client):

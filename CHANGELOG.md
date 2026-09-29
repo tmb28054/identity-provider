@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reloaded). The `register/finish` response now reports `passwordless_eligible`
   and the client re-enables the toggle in place once the account meets the
   minimum-factor policy.
+- Cache-bust `passkey.js`: shortened its cache to 5 minutes and appended a
+  `?v=<version>` query to every script reference so a release is never masked
+  by a stale CDN/browser copy of the client script.
 
 ## [1.8.0] - 2026-09-26
 

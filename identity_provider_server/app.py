@@ -134,7 +134,7 @@ LOGIN_FORM = """
             data-csrf="{{ csrf_token }}"
             style="background:#232f3e;">Use a passkey</button>
     <p id="passkey-status" class="error" style="margin-top:0.75rem;"></p>
-    <script src="/static/passkey.js" defer></script>
+    <script src="/static/passkey.js?v={{ passkey_js_version }}" defer></script>
     {% endif %}
   </div>
 </body>
@@ -447,7 +447,7 @@ USER_PAGE_ENROLL = """
             data-csrf="{{ csrf_token }}"
             data-auth-token="{{ auth_token }}">Register a passkey</button>
     <p id="passkey-status" class="error" style="margin-top:0.75rem;"></p>
-    <script src="/static/passkey.js" defer></script>
+    <script src="/static/passkey.js?v={{ passkey_js_version }}" defer></script>
 
     <h2 style="border-top:1px dashed #eee;">Password-less sign-in</h2>
     {% if passwordless_error|default('') %}<p class="error">{{ passwordless_error }}</p>{% endif %}
@@ -884,6 +884,10 @@ def create_app(
 
     app = Flask(__name__)
     app.secret_key = secret_key or os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+    # Cache-bust the static passkey script per release so a deploy is never
+    # masked by a stale CDN/browser copy. Available to every template render.
+    from ._version import __version__ as _idp_version
+    app.jinja_env.globals["passkey_js_version"] = _idp_version
 
     # Trust exactly one upstream proxy for the client IP / scheme so rate
     # limiting keys on the real client rather than the proxy address.
