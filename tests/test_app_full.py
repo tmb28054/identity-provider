@@ -20,7 +20,16 @@ import pytest
 import yaml
 
 from identity_provider_server.app import create_app
-from identity_provider_server.tokens import PURPOSE_SESSION, issue_token
+from identity_provider_server.tokens import issue_session_token
+
+
+def _session_cookie(secret: str, username: str) -> str:
+    """Mint a session cookie in the current (epoch + auth_time) scheme."""
+    import time as _time
+
+    return issue_session_token(
+        secret, username, auth_time=int(_time.time()), epoch=0,
+    )
 
 DATA_SRC = Path(__file__).parent.parent / "data"
 PW = "Str0ng-Passw0rd!"
@@ -247,7 +256,7 @@ def test_session_reuse_saml(tmp_path):
          "claims": []}
     ])
     client = app.test_client()
-    client.set_cookie("idp_session", issue_token("appsecret", "bob", PURPOSE_SESSION),
+    client.set_cookie("idp_session", _session_cookie("appsecret", "bob"),
                       domain="localhost")
     resp = client.get("/aws")
     assert b"SAMLResponse" in resp.data
@@ -260,7 +269,7 @@ def test_session_reuse_oauth(tmp_path):
         services={"oauth": {"wiki": {"url": "https://wiki.example/cb"}}},
     )
     client = app.test_client()
-    client.set_cookie("idp_session", issue_token("appsecret", "bob", PURPOSE_SESSION),
+    client.set_cookie("idp_session", _session_cookie("appsecret", "bob"),
                       domain="localhost")
     resp = client.get("/wiki")
     assert resp.status_code == 302
@@ -597,6 +606,21 @@ def _make_recovery_token(app, tmp_path, username="bob"):
     path.write_text(json.dumps({token: {"username": username, "created": _t.time(),
                                           "expires": _t.time() + 3600}}))
     return token
+
+
+def test_recover_rejects_password_reuse(tmp_path):
+    """The recovery flow refuses to set the account's current password again."""
+    app = _write_app(tmp_path, [{"username": "bob", "password": _hash(), "roles": [], "claims": []}])
+    token = _make_recovery_token(app, tmp_path)
+    client = app.test_client()
+    get = client.get(f"/recover/{token}")
+    csrf = _csrf(get.data)
+    secret = re.search(rb'name="totp_secret" value="([^"]+)"', get.data).group(1).decode()
+    resp = client.post(f"/recover/{token}", data={
+        "csrf_token": csrf, "new_password": PW, "confirm_password": PW,
+        "totp_secret": secret,
+    })
+    assert b"differ from the last" in resp.data
 
 
 def test_recover_get_valid_and_invalid(tmp_path):
@@ -1478,7 +1502,9 @@ def test_passkey_begin_rate_limited(tmp_path):
 
 
 def test_passkey_auth_blocked_when_account_disabled(tmp_path):
-    """A disabled account cannot start a passkey login even with a credential."""
+    """A disabled account's passkey begin is indistinguishable (decoy options),
+    so it does not leak that the account exists or has a passkey. The account
+    still cannot actually authenticate (covered by the finish-side test)."""
     app = _write_app(
         tmp_path,
         [{"username": "bob", "password": _hash(), "roles": [], "claims": []}],
@@ -1501,8 +1527,9 @@ def test_passkey_auth_blocked_when_account_disabled(tmp_path):
                      client.get("/aws").data).group(1).decode()
     begin = client.post("/aws/passkey/begin",
                         json={"csrf_token": csrf, "username": "bob"})
-    assert begin.status_code == 400
-    assert "no passkey" in begin.get_json()["error"].lower()
+    # Indistinguishable from an eligible account: 200 with options.
+    assert begin.status_code == 200
+    assert begin.get_json()["options"]["allowCredentials"]
 
 
 def test_passkey_finish_blocked_if_disabled_after_begin(tmp_path):

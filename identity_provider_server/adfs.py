@@ -113,6 +113,14 @@ def authenticate_adfs(
     from ldap3 import ALL, Connection, Server, Tls
     from ldap3.core.exceptions import LDAPBindError, LDAPException
 
+    # Reject empty or whitespace-only passwords before any bind. A directory
+    # that permits an unauthenticated simple bind (RFC 4513) returns success
+    # for a DN with an empty password; without this guard that success would be
+    # read as a valid authentication.
+    if not password or not password.strip():
+        logger.info("ADFS auth: rejected empty password for user %s", username)
+        return None
+
     host = adfs_config["host"]
     bind_user = adfs_config["username"]
     bind_password = adfs_config["password"]

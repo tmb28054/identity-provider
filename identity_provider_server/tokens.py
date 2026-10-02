@@ -105,6 +105,86 @@ def verify_token(secret: str, token: str, purpose: str, max_age: int) -> str | N
     return username
 
 
+# Session tokens carry two extra fields beyond the plain token subject so the
+# server can enforce an absolute lifetime and revoke outstanding cookies:
+#
+#   * ``auth_time`` — the wall-clock second the session was first established.
+#     It is preserved verbatim when the cookie is re-minted on each request, so
+#     the idle window can slide while the absolute cap stays fixed.
+#   * ``epoch`` — a per-user revocation counter copied from the user record at
+#     issue time. Bumping the stored counter (on disable / password reset /
+#     claim change) invalidates every cookie minted with the old value.
+#
+# These are packed into the token *subject* with ``|`` as the separator. The
+# username charset (see ``app._USERNAME_RE``) excludes ``|`` and ``:``, so the
+# outer four-field ``:`` token format is unaffected.
+_SESSION_SEP = "|"
+
+
+def issue_session_token(
+    secret: str,
+    username: str,
+    *,
+    auth_time: int,
+    epoch: int,
+    now: int | None = None,
+) -> str:
+    """Issue a session token binding ``auth_time`` and the revocation ``epoch``.
+
+    Args:
+        secret: The application root secret.
+        username: The subject the session authenticates.
+        auth_time: The second the session was first established (absolute-cap
+            anchor); preserved across re-mints.
+        epoch: The user's current revocation counter.
+        now: Optional issue timestamp override (seconds) for the idle window.
+
+    Returns:
+        The encoded session token string.
+    """
+    subject = f"{username}{_SESSION_SEP}{int(auth_time)}{_SESSION_SEP}{int(epoch)}"
+    return issue_token(secret, subject, PURPOSE_SESSION, now=now)
+
+
+def verify_session_token(
+    secret: str,
+    token: str,
+    idle_max_age: int,
+    absolute_max_age: int,
+) -> tuple[str, int, int] | None:
+    """Verify a session token against the idle *and* absolute lifetime limits.
+
+    The signed issue timestamp is treated as the last-activity marker (the
+    cookie is re-minted on each authenticated request) and is checked against
+    ``idle_max_age``. The embedded ``auth_time`` is checked against
+    ``absolute_max_age`` so an actively-used session still faces a hard ceiling.
+
+    Args:
+        secret: The application root secret.
+        token: The session token string.
+        idle_max_age: Maximum seconds since last activity.
+        absolute_max_age: Maximum seconds since the session was established.
+
+    Returns:
+        ``(username, auth_time, epoch)`` if valid, else ``None``.
+    """
+    subject = verify_token(secret, token, PURPOSE_SESSION, idle_max_age)
+    if subject is None:
+        return None
+    parts = subject.split(_SESSION_SEP)
+    if len(parts) != 3:
+        return None
+    username, auth_time_str, epoch_str = parts
+    try:
+        auth_time = int(auth_time_str)
+        epoch = int(epoch_str)
+    except ValueError:
+        return None
+    if auth_time < 0 or time.time() - auth_time > absolute_max_age:
+        return None
+    return username, auth_time, epoch
+
+
 @dataclass
 class NonceStore:
     """A tiny in-memory single-use nonce store with time-based expiry.

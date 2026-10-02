@@ -351,3 +351,20 @@ def test_authenticate_adfs_no_ssl_no_tls():
     # use_ssl should be False
     call_kwargs = MockServer.call_args
     assert call_kwargs.kwargs.get("use_ssl") is False or call_kwargs[1].get("use_ssl") is False
+
+
+# --- empty-password guard (security review F4) ---
+
+def test_authenticate_adfs_rejects_empty_password():
+    """An empty password is refused before any bind (unauthenticated simple
+    bind defence). No LDAP connection should be attempted."""
+    cfg = {
+        "host": "ldaps://ldap.example.com",
+        "username": "cn=svc,dc=example,dc=com",
+        "password": "svcpass",
+        "base_dn": "dc=example,dc=com",
+    }
+    with patch("ldap3.Connection") as conn:
+        assert authenticate_adfs("alice", "", cfg) is None
+        assert authenticate_adfs("alice", "   ", cfg) is None
+        conn.assert_not_called()

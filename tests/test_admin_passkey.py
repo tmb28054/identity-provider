@@ -113,14 +113,58 @@ def _admin_csrf(client) -> str:
     ).group(1).decode()
 
 
-def _admin_passkey_login(client, device, username="admin"):
+def _uv_get(device, options, origin):
+    """Produce an assertion with the user-verification (UV) flag set.
+
+    ``soft_webauthn`` only sets user-present (``flags = 0x01``). The admin
+    passkey flow now requires user verification, so this mirrors the library's
+    ``get`` with ``flags = 0x05`` (UP|UV) and re-signs over that data.
+    """
+    import json as _json
+    from base64 import urlsafe_b64encode
+    from hashlib import sha256
+    from struct import pack
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    device.sign_count += 1
+    client_data = _json.dumps({
+        "type": "webauthn.get",
+        "challenge": urlsafe_b64encode(
+            options["publicKey"]["challenge"]
+        ).decode("ascii").rstrip("="),
+        "origin": origin,
+    }).encode("utf-8")
+    client_data_hash = sha256(client_data).digest()
+    rp_id_hash = sha256(device.rp_id.encode("ascii")).digest()
+    flags = b"\x05"  # user-present + user-verified
+    authenticator_data = rp_id_hash + flags + pack(">I", device.sign_count)
+    signature = device.private_key.sign(
+        authenticator_data + client_data_hash, ec.ECDSA(hashes.SHA256())
+    )
+    return {
+        "id": urlsafe_b64encode(device.credential_id),
+        "rawId": device.credential_id,
+        "response": {
+            "authenticatorData": authenticator_data,
+            "clientDataJSON": client_data,
+            "signature": signature,
+            "userHandle": device.user_handle,
+        },
+        "type": "public-key",
+    }
+
+
+def _admin_passkey_login(client, device, username="admin", *, user_verified=True):
     csrf = _admin_csrf(client)
     begin = client.post("/admin/passkey/begin",
                         json={"csrf_token": csrf, "username": username})
     if begin.status_code != 200:
         return begin
     body = begin.get_json()
-    assertion = device.get(_options_to_soft(body["options"]), ORIGIN)
+    opts = _options_to_soft(body["options"])
+    assertion = _uv_get(device, opts, ORIGIN) if user_verified else device.get(opts, ORIGIN)
     return client.post("/admin/passkey/finish", json={
         "csrf_token": csrf, "handle": body["handle"],
         "credential": _att_to_dict(assertion),
@@ -147,23 +191,41 @@ def test_admin_passkey_login_success(app):
     assert b"Add User" in client.get("/admin").data
 
 
-def test_admin_passkey_begin_non_admin_rejected(app):
-    """A non-idpadmin account with a passkey cannot start the admin ceremony."""
+def test_admin_passkey_begin_non_admin_indistinguishable(app):
+    """A non-idpadmin account yields the same 200+options shape as an admin, so
+    begin does not enumerate idpadmin membership. The finish still fails."""
     client = app.test_client()
     device = SoftWebauthnDevice()
     _register_passkey(client, device, "bob")
     csrf = _admin_csrf(client)
     resp = client.post("/admin/passkey/begin",
                        json={"csrf_token": csrf, "username": "bob"})
-    assert resp.status_code == 400
-    assert "no admin passkey" in resp.get_json()["error"].lower()
+    assert resp.status_code == 200
+    assert resp.get_json()["options"]["allowCredentials"]
 
 
-def test_admin_passkey_begin_unknown_user(app):
+def test_admin_passkey_begin_unknown_user_indistinguishable(app):
     client = app.test_client()
     csrf = _admin_csrf(client)
     resp = client.post("/admin/passkey/begin",
                        json={"csrf_token": csrf, "username": "ghost"})
+    assert resp.status_code == 200
+    assert resp.get_json()["options"]["allowCredentials"]
+
+
+def test_admin_passkey_non_admin_cannot_finish(app):
+    """Even though begin returns decoy options, a non-admin cannot finish."""
+    client = app.test_client()
+    device = SoftWebauthnDevice()
+    _register_passkey(client, device, "bob")
+    csrf = _admin_csrf(client)
+    begin = client.post("/admin/passkey/begin",
+                        json={"csrf_token": csrf, "username": "bob"}).get_json()
+    assertion = _uv_get(device, _options_to_soft(begin["options"]), ORIGIN)
+    resp = client.post("/admin/passkey/finish", json={
+        "csrf_token": csrf, "handle": begin["handle"],
+        "credential": _att_to_dict(assertion),
+    })
     assert resp.status_code == 400
 
 

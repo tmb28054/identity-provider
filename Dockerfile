@@ -1,18 +1,23 @@
-# Pin the base image to a specific patch release. For stronger supply-chain
-# integrity, pin by digest instead, e.g.:
-#   FROM python:3.13.7-slim@sha256:<digest>
-# Resolve the digest with: docker buildx imagetools inspect python:3.13.7-slim
-FROM python:3.13.7-slim
+# Pin the base image by immutable digest, not just the mutable tag, so the
+# build always resolves the exact image that was reviewed. The tag is kept in
+# the comment for human readability.
+# Re-pin after a deliberate base-image bump with:
+#   docker buildx imagetools inspect python:3.13.7-slim
+# tag: python:3.13.7-slim
+FROM python:3.13.7-slim@sha256:8d9d0b8bcf6506481eae4907c18f5e3e7902e629f5f6d684f9e7c32e85e3ddf0
 
 # Create an unprivileged user to run the service (never run as root).
 RUN groupadd --system idp && useradd --system --gid idp --home /app idp
 
 WORKDIR /app
 
-COPY pyproject.toml CHANGELOG.md ./
+COPY pyproject.toml CHANGELOG.md constraints.txt ./
 COPY identity_provider_server/ identity_provider_server/
 
-RUN pip install --no-cache-dir .
+# Install against the pinned constraint set (the SBOM anchor) so the image
+# resolves the same versions the CI test job verifies, rather than whatever
+# PyPI serves at build time inside the open-ended ranges in pyproject.toml.
+RUN pip install --no-cache-dir -c constraints.txt .
 
 # /data holds secrets (signing key, user DB); owned by the service user.
 RUN mkdir -p /data && chown -R idp:idp /data /app

@@ -22,8 +22,10 @@ Design notes:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import re
 import tarfile
 from dataclasses import asdict, dataclass
@@ -45,7 +47,9 @@ BACKUP_FILES: tuple[str, ...] = (
     "group_roles.yaml",
     "adfs_config.yaml",
     "recovery_tokens.json",
-    "backup_config.json",
+    # NOTE: backup_config.json is deliberately NOT backed up. It holds the SMB
+    # share credentials; storing it on the share itself would expose those
+    # credentials to anyone who can read the backups.
 )
 
 # Never include these in an archive even if present in the data dir.
@@ -64,6 +68,129 @@ _ARCHIVE_PREFIX = "idp-"
 _ARCHIVE_SUFFIX = ".tar.gz"
 # idp-YYYYMMDD-HHMMSS.tar.gz
 _ARCHIVE_RE = _ARCHIVE_PREFIX + "%Y%m%d-%H%M%S" + _ARCHIVE_SUFFIX
+
+# Encrypted archives append ``.enc``; a detached digest sits alongside as
+# ``<archive>.sha256``. The archive is encrypted with Fernet (AES-128-CBC +
+# HMAC-SHA256 authenticated), so a tampered or truncated archive fails to
+# decrypt and the digest gives a second, cheap integrity check before the
+# archive is ever opened as a tarball.
+ENCRYPTED_SUFFIX = ".enc"
+DIGEST_SUFFIX = ".sha256"
+
+# Environment variable and on-host filename for the backup encryption key. The
+# key lives OUTSIDE the backed-up data directory so a stolen archive does not
+# also contain the key that decrypts it.
+BACKUP_KEY_ENV = "IDP_BACKUP_KEY"
+BACKUP_KEY_FILENAME = "backup.key"
+
+
+class BackupKeyError(RuntimeError):
+    """Raised when the backup encryption key is missing or malformed."""
+
+
+def resolve_backup_key(data_dir: str | Path) -> bytes:
+    """Return the Fernet backup key, generating one on first use.
+
+    Resolution order:
+
+    1. ``IDP_BACKUP_KEY`` environment variable (urlsafe-base64 Fernet key).
+    2. ``backup.key`` in the *parent* of ``data_dir`` (never inside it, so the
+       key is not swept into the archive). Created 0600 on first use.
+
+    Raises:
+        BackupKeyError: If an env key is set but malformed.
+    """
+    from cryptography.fernet import Fernet
+
+    env_key = os.environ.get(BACKUP_KEY_ENV)
+    if env_key:
+        try:
+            Fernet(env_key.encode())
+        except (ValueError, TypeError) as exc:
+            raise BackupKeyError(f"{BACKUP_KEY_ENV} is not a valid Fernet key") from exc
+        return env_key.encode()
+
+    key_path = Path(data_dir).resolve().parent / BACKUP_KEY_FILENAME
+    if key_path.is_file():
+        return key_path.read_bytes().strip()
+
+    key = Fernet.generate_key()
+    key_path.write_bytes(key)
+    try:
+        key_path.chmod(0o600)
+    except OSError:  # pragma: no cover - best effort on exotic filesystems
+        logger.warning("Could not chmod 600 %s", key_path)
+    logger.info("Generated a new backup encryption key at %s", key_path)
+    return key
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def create_encrypted_archive(
+    data_dir: str | Path, dest_path: str | Path, key: bytes
+) -> int:
+    """Create an authenticated-encrypted archive plus a detached SHA-256.
+
+    ``dest_path`` is the base archive path (e.g. ``idp-...tar.gz``); the
+    ciphertext is written to ``dest_path + '.enc'`` and the digest of the
+    ciphertext to ``dest_path + '.enc.sha256'``. The plaintext tarball is
+    created in a temporary file and removed immediately after encryption.
+
+    Returns:
+        The size of the encrypted archive in bytes.
+    """
+    from cryptography.fernet import Fernet
+
+    dest_path = Path(dest_path)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_plain = dest_path.with_suffix(dest_path.suffix + ".plain.tmp")
+    try:
+        create_archive(data_dir, tmp_plain)
+        token = Fernet(key).encrypt(tmp_plain.read_bytes())
+    finally:
+        tmp_plain.unlink(missing_ok=True)
+    enc_path = Path(str(dest_path) + ENCRYPTED_SUFFIX)
+    enc_path.write_bytes(token)
+    Path(str(enc_path) + DIGEST_SUFFIX).write_text(_sha256_hex(token) + "\n")
+    return enc_path.stat().st_size
+
+
+def restore_encrypted_archive(
+    archive_path: str | Path, data_dir: str | Path, key: bytes
+) -> list[str]:
+    """Verify, decrypt, validate, and extract an encrypted archive.
+
+    The detached digest (if present) is checked first, then the Fernet
+    authentication tag on decryption, then the inner tarball is validated for
+    unsafe members before extraction.
+
+    Raises:
+        ValueError: On digest mismatch, decryption failure, or unsafe member.
+    """
+    from cryptography.fernet import Fernet, InvalidToken
+
+    archive_path = Path(archive_path)
+    token = archive_path.read_bytes()
+
+    digest_path = Path(str(archive_path) + DIGEST_SUFFIX)
+    if digest_path.is_file():
+        expected = digest_path.read_text().strip()
+        if _sha256_hex(token) != expected:
+            raise ValueError("Backup archive digest mismatch — refusing to restore.")
+
+    try:
+        plaintext = Fernet(key).decrypt(token)
+    except InvalidToken as exc:
+        raise ValueError("Backup archive failed authentication — refusing to restore.") from exc
+
+    tmp_plain = archive_path.with_suffix(archive_path.suffix + ".plain.tmp")
+    try:
+        tmp_plain.write_bytes(plaintext)
+        return restore_archive(tmp_plain, data_dir)
+    finally:
+        tmp_plain.unlink(missing_ok=True)
 
 
 @dataclass
@@ -221,7 +348,12 @@ def archive_name(when: datetime | None = None) -> str:
 
 
 def list_archives(dest_dir: str | Path) -> list[str]:
-    """List backup archive filenames in a directory, newest first."""
+    """List backup archive filenames in a directory, newest first.
+
+    Recognises both legacy plaintext archives (``…tar.gz``) and the current
+    encrypted archives (``…tar.gz.enc``). The detached ``.sha256`` digests are
+    not listed.
+    """
     dest_dir = Path(dest_dir)
     if not dest_dir.is_dir():
         return []
@@ -230,7 +362,10 @@ def list_archives(dest_dir: str | Path) -> list[str]:
         for p in dest_dir.iterdir()
         if p.is_file()
         and p.name.startswith(_ARCHIVE_PREFIX)
-        and p.name.endswith(_ARCHIVE_SUFFIX)
+        and (
+            p.name.endswith(_ARCHIVE_SUFFIX)
+            or p.name.endswith(_ARCHIVE_SUFFIX + ENCRYPTED_SUFFIX)
+        )
     ]
     return sorted(names, reverse=True)
 
@@ -253,6 +388,10 @@ def prune_archives(dest_dir: str | Path, keep: int) -> list[str]:
         try:
             (dest_dir / name).unlink()
             deleted.append(name)
+            # Remove the detached digest sidecar if present.
+            sidecar = dest_dir / (name + DIGEST_SUFFIX)
+            if sidecar.is_file():
+                sidecar.unlink()
         except OSError:
             logger.warning("Could not delete old archive %s", name)
     return deleted
@@ -290,18 +429,20 @@ def run_backup(
     status.last_attempt = when.isoformat()
 
     try:
+        key = resolve_backup_key(data_dir)
         base = safe_base(mount_dir, config.subpath)
         # Ensure the configured subpath (and its daily set) exists on the share.
         daily_dir = base / "daily"
         daily_dir.mkdir(parents=True, exist_ok=True)
-        name = archive_name(when)
-        size = create_archive(data_dir, daily_dir / name)
+        # The on-share archive name carries the .enc suffix.
+        name = archive_name(when) + ENCRYPTED_SUFFIX
+        size = create_encrypted_archive(data_dir, daily_dir / archive_name(when), key)
         prune_archives(daily_dir, config.daily_retention)
 
         if _is_weekly(when):
             weekly_dir = base / "weekly"
             weekly_dir.mkdir(parents=True, exist_ok=True)
-            create_archive(data_dir, weekly_dir / name)
+            create_encrypted_archive(data_dir, weekly_dir / archive_name(when), key)
             prune_archives(weekly_dir, config.weekly_retention)
 
         status.result = "success"
@@ -321,11 +462,17 @@ def run_backup(
             write_archive_listing(data_dir, merged)
         except OSError:
             logger.warning("Could not write archive listing cache")
-    except (OSError, FileNotFoundError, tarfile.TarError) as exc:
+    except (OSError, FileNotFoundError, tarfile.TarError, BackupKeyError) as exc:
         status.result = "failure"
         status.message = f"Backup failed: {exc}"
         status.consecutive_failures += 1
         logger.error("Backup failed: %s", exc)
+        from . import notify
+        notify.notify(
+            "backup_failed",
+            f"IdP backup failed: {exc}",
+            severity="critical",
+        )
 
     save_status(data_dir, status)
     return status

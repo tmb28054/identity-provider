@@ -308,17 +308,24 @@ def test_auth_begin_bad_csrf(client):
     assert resp.status_code == 403
 
 
-def test_auth_begin_no_passkey(client):
+def test_auth_begin_no_passkey_is_indistinguishable(client):
+    """An account without a passkey yields the SAME 200+options shape as one
+    with a passkey, so the begin response is not an enumeration oracle."""
     csrf = _csrf(client)
     resp = client.post("/aws/passkey/begin", json={"csrf_token": csrf, "username": "topaztest"})
-    assert resp.status_code == 400
-    assert "no passkey" in resp.get_json()["error"].lower()
+    assert resp.status_code == 200
+    body = resp.get_json()
+    # Valid options object with a (decoy) allowed credential.
+    assert "handle" in body
+    assert body["options"]["allowCredentials"]
 
 
-def test_auth_begin_unknown_user(client):
+def test_auth_begin_unknown_user_is_indistinguishable(client):
+    """An unknown username also yields 200+options (decoy), not a 400 oracle."""
     csrf = _csrf(client)
     resp = client.post("/aws/passkey/begin", json={"csrf_token": csrf, "username": "ghost"})
-    assert resp.status_code == 400
+    assert resp.status_code == 200
+    assert resp.get_json()["options"]["allowCredentials"]
 
 
 def test_auth_finish_disabled_returns_404(data_dir):

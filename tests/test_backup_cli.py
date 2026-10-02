@@ -172,6 +172,39 @@ def test_do_restore_happy_path(tmp_path):
     assert len(snaps) == 1
 
 
+def test_do_restore_encrypted_archive(tmp_path):
+    """do_restore decrypts a .tar.gz.enc archive and restores its contents."""
+    data = tmp_path / "data"
+    data.mkdir()
+    _seed(data)
+    bk.save_config(
+        data,
+        bk.BackupConfig(server="s", share="sh", username="u", subpath="idp-backup"),
+    )
+    # Pin a known key so create and restore use the same material.
+    from cryptography.fernet import Fernet
+    key = Fernet.generate_key()
+    (tmp_path / bk.BACKUP_KEY_FILENAME).write_bytes(key)
+
+    archive = "idp-20260101-000000.tar.gz" + bk.ENCRYPTED_SUFFIX
+
+    def fake_mount(config, mount_dir):
+        daily = Path(mount_dir) / "idp-backup" / "daily"
+        daily.mkdir(parents=True, exist_ok=True)
+        other = Path(mount_dir) / "src"
+        other.mkdir()
+        (other / "users.json").write_text(json.dumps([{"username": "restored"}]))
+        (other / "idp.key").write_text("ENC-RESTORED-KEY")
+        bk.create_encrypted_archive(other, daily / "idp-20260101-000000.tar.gz", key)
+
+    with mock.patch.object(backup_cli, "_mount_smb", side_effect=fake_mount), \
+         mock.patch.object(backup_cli, "_umount"):
+        rc = backup_cli.do_restore(str(data), archive)
+
+    assert rc == 0
+    assert (data / "idp.key").read_text() == "ENC-RESTORED-KEY"
+
+
 def test_test_connection_reports_archive_count(tmp_path):
     data = tmp_path / "data"
     data.mkdir()

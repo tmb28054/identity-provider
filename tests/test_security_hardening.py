@@ -29,6 +29,42 @@ from identity_provider_server.app import (
 DATA_DIR = Path(__file__).parent.parent / "data"
 
 
+# --- session tokens (absolute cap + revocation epoch) -----------------------
+
+@pytest.mark.smoke
+def test_session_token_roundtrip_smoke():
+    now = int(__import__("time").time())
+    tok = tokens.issue_session_token("s3cret", "alice", auth_time=now, epoch=2, now=now)
+    out = tokens.verify_session_token("s3cret", tok, 3600, 12 * 3600)
+    assert out == ("alice", now, 2)
+
+
+def test_session_token_absolute_cap_enforced():
+    """A still-fresh (idle-OK) token past the absolute cap is rejected."""
+    now = int(__import__("time").time())
+    # issued now (idle fine) but anchored 13h ago -> beyond the 12h cap.
+    tok = tokens.issue_session_token(
+        "s3cret", "alice", auth_time=now - 13 * 3600, epoch=0, now=now,
+    )
+    assert tokens.verify_session_token("s3cret", tok, 3600, 12 * 3600) is None
+
+
+def test_session_token_rejects_plain_subject():
+    """A token whose subject is not the 3-field session form is rejected."""
+    plain = tokens.issue_token("s3cret", "alice", tokens.PURPOSE_SESSION)
+    assert tokens.verify_session_token("s3cret", plain, 3600, 12 * 3600) is None
+
+
+def test_session_token_rejects_non_integer_fields():
+    bad = tokens.issue_token("s3cret", "alice|x|y", tokens.PURPOSE_SESSION)
+    assert tokens.verify_session_token("s3cret", bad, 3600, 12 * 3600) is None
+
+
+def test_session_token_rejects_expired_idle():
+    tok = tokens.issue_session_token("s3cret", "alice", auth_time=0, epoch=0, now=0)
+    assert tokens.verify_session_token("s3cret", tok, 1, 12 * 3600) is None
+
+
 # --- tokens.py --------------------------------------------------------------
 
 def test_token_roundtrip_valid():

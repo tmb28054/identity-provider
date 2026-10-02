@@ -36,8 +36,13 @@ def main() -> None:
     parser.add_argument(
         "--workers",
         type=int,
-        default=2,
-        help="Number of gunicorn worker processes (default: 2)",
+        default=1,
+        help=(
+            "Number of gunicorn worker processes (default: 1). The rate limiter "
+            "and single-use MFA/captcha/WebAuthn nonce stores are per-process; "
+            "running more than one worker requires a shared store, or those "
+            "controls weaken proportionally to the worker count."
+        ),
     )
     parser.add_argument(
         "--provider-name",

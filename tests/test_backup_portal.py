@@ -41,9 +41,13 @@ def _make_app(tmp: Path):
 
 def _admin_session_cookie(app) -> str:
     """Mint a valid idp_session cookie for the admin user (new token scheme)."""
-    from identity_provider_server.tokens import PURPOSE_SESSION, issue_token
+    import time as _time
 
-    return issue_token(app.secret_key, "admin", PURPOSE_SESSION)
+    from identity_provider_server.tokens import issue_session_token
+
+    return issue_session_token(
+        app.secret_key, "admin", auth_time=int(_time.time()), epoch=0,
+    )
 
 
 def _client_with_session(app):

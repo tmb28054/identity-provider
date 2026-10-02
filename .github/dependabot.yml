@@ -1,0 +1,20 @@
+version: 2
+# Continuous dependency-risk monitoring (supply-chain integrity). Dependabot
+# opens PRs for vulnerable or outdated dependencies so risk is surfaced on an
+# ongoing basis rather than only at adoption time.
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

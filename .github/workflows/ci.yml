@@ -9,6 +9,10 @@ on:
   pull_request:
     branches: [main]
 
+# Least-privilege default token scope for every job in this workflow.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -30,7 +34,7 @@ jobs:
 
       - name: Mypy (strict)
         run: mypy identity_provider_server
-        continue-on-error: true  # advisory until existing annotations are complete
+        continue-on-error: true  # advisory until annotations are complete
 
       - name: Bandit (package + scripts, medium+)
         run: |
@@ -38,11 +42,22 @@ jobs:
           bandit -r scripts -q --severity-level medium
 
       - name: Dependency vulnerability audit
-        run: pip-audit -c constraints.txt || true
+        run: pip-audit -c constraints.txt
 
       - name: Secret scan (gitleaks)
         uses: gitleaks/gitleaks-action@v2
-        continue-on-error: true
+
+      - name: Gitignored paths must not be tracked
+        run: |
+          # Fail if a .gitignore-listed path is actually tracked by git —
+          # catches posture artifacts (e.g. scripts/deploy.py) committed
+          # before the ignore rule, where the rule is a silent no-op.
+          tracked="$(git ls-files -ci --exclude-standard)"
+          if [ -n "$tracked" ]; then
+            echo "::error::Tracked files match .gitignore; untrack them:"
+            echo "$tracked"
+            exit 1
+          fi
 
       - name: Unit tests
         run: pytest -m "not integration" --ignore=tests/integration -q

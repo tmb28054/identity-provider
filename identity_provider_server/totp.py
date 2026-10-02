@@ -17,10 +17,12 @@ def generate_secret() -> str:
 def verify_code(secret: str, code: str) -> bool:
     """Verify a TOTP code against a secret.
 
-    Allows a 2-step window (60 seconds before/after) to account for clock drift.
+    Allows a 1-step window (30 seconds before/after) to account for clock
+    drift. A wider window needlessly enlarges the set of simultaneously-valid
+    codes, so it is kept to the minimum that still tolerates realistic drift.
     """
     totp = pyotp.TOTP(secret)
-    return totp.verify(code, valid_window=2)
+    return totp.verify(code, valid_window=1)
 
 
 def provisioning_uri(secret: str, username: str, issuer: str = "IdP") -> str:

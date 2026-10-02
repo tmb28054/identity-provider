@@ -60,8 +60,11 @@ def _mount_smb(config: bk.BackupConfig, mount_dir: Path) -> None:
 
         # Use the bare "rw" flag — mount.cifs does NOT understand "ro=false"
         # (it parses the "ro" token and mounts read-only, ignoring "=false").
+        # vers=3.1.1 pins a modern dialect and seal forces SMB3 encryption on
+        # the wire, so the archive (which contains the signing key) is never
+        # negotiated down to an unencrypted transport.
         options = (
-            f"credentials={cred_file.name},rw,"
+            f"credentials={cred_file.name},rw,vers=3.1.1,seal,"
             "uid=0,gid=0,file_mode=0600,dir_mode=0700"
         )
         cmd = [
@@ -176,7 +179,9 @@ def do_restore(data_dir: str, archive: str) -> int:
         return 2
 
     # Guard the archive name against path traversal before touching the share.
-    if "/" in archive or ".." in archive or not archive.endswith(".tar.gz"):
+    # Accept encrypted archives (.tar.gz.enc) and legacy plaintext (.tar.gz).
+    valid_suffix = archive.endswith(".tar.gz") or archive.endswith(".tar.gz.enc")
+    if "/" in archive or ".." in archive or not valid_suffix:
         logger.error("Invalid archive name: %s", archive)
         return 2
 
@@ -202,9 +207,14 @@ def do_restore(data_dir: str, archive: str) -> int:
             snap = bk.snapshot_current(data_dir, snap_dir)
             logger.info("Pre-restore snapshot written: %s", snap)
 
-            bk.restore_archive(src, data_dir)
+            if archive.endswith(bk.ENCRYPTED_SUFFIX):
+                key = bk.resolve_backup_key(data_dir)
+                bk.restore_encrypted_archive(src, data_dir, key)
+            else:
+                # Legacy plaintext archive (pre-encryption).
+                bk.restore_archive(src, data_dir)
             logger.info("Restore complete from %s", archive)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, bk.BackupKeyError) as exc:
             logger.error("Restore failed: %s", exc)
             return 1
         finally:

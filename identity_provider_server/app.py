@@ -22,10 +22,11 @@ from .saml_builder import ACS_URL, build_saml_response
 from .services import ServiceProvider, load_services
 from .tokens import (
     PURPOSE_MFA_PENDING,
-    PURPOSE_SESSION,
     PURPOSE_USER,
     NonceStore,
+    issue_session_token,
     issue_token,
+    verify_session_token,
     verify_token,
 )
 from .totp import generate_secret, provisioning_uri, qr_code_data_uri, verify_code
@@ -627,6 +628,16 @@ class _RateLimiter:
 
 MIN_PASSWORD_LENGTH = 12
 
+# Durable account lockout. The sliding-window rate limiter bounds burst guessing
+# but self-clears after its window; these settings add a persisted lockout so a
+# patient attacker cannot simply pace their attempts under the window.
+LOCKOUT_THRESHOLD = 10  # consecutive failures before the account is locked
+LOCKOUT_DURATION_SECONDS = 30 * 60  # 30-minute hold once locked
+
+# Password history: reject reuse of the last N bcrypt hashes (includes the
+# current one), closing the "alternate between two passwords" gap.
+PASSWORD_HISTORY_SIZE = 5
+
 
 def _now_iso() -> str:
     """Return the current UTC time as an ISO-8601 string (lifecycle stamps)."""
@@ -910,6 +921,25 @@ def create_app(
         max_attempts=rate_limit_max_attempts, window_seconds=rate_limit_window_seconds
     )
 
+    # The rate limiter and the single-use nonce / challenge stores below are
+    # per-process. Running multiple workers/replicas without a shared backend
+    # silently weakens them (the failed-login budget multiplies and a nonce can
+    # be replayed once per process). Warn loudly if the environment advertises
+    # more than one worker so an operator does not deploy an unsafe topology
+    # by accident. ``WEB_CONCURRENCY`` / ``GUNICORN_WORKERS`` are the usual hints.
+    for _worker_var in ("WEB_CONCURRENCY", "GUNICORN_WORKERS"):
+        try:
+            _worker_count = int(os.environ.get(_worker_var, "1"))
+        except ValueError:  # pragma: no cover - non-numeric env is ignored
+            continue
+        if _worker_count > 1:
+            logger.warning(
+                "%s=%d but the rate limiter and single-use nonce stores are "
+                "per-process; run a single worker or add a shared store, else "
+                "these anti-abuse controls weaken by a factor of the worker count.",
+                _worker_var, _worker_count,
+            )
+
     # Single-use nonce store backing the short-lived MFA "password proven"
     # ticket, so an observed ticket cannot be replayed within its window.
     MFA_TICKET_MAX_AGE = 120  # seconds
@@ -1025,7 +1055,7 @@ def create_app(
         edit — including out-of-band writes that keep the same size or mtime — is
         picked up on the next request, so the in-memory copy can never go stale.
         """
-        nonlocal users, users_digest
+        nonlocal users_digest
         if use_adfs or users_path is None:
             return
         current = _users_digest(users_path)
@@ -1034,10 +1064,16 @@ def create_app(
             return
         if current != users_digest:
             try:
-                users = _load_users(users_path)
+                fresh = _load_users(users_path)
             except (OSError, ValueError) as exc:
                 logger.warning("Could not reload users.json: %s", exc)
                 return
+            # Update the dict IN PLACE rather than rebinding it, so every holder
+            # of the reference (notably the admin blueprint, which captured it
+            # at registration) sees the change. Rebinding would leave the admin
+            # routes reading a stale copy, defeating the account-state gate.
+            users.clear()
+            users.update(fresh)
             users_digest = current
             logger.info("Reloaded users.json (content changed)")
 
@@ -1147,6 +1183,10 @@ def create_app(
                 return False, None
             return True, groups
         else:
+            # Reject empty/whitespace-only passwords outright so a blank field
+            # can never be read as a match (defence in depth alongside bcrypt).
+            if not password or not password.strip():
+                return False, None
             user = users.get(username)
             if not user or not _user_can_login(user):
                 return False, None
@@ -1157,10 +1197,19 @@ def create_app(
     def _handle_login_form(service_path: str):
         """Render the login form for a service path."""
         # Check for valid session cookie — skip login if remembered
-        session_user = _verify_session_cookie(request.cookies.get(SESSION_COOKIE_NAME, ""))
+        session = _verify_session_cookie_full(request.cookies.get(SESSION_COOKIE_NAME, ""))
+        session_user = session[0] if session else None
+        session_auth_time = session[1] if session else None
         if session_user and not use_adfs:
             user = users.get(session_user)
-            if user:
+            # Re-apply the account-state gate on this credential-issuing path:
+            # a live cookie must not outlive disablement or a forced-rotation
+            # flag. Falls through to the login form otherwise.
+            if (
+                user
+                and _user_can_login(user)
+                and not _needs_password_change(session_user)
+            ):
                 sp = _get_service(service_path)
                 protocol = sp.protocol if sp else "saml"
                 audit.log(
@@ -1182,8 +1231,8 @@ def create_app(
                     )
                     separator = "&" if "?" in sp.url else "?"
                     resp = app.make_response(redirect(f"{sp.url}{separator}token={token}"))
-                    # Slide the idle window on each authenticated use.
-                    _set_session_cookie(resp, session_user)
+                    # Slide the idle window but keep the absolute-cap anchor.
+                    _set_session_cookie(resp, session_user, auth_time=session_auth_time)
                     return resp
                 else:
                     sp_acs_url = sp.url if sp else ACS_URL
@@ -1198,7 +1247,7 @@ def create_app(
                     resp = app.make_response(
                         render_template_string(SAML_POST, acs=sp_acs_url, saml=saml_b64)
                     )
-                    _set_session_cookie(resp, session_user)
+                    _set_session_cookie(resp, session_user, auth_time=session_auth_time)
                     return resp
 
         sp = _get_service(service_path)
@@ -1297,8 +1346,30 @@ def create_app(
                     service_title=title,
                 ), 401
 
+            # Burn the ticket nonce BEFORE verifying the code so each ticket
+            # permits exactly one guess. A wrong code therefore costs the
+            # attacker a fresh password-proof round-trip, and the 120-second
+            # ticket can no longer be replayed for unlimited attempts.
+            if not _consume_mfa_nonce(auth_username, ticket_nonce):
+                question, new_hash = _make_challenge()
+                return render_template_string(
+                    LOGIN_FORM,
+                    error="Your session expired. Please sign in again.",
+                    csrf_token=_generate_csrf_token(),
+                    challenge_question=question,
+                    challenge_hash=new_hash,
+                    service_title=title,
+                ), 401
+
             if not verify_code(user["totp_secret"], totp_code):
+                # Record the buckets the limiter actually CHECKS (per-IP at
+                # app start of this handler, and per-account), not only the
+                # composite key — a failed second factor must count toward
+                # throttling and lockout.
+                rate_limiter.record(client_ip)
+                rate_limiter.record(f"acct:{auth_username}")
                 rate_limiter.record(_rl_key(client_ip, auth_username))
+                _register_auth_failure(auth_username)
                 audit.log(
                     username=auth_username,
                     ip=client_ip,
@@ -1322,17 +1393,9 @@ def create_app(
                 )
                 return resp, 401
 
-            # TOTP verified — burn the single-use ticket, then issue credentials.
-            if not _consume_mfa_nonce(auth_username, ticket_nonce):
-                question, new_hash = _make_challenge()
-                return render_template_string(
-                    LOGIN_FORM,
-                    error="Your session expired. Please sign in again.",
-                    csrf_token=_generate_csrf_token(),
-                    challenge_question=question,
-                    challenge_hash=new_hash,
-                    service_title=title,
-                ), 401
+            # TOTP verified — the single-use ticket was already burned above,
+            # so a correct code here issues credentials exactly once.
+            _reset_auth_failures(auth_username)
             username = auth_username
             if use_adfs:  # pragma: no cover - ADFS accounts never carry a local totp_secret, so this MFA-ticket branch is unreachable in ADFS mode
                 from .adfs import groups_to_roles
@@ -1402,8 +1465,33 @@ def create_app(
         username = request.form.get("username", "")
         password = request.form.get("password", "")
 
+        # Durable per-account lockout (survives the sliding window and restarts).
+        if _account_locked(username):
+            audit.log(
+                username=username,
+                ip=client_ip,
+                service=service_path,
+                protocol=sp.protocol if sp else "saml",
+                result="failure",
+                reason="account_locked",
+                user_agent=request.headers.get("User-Agent", ""),
+            )
+            question, new_hash = _make_challenge()
+            return render_template_string(
+                LOGIN_FORM,
+                error="Account temporarily locked. Try again later.",
+                csrf_token=_generate_csrf_token(),
+                challenge_question=question,
+                challenge_hash=new_hash,
+                service_title=title,
+            ), 429
+
         # Per-account lockout check (bounds spraying one account from many IPs).
         if username and rate_limiter.is_limited(f"acct:{username}"):
+            # A throttled attempt is still a failed attempt against the account;
+            # count it toward the durable lockout so a spray paced to stay under
+            # the sliding window still eventually locks the account.
+            _register_auth_failure(username)
             audit.log(
                 username=username,
                 ip=client_ip,
@@ -1423,12 +1511,39 @@ def create_app(
                 service_title=title,
             ), 429
 
+        # Human verification BEFORE the credential check, applied uniformly to
+        # every account (previously it ran after the password check and was
+        # skipped for TOTP accounts, an inconsistency the review flagged).
+        if not _check_challenge(challenge_answer, challenge_hash_val):
+            rate_limiter.record(_rl_key(client_ip, username))
+            rate_limiter.record(client_ip)
+            logger.info("Failed challenge from ip=%s", client_ip)
+            audit.log(
+                username=username,
+                ip=client_ip,
+                service=service_path,
+                protocol=sp.protocol if sp else "saml",
+                result="failure",
+                reason="failed_captcha",
+                user_agent=request.headers.get("User-Agent", ""),
+            )
+            question, new_hash = _make_challenge()
+            return render_template_string(
+                LOGIN_FORM,
+                error="Incorrect answer — please try again.",
+                csrf_token=_generate_csrf_token(),
+                challenge_question=question,
+                challenge_hash=new_hash,
+                service_title=title,
+            ), 401
+
         success, auth_result = _authenticate_user(username, password)
         if not success:
             rate_limiter.record(_rl_key(client_ip, username))
             rate_limiter.record(client_ip)  # also throttle at the IP level
             if username:
                 rate_limiter.record(f"acct:{username}")  # per-account lockout
+                _register_auth_failure(username)  # durable lockout counter
             logger.info("Failed login for user=%s from ip=%s", username, client_ip)
             audit.log(
                 username=username,
@@ -1448,36 +1563,6 @@ def create_app(
                 challenge_hash=new_hash,
                 service_title=title,
             ), 401
-
-        # If user has MFA, skip captcha (TOTP proves they're human).
-        # If no MFA, enforce the captcha.
-        user_has_mfa = False
-        if not use_adfs:
-            user = users.get(username)
-            user_has_mfa = bool(user and user.get("totp_secret"))
-
-        if not user_has_mfa:  # noqa: SIM102 - kept nested for auth-flow clarity
-            if not _check_challenge(challenge_answer, challenge_hash_val):
-                rate_limiter.record(_rl_key(client_ip, username))
-                logger.info("Failed challenge from ip=%s", client_ip)
-                audit.log(
-                    username=username,
-                    ip=client_ip,
-                    service=service_path,
-                    protocol=sp.protocol if sp else "saml",
-                    result="failure",
-                    reason="failed_captcha",
-                    user_agent=request.headers.get("User-Agent", ""),
-                )
-                question, new_hash = _make_challenge()
-                return render_template_string(
-                    LOGIN_FORM,
-                    error="Incorrect answer — please try again.",
-                    csrf_token=_generate_csrf_token(),
-                    challenge_question=question,
-                    challenge_hash=new_hash,
-                    service_title=title,
-                ), 401
 
         # Resolve roles for ADFS mode
         if use_adfs:
@@ -1510,6 +1595,9 @@ def create_app(
                 )
                 return resp
 
+        # Fully authenticated (password + captcha, no MFA enrolled, or ADFS) —
+        # clear any durable lockout counters.
+        _reset_auth_failures(username)
         logger.info(
             "Successful login: user=%s service=%s from ip=%s",
             username, service_path, client_ip,
@@ -1628,29 +1716,77 @@ def create_app(
         return True
 
     SESSION_COOKIE_NAME = "idp_session"
-    SESSION_MAX_AGE = 12 * 3600  # 12 hours (absolute cap)
-    SESSION_IDLE_MAX_AGE = 30 * 60  # 30 minutes of inactivity
+    SESSION_MAX_AGE = 12 * 3600  # 12 hours (absolute cap, enforced server-side)
+    SESSION_IDLE_MAX_AGE = 15 * 60  # 15 minutes of inactivity
 
-    def _issue_session_cookie(username: str) -> str:
-        """Issue a signed, purpose-scoped session cookie value."""
-        return issue_token(app.secret_key, username, PURPOSE_SESSION)
+    def _user_session_epoch(username: str) -> int:
+        """Return the account's current session-revocation epoch.
 
-    def _verify_session_cookie(cookie_val: str) -> str | None:
-        """Verify a session cookie against both the idle and absolute limits.
-
-        The signed timestamp is treated as the last-activity marker (the cookie
-        is re-issued on each authenticated request), so exceeding the idle
-        window invalidates the session even within the absolute cap.
+        The epoch is bumped whenever outstanding sessions must be invalidated
+        (account disabled, password reset, claims changed). A cookie minted with
+        a stale epoch no longer verifies, giving server-side revocation on top
+        of the stateless token.
         """
-        return verify_token(
-            app.secret_key, cookie_val, PURPOSE_SESSION, SESSION_IDLE_MAX_AGE
+        user = users.get(username) or {}
+        try:
+            return int(user.get("session_epoch", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _issue_session_cookie(username: str, *, auth_time: int | None = None) -> str:
+        """Issue a signed session cookie value binding auth_time and epoch.
+
+        Args:
+            username: The authenticated subject.
+            auth_time: The absolute-cap anchor. ``None`` starts a fresh session
+                (anchored at now); re-mints pass the original value to keep the
+                absolute window fixed while the idle window slides.
+        """
+        now = int(time.time())
+        return issue_session_token(
+            app.secret_key,
+            username,
+            auth_time=now if auth_time is None else auth_time,
+            epoch=_user_session_epoch(username),
         )
 
-    def _set_session_cookie(resp, username: str):
-        """Set the session cookie on a response (Secure in non-debug mode)."""
+    def _verify_session_cookie_full(cookie_val: str) -> tuple[str, int] | None:
+        """Verify a session cookie against idle, absolute, and revocation limits.
+
+        Returns ``(username, auth_time)`` so the caller can preserve the
+        absolute-cap anchor when re-minting, or ``None`` if the cookie is
+        expired (idle or absolute), tampered, or revoked by an epoch bump.
+        """
+        result = verify_session_token(
+            app.secret_key, cookie_val, SESSION_IDLE_MAX_AGE, SESSION_MAX_AGE
+        )
+        if result is None:
+            return None
+        username, auth_time, epoch = result
+        if epoch != _user_session_epoch(username):
+            logger.info("Rejected session cookie with stale epoch for user=%s", username)
+            return None
+        return username, auth_time
+
+    def _verify_session_cookie(cookie_val: str) -> str | None:
+        """Verify a session cookie and return the username, or ``None``.
+
+        Enforces the idle window, the server-side absolute lifetime, and the
+        per-user revocation epoch. The account-state gate (disabled /
+        must-set-password) is applied by callers that issue credentials.
+        """
+        result = _verify_session_cookie_full(cookie_val)
+        return result[0] if result else None
+
+    def _set_session_cookie(resp, username: str, *, auth_time: int | None = None):
+        """Set the session cookie on a response (Secure in non-debug mode).
+
+        ``auth_time`` is passed through on re-mint so sliding the idle window
+        does not reset the absolute lifetime cap.
+        """
         resp.set_cookie(
             SESSION_COOKIE_NAME,
-            _issue_session_cookie(username),
+            _issue_session_cookie(username, auth_time=auth_time),
             max_age=SESSION_MAX_AGE,
             httponly=True,
             samesite="Strict",
@@ -1706,6 +1842,21 @@ def create_app(
         # Handle TOTP verification for /user access (from TOTP_FORM)
         totp_step = request.form.get("totp_step", "")
         if totp_step == "1" and request.form.get("service_path") == "user":
+            # Throttle the second-factor step too, so repeated wrong codes
+            # trip the per-IP limiter they now feed. (In practice the password
+            # step's own per-IP check usually trips first; this is the belt to
+            # that braces.)
+            if rate_limiter.is_limited(client_ip):  # pragma: no cover - shadowed by the password-step limiter on the same IP
+                token = _generate_csrf_token()
+                resp = app.make_response(render_template_string(
+                    USER_PAGE_LOGIN, error="Too many attempts. Try again later.",
+                    csrf_token=token,
+                ))
+                resp.set_cookie(
+                    "csrf_token", token, httponly=True,
+                    samesite="Strict", secure=_cookies_secure,
+                )
+                return resp, 429
             totp_code = request.form.get("totp_code", "")
             # Username is derived from the signed single-use ticket, never the form.
             ticket_info = _read_mfa_ticket(request.form.get("mfa_ticket", ""))
@@ -1734,8 +1885,27 @@ def create_app(
                 )
                 return resp, 401
 
+            # Burn the ticket before verifying so each ticket is one guess.
+            if not _consume_mfa_nonce(username, ticket_nonce):
+                token = _generate_csrf_token()
+                resp = app.make_response(render_template_string(
+                    USER_PAGE_LOGIN, error="Your session expired. Please sign in again.",
+                    csrf_token=token,
+                ))
+                resp.set_cookie(
+                    "csrf_token", token, httponly=True,
+                    samesite="Strict", secure=_cookies_secure,
+                )
+                return resp, 401
+
             if not verify_code(user["totp_secret"], totp_code):
+                # Record the checked buckets (per-IP + per-account) and count
+                # the failure toward lockout — this branch previously fed only
+                # the never-read composite key.
+                rate_limiter.record(client_ip)
+                rate_limiter.record(f"acct:{username}")
                 rate_limiter.record(_rl_key(client_ip, username))
+                _register_auth_failure(username)
                 token = _generate_csrf_token()
                 resp = app.make_response(render_template_string(
                     TOTP_FORM,
@@ -1750,18 +1920,7 @@ def create_app(
                 )
                 return resp, 401
 
-            if not _consume_mfa_nonce(username, ticket_nonce):
-                token = _generate_csrf_token()
-                resp = app.make_response(render_template_string(
-                    USER_PAGE_LOGIN, error="Your session expired. Please sign in again.",
-                    csrf_token=token,
-                ))
-                resp.set_cookie(
-                    "csrf_token", token, httponly=True,
-                    samesite="Strict", secure=_cookies_secure,
-                )
-                return resp, 401
-
+            _reset_auth_failures(username)
             # TOTP verified — show settings page
             auth_token = _issue_auth_token(username)
             token = _generate_csrf_token()
@@ -1903,6 +2062,15 @@ def create_app(
                 user["totp_secret"] = totp_secret
                 _save_users_and_update_mtime(users_path, users)
                 logger.info("MFA enrolled for user=%s", username)
+                audit.log(
+                    username=username,
+                    ip=request.remote_addr or "unknown",
+                    service="user",
+                    protocol="user_settings",
+                    result="success",
+                    reason="totp_enrolled",
+                    user_agent=request.headers.get("User-Agent", ""),
+                )
 
             token = _generate_csrf_token()
             resp = app.make_response(render_template_string(
@@ -1934,6 +2102,15 @@ def create_app(
             if user and users_path:
                 user.pop("totp_secret", None)
                 _save_users_and_update_mtime(users_path, users)
+                audit.log(
+                    username=username,
+                    ip=request.remote_addr or "unknown",
+                    service="user",
+                    protocol="user_settings",
+                    result="success",
+                    reason="totp_removed",
+                    user_agent=request.headers.get("User-Agent", ""),
+                )
                 logger.info("MFA disabled for user=%s", username)
 
             token = _generate_csrf_token()
@@ -1983,8 +2160,11 @@ def create_app(
                 error = policy_error
             elif new_password != confirm_password:
                 error = "Passwords do not match."
-            elif _check_password(user.get("password", ""), new_password):
-                error = "New password must differ from the current password."
+            elif _password_reused(user, new_password):
+                error = (
+                    f"New password must differ from the last "
+                    f"{PASSWORD_HISTORY_SIZE} passwords."
+                )
 
             if error:
                 token = _generate_csrf_token()
@@ -2002,14 +2182,25 @@ def create_app(
                 return resp, 400
 
             import bcrypt as _bcrypt
+            _record_password_history(user)
             user["password"] = _bcrypt.hashpw(
                 new_password.encode(), _bcrypt.gensalt()
             ).decode()
             user.pop("force_password_change", None)
             user.pop("must_set_password", None)
+            _bump_session_epoch_local(username)
             if users_path:
                 _save_users_and_update_mtime(users_path, users)
             logger.info("Forced password rotation completed for user=%s", username)
+            audit.log(
+                username=username,
+                ip=request.remote_addr or "unknown",
+                service="user",
+                protocol="user_settings",
+                result="success",
+                reason="password_changed",
+                user_agent=request.headers.get("User-Agent", ""),
+            )
 
             token = _generate_csrf_token()
             resp = app.make_response(render_template_string(
@@ -2160,6 +2351,11 @@ def create_app(
                 password_error = policy_error
             elif new_password != confirm_password:
                 password_error = "Passwords do not match."
+            elif _password_reused(user, new_password):
+                password_error = (
+                    f"New password must differ from the last "
+                    f"{PASSWORD_HISTORY_SIZE} passwords."
+                )
 
             if password_error:
                 token = _generate_csrf_token()
@@ -2183,9 +2379,20 @@ def create_app(
             import bcrypt as _bcrypt
             hashed = _bcrypt.hashpw(new_password.encode(), _bcrypt.gensalt()).decode()
             if user and users_path:
+                _record_password_history(user)
                 user["password"] = hashed
+                _bump_session_epoch_local(username)
                 _save_users_and_update_mtime(users_path, users)
                 logger.info("Password changed for user=%s", username)
+                audit.log(
+                    username=username,
+                    ip=request.remote_addr or "unknown",
+                    service="user",
+                    protocol="user_settings",
+                    result="success",
+                    reason="password_changed",
+                    user_agent=request.headers.get("User-Agent", ""),
+                )
 
             token = _generate_csrf_token()
             resp = app.make_response(render_template_string(
@@ -2372,16 +2579,25 @@ def create_app(
             return _passkey_error("Too many attempts. Try again later.", 429)
         username = payload.get("username", "")
         user = users.get(username)
-        # Disabled / must-set-password accounts cannot use a passkey either.
-        # Always mint options against the user's real credentials; an unknown
-        # or ineligible user yields the same generic error so existence and
-        # account state aren't leaked by the response shape.
+        # Return a syntactically valid 200 with options in EVERY case so the
+        # response shape does not reveal whether the account exists, is enabled,
+        # or has a passkey (the enumeration oracle the review flagged). Unknown
+        # or ineligible accounts get decoy options over a deterministic dummy
+        # credential; their finish step still fails, so no login is possible.
         credentials = (
             wf.get_credentials(user) if user and _user_can_login(user) else []
         )
-        if not credentials:
-            return _passkey_error("No passkey registered for this account.", 400)
-        options_json, challenge = wf.begin_authentication(_webauthn_rp, credentials)
+        if credentials:
+            options_json, challenge = wf.begin_authentication(_webauthn_rp, credentials)
+        else:
+            # Count the probe toward throttling (begin previously recorded
+            # nothing, so the is_limited check above could never trip).
+            rate_limiter.record(client_ip)
+            if username:
+                rate_limiter.record(_rl_key(client_ip, username))
+            options_json, challenge = wf.begin_authentication_decoy(
+                _webauthn_rp, username or client_ip
+            )
         handle = _passkey_challenges.put(
             challenge=challenge, username=username, purpose="authenticate"
         )
@@ -2684,17 +2900,35 @@ def create_app(
                 return _rerender("Invalid MFA code. Try again.")
             mfa_enrolled = True
 
+        # Reject reuse of a recent password on the recovery path too.
+        user = users.get(username)
+        if user and _password_reused(user, new_password):
+            return _rerender(
+                f"New password must differ from the last "
+                f"{PASSWORD_HISTORY_SIZE} passwords."
+            )
+
         # Apply changes
         import bcrypt as _bcrypt
-        user = users.get(username)
         if user:
+            _record_password_history(user)
             user["password"] = _bcrypt.hashpw(new_password.encode(), _bcrypt.gensalt()).decode()
             user.pop("must_set_password", None)
             if mfa_enrolled:
                 user["totp_secret"] = enroll_secret
+            _bump_session_epoch_local(username)
             if users_path:
                 _save_users_and_update_mtime(users_path, users)
             logger.info("Recovery completed for user=%s (MFA=%s)", username, mfa_enrolled)
+            audit.log(
+                username=username,
+                ip=request.remote_addr or "unknown",
+                service="user",
+                protocol="recovery",
+                result="success",
+                reason="password_reset",
+                user_agent=request.headers.get("User-Agent", ""),
+            )
 
         # Consume the token (single-use)
         consume_recovery_token(recovery_token)
@@ -2725,6 +2959,98 @@ def create_app(
             _save_users_and_update_mtime(users_path, users)
         except OSError:
             logger.warning("Could not persist last_login for user=%s", username)
+
+    def _account_locked(username: str) -> bool:
+        """True if the account is currently within a durable lockout hold."""
+        if use_adfs or not username:
+            return False
+        user = users.get(username)
+        if not user:
+            return False
+        try:
+            locked_until = float(user.get("locked_until", 0))
+        except (TypeError, ValueError):
+            return False
+        return locked_until > time.time()
+
+    def _register_auth_failure(username: str) -> None:
+        """Count a failed authentication and lock the account past the threshold.
+
+        Persists ``failed_count`` and, once it reaches ``LOCKOUT_THRESHOLD``, a
+        ``locked_until`` timestamp. Unlike the in-memory sliding window this
+        survives process restarts and does not self-clear while the attacker
+        paces their guesses.
+        """
+        if use_adfs or users_path is None or not username:
+            return
+        user = users.get(username)
+        if not user:
+            return
+        try:
+            count = int(user.get("failed_count", 0)) + 1
+        except (TypeError, ValueError):
+            count = 1
+        user["failed_count"] = count
+        if count >= LOCKOUT_THRESHOLD:
+            user["locked_until"] = time.time() + LOCKOUT_DURATION_SECONDS
+            logger.warning("Account locked after %d failures: user=%s", count, username)
+        try:
+            _save_users_and_update_mtime(users_path, users)
+        except OSError:  # pragma: no cover - defensive
+            logger.warning("Could not persist lockout state for user=%s", username)
+
+    def _reset_auth_failures(username: str) -> None:
+        """Clear lockout counters after a fully successful authentication."""
+        if use_adfs or users_path is None or not username:
+            return
+        user = users.get(username)
+        if not user or not (user.get("failed_count") or user.get("locked_until")):
+            return
+        user.pop("failed_count", None)
+        user.pop("locked_until", None)
+        try:
+            _save_users_and_update_mtime(users_path, users)
+        except OSError:  # pragma: no cover - defensive
+            logger.warning("Could not clear lockout state for user=%s", username)
+
+    def _bump_session_epoch_local(username: str) -> None:
+        """Invalidate the account's outstanding session cookies (self-service).
+
+        Mirrors the admin-side bump: a password change must revoke sessions
+        established under the old credential.
+        """
+        user = users.get(username)
+        if not user:  # pragma: no cover - callers always pass an existing user
+            return
+        try:
+            current = int(user.get("session_epoch", 0))
+        except (TypeError, ValueError):
+            current = 0
+        user["session_epoch"] = current + 1
+
+    def _password_reused(user: dict[str, Any], new_password: str) -> bool:
+        """True if ``new_password`` matches the current or a recent hash."""
+        if _check_password(user.get("password", ""), new_password):
+            return True
+        for old_hash in user.get("password_history", []):
+            if _check_password(old_hash, new_password):
+                return True
+        return False
+
+    def _record_password_history(user: dict[str, Any]) -> None:
+        """Push the current password hash onto the bounded history list.
+
+        Call AFTER setting ``user['password']`` to the new hash is wrong; call
+        with the OLD hash still in place. The caller passes the user dict before
+        the new hash is assigned, so the retiring hash is captured here.
+        """
+        current = user.get("password", "")
+        if not current:  # pragma: no cover - change paths always have a current password
+            return
+        history = list(user.get("password_history", []))
+        history.insert(0, current)
+        # Keep the last N-1 retired hashes; the live hash is the Nth slot.
+        user["password_history"] = history[: PASSWORD_HISTORY_SIZE - 1]
 
     def _needs_password_change(username: str) -> bool:
         """True if the account must change its password before proceeding.

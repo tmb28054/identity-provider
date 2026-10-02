@@ -297,11 +297,23 @@ def finish_registration(
 
 
 def begin_authentication(
-    rp: RelyingParty, credentials: list[dict[str, Any]]
+    rp: RelyingParty,
+    credentials: list[dict[str, Any]],
+    *,
+    require_uv: bool = False,
 ) -> tuple[str, bytes]:
     """Build authentication options JSON for ``navigator.credentials.get()``.
 
-    Returns ``(options_json, challenge_bytes)``.
+    Args:
+        rp: The relying-party configuration.
+        credentials: The candidate stored credentials.
+        require_uv: When True, request ``user_verification=REQUIRED`` so the
+            assertion carries a verified PIN/biometric and the passkey counts as
+            two factors. Used for the admin flow; the SP flow leaves it False
+            (``PREFERRED``).
+
+    Returns:
+        ``(options_json, challenge_bytes)``.
     """
     allow = [
         PublicKeyCredentialDescriptor(
@@ -314,9 +326,33 @@ def begin_authentication(
     options = generate_authentication_options(
         rp_id=rp.rp_id,
         allow_credentials=allow or None,
-        user_verification=UserVerificationRequirement.PREFERRED,
+        user_verification=(
+            UserVerificationRequirement.REQUIRED
+            if require_uv
+            else UserVerificationRequirement.PREFERRED
+        ),
     )
     return options_to_json(options), options.challenge
+
+
+def begin_authentication_decoy(
+    rp: RelyingParty, seed: str, *, require_uv: bool = False
+) -> tuple[str, bytes]:
+    """Build options over a deterministic *decoy* credential.
+
+    Returned for unknown or ineligible accounts so the begin response is a
+    valid HTTP 200 with options in every case, removing the 200-vs-400 oracle
+    that leaked account existence / admin membership. The decoy credential id
+    is derived deterministically from ``seed`` (username) so a repeated probe
+    of the same name yields a stable id, matching the shape of a real response.
+    The subsequent finish step still fails for these accounts, so no login is
+    possible — only the enumeration signal is removed.
+    """
+    import hashlib
+
+    digest = hashlib.sha256(f"decoy:{rp.rp_id}:{seed}".encode()).digest()
+    decoy = [{"credential_id": bytes_to_base64url(digest), "transports": None}]
+    return begin_authentication(rp, decoy, require_uv=require_uv)
 
 
 def finish_authentication(
@@ -324,8 +360,19 @@ def finish_authentication(
     credential_json: str,
     expected_challenge: bytes,
     stored_credential: dict[str, Any],
+    *,
+    require_uv: bool = False,
 ) -> int:
     """Verify an authentication assertion; return the new sign count.
+
+    Args:
+        rp: The relying-party configuration.
+        credential_json: The client assertion JSON.
+        expected_challenge: The challenge issued at begin.
+        stored_credential: The stored credential record.
+        require_uv: When True, reject assertions whose user-verification flag is
+            not set, so the passkey counts as a verified second factor. The
+            admin flow passes True; the SP flow leaves it False.
 
     Raises:
         WebAuthnError: If verification fails.
@@ -338,7 +385,7 @@ def finish_authentication(
             expected_origin=rp.expected_origin,
             credential_public_key=base64url_to_bytes(stored_credential["public_key"]),
             credential_current_sign_count=int(stored_credential.get("sign_count", 0)),
-            require_user_verification=False,
+            require_user_verification=require_uv,
         )
     except Exception as exc:  # noqa: BLE001 - library raises many types; treat all as failure
         raise WebAuthnError(f"Passkey authentication failed: {exc}") from exc

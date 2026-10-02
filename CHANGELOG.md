@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `docs/security-review-20261001-response.md`: validation and remediation plan
+  for the AWS Security Agent code review (idp-20261001). All 12 findings were
+  re-checked against the current source and confirmed real.
+- `docs/incident-response.md`: stakeholder notification plan, per-relying-party
+  contacts, and outbound-channel configuration (finding F12).
+- Durable per-account lockout: after repeated failures an account is locked for
+  30 minutes via a persisted `locked_until`, surviving the in-memory sliding
+  window and process restarts (F1/F4).
+- Password history: the last 5 password hashes are retained and reuse is
+  rejected on every change path (self-service, forced rotation, recovery, admin
+  reset) (F4).
+- Server-side absolute session lifetime and revocation: session cookies now
+  carry a signed `auth_time` (12-hour hard cap, enforced server-side) and a
+  per-user `session_epoch`; disabling an account, resetting its password, or
+  changing its claims bumps the epoch and immediately invalidates outstanding
+  cookies (F3/F5).
+- Encrypted, authenticated backups: archives are Fernet-encrypted with a key
+  held outside the data directory and written with a detached SHA-256; restore
+  verifies both before extraction. SMB mounts now require `vers=3.1.1,seal`
+  (F7).
+- `identity_provider_server/notify.py`: optional outbound webhook
+  (`IDP_NOTIFY_WEBHOOK`) for backup-failure and idpadmin-grant events (F12).
+- `ServiceProvider.owner_contact` and a shared `services.is_valid_sp_path`
+  grammar used by both the admin writer and the loader (F8/F12).
+- `.github/dependabot.yml` and a CI step that fails when a `.gitignore`-listed
+  path is tracked (F9/F11).
 - `verify-jwt` CLI (`identity_provider_server/verify_jwt.py`): decodes a JWT,
   prints its header and claims, and validates the RS256 signature against the
   IdP's RSA public key. The key is read from a local certificate/public-key PEM
@@ -17,6 +43,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mode (`--no-verify`), and machine-readable output (`--json`). Exits `0` for a
   valid signature, `2` for an invalid or expired token, and `1` for decode or
   fetch errors.
+
+### Changed
+- Admin login now requires a second factor for every `idpadmin` account; a
+  password alone is refused and the admin is directed to enroll (F4).
+- Admin passkey login now requires user verification (`require_uv`), so a
+  passkey counts as two factors (F4).
+- Passkey `begin` endpoints return indistinguishable options for unknown or
+  ineligible accounts (and record a throttle hit), removing the account- and
+  admin-enumeration oracle (F2).
+- The login captcha is now evaluated before the password check and applied to
+  every account, including those with TOTP (F8).
+- Default worker/replica count is 1 (`run_gunicorn.py`, k8s example); `create_app`
+  warns when `WEB_CONCURRENCY`/`GUNICORN_WORKERS` > 1 (F10).
+- Dockerfile installs against `constraints.txt` and pins the base image by
+  digest; CI dependency-audit and secret-scan steps are now blocking and the
+  workflow runs with least-privilege `permissions` (F9).
+- `users.json` hot-reload now updates the in-memory dict in place so the admin
+  blueprint never reads a stale copy after an out-of-band edit.
+
+### Security
+- TOTP second factor is no longer brute-forceable: failed codes now count
+  against the rate-limit buckets that are actually checked, the MFA ticket is
+  consumed before verification (one guess per ticket), and `valid_window` is
+  narrowed from 2 to 1 (F1).
+- Disabling an account now revokes its live SSO and admin sessions instead of
+  waiting out the idle window (F3).
+- LDAP/ADFS authentication rejects empty or whitespace-only passwords before
+  binding, closing the unauthenticated-simple-bind path (F4).
+- Admin SP-registry and backup-destination mutations, credential changes, and
+  audit-log reads are now written to the audit log (F6).
+- SP-registry and backup credentials (`backup_config.json`) are no longer
+  included in backup archives (F7).
+- `scripts/deploy.py` (production topology + sudoers policy) is untracked and
+  excluded from the deployment rsync (F11).
 
 ### Fixed
 - The "Enable password-less sign-in" button stayed disabled right after

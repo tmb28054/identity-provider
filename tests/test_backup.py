@@ -54,6 +54,121 @@ def test_backup_restore_round_trip(tmp_path):
     assert not (dest / "audit.log").exists()
 
 
+def test_backup_config_not_archived(tmp_path):
+    """backup_config.json (SMB creds) must never be swept into the archive."""
+    src = tmp_path / "data"
+    src.mkdir()
+    _seed_data_dir(src)
+    (src / "backup_config.json").write_text('{"password": "smbsecret"}')
+    archive = tmp_path / "b.tar.gz"
+    bk.create_archive(src, archive)
+    with tarfile.open(archive) as tar:
+        assert "backup_config.json" not in tar.getnames()
+
+
+@pytest.mark.smoke
+def test_encrypted_backup_round_trip(tmp_path):
+    """Encrypted archive + detached digest decrypts and restores correctly."""
+    from cryptography.fernet import Fernet
+
+    src = tmp_path / "data"
+    src.mkdir()
+    _seed_data_dir(src)
+    key = Fernet.generate_key()
+    base = tmp_path / "idp-20260101-000000.tar.gz"
+    size = bk.create_encrypted_archive(src, base, key)
+    enc = tmp_path / ("idp-20260101-000000.tar.gz" + bk.ENCRYPTED_SUFFIX)
+    assert size > 0
+    assert enc.is_file()
+    # The ciphertext must not contain the plaintext secret.
+    assert b"PRIVATE KEY" not in enc.read_bytes()
+    # Detached digest sidecar exists.
+    assert (tmp_path / (enc.name + bk.DIGEST_SUFFIX)).is_file()
+
+    dest = tmp_path / "restored"
+    dest.mkdir()
+    bk.restore_encrypted_archive(enc, dest, key)
+    assert (dest / "idp.key").read_text() == "PRIVATE KEY"
+
+
+def test_encrypted_restore_rejects_tamper(tmp_path):
+    """A tampered ciphertext fails the digest check and is refused."""
+    from cryptography.fernet import Fernet
+
+    src = tmp_path / "data"
+    src.mkdir()
+    _seed_data_dir(src)
+    key = Fernet.generate_key()
+    base = tmp_path / "idp-20260101-000000.tar.gz"
+    bk.create_encrypted_archive(src, base, key)
+    enc = tmp_path / ("idp-20260101-000000.tar.gz" + bk.ENCRYPTED_SUFFIX)
+    enc.write_bytes(enc.read_bytes() + b"tampered")  # digest will mismatch
+    dest = tmp_path / "restored"
+    dest.mkdir()
+    with pytest.raises(ValueError):
+        bk.restore_encrypted_archive(enc, dest, key)
+
+
+def test_encrypted_restore_rejects_wrong_key(tmp_path):
+    """A valid-digest archive still fails Fernet auth under the wrong key."""
+    from cryptography.fernet import Fernet
+
+    src = tmp_path / "data"
+    src.mkdir()
+    _seed_data_dir(src)
+    bk.create_encrypted_archive(src, tmp_path / "a.tar.gz", Fernet.generate_key())
+    enc = tmp_path / ("a.tar.gz" + bk.ENCRYPTED_SUFFIX)
+    dest = tmp_path / "restored"
+    dest.mkdir()
+    with pytest.raises(ValueError):
+        bk.restore_encrypted_archive(enc, dest, Fernet.generate_key())
+
+
+def test_resolve_backup_key_generates_and_reuses(tmp_path, monkeypatch):
+    """Key is generated outside the data dir on first use, then reused."""
+    monkeypatch.delenv(bk.BACKUP_KEY_ENV, raising=False)
+    data = tmp_path / "data"
+    data.mkdir()
+    k1 = bk.resolve_backup_key(data)
+    k2 = bk.resolve_backup_key(data)
+    assert k1 == k2
+    key_file = tmp_path / bk.BACKUP_KEY_FILENAME  # parent of data dir
+    assert key_file.is_file()
+    # The key file is NOT inside the backed-up data dir.
+    assert not (data / bk.BACKUP_KEY_FILENAME).exists()
+
+
+def test_resolve_backup_key_from_env(tmp_path, monkeypatch):
+    from cryptography.fernet import Fernet
+
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv(bk.BACKUP_KEY_ENV, key)
+    assert bk.resolve_backup_key(tmp_path / "data").decode() == key
+
+
+def test_resolve_backup_key_rejects_bad_env(tmp_path, monkeypatch):
+    monkeypatch.setenv(bk.BACKUP_KEY_ENV, "not-a-fernet-key")
+    with pytest.raises(bk.BackupKeyError):
+        bk.resolve_backup_key(tmp_path / "data")
+
+
+def test_prune_removes_digest_sidecars(tmp_path):
+    """Pruning an encrypted archive also deletes its detached .sha256 sidecar."""
+    d = tmp_path / "daily"
+    d.mkdir()
+    # Two encrypted archives with digest sidecars; keep only the newest.
+    for stamp in ("20260101-000000", "20260102-000000"):
+        name = f"idp-{stamp}.tar.gz{bk.ENCRYPTED_SUFFIX}"
+        (d / name).write_text("cipher")
+        (d / (name + bk.DIGEST_SUFFIX)).write_text("deadbeef")
+    deleted = bk.prune_archives(d, keep=1)
+    assert len(deleted) == 1
+    old = deleted[0]
+    # Both the archive and its digest sidecar are gone.
+    assert not (d / old).exists()
+    assert not (d / (old + bk.DIGEST_SUFFIX)).exists()
+
+
 def test_create_archive_excludes_audit_log(tmp_path):
     src = tmp_path / "data"
     src.mkdir()

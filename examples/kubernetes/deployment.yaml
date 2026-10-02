@@ -6,7 +6,11 @@ metadata:
   labels:
     app.kubernetes.io/name: identity-provider-server
 spec:
-  replicas: 2
+  # The rate limiter and single-use MFA/captcha/WebAuthn nonce stores are
+  # per-process (in-memory). Running more than one replica without a shared
+  # store multiplies the failed-login budget and lets a nonce be replayed once
+  # per replica. Keep this at 1 unless a shared backend is introduced.
+  replicas: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: identity-provider-server

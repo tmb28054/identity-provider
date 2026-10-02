@@ -19,9 +19,18 @@ import pytest
 
 from identity_provider_server import backup as bk
 from identity_provider_server.app import create_app
-from identity_provider_server.tokens import PURPOSE_SESSION, issue_token
+from identity_provider_server.tokens import issue_session_token
 
 DATA_SRC = Path(__file__).parent.parent / "data"
+
+
+def _session_cookie(secret: str, username: str) -> str:
+    """Mint a session cookie in the current (epoch + auth_time) scheme."""
+    import time as _time
+
+    return issue_session_token(
+        secret, username, auth_time=int(_time.time()), epoch=0,
+    )
 ADMIN_TOTP = pyotp.random_base32()
 
 
@@ -49,7 +58,7 @@ def _make_app(tmp_path, *, admin_mfa=False):
 
 def _client(app):
     c = app.test_client()
-    c.set_cookie("idp_session", issue_token("adminsecret", "admin", PURPOSE_SESSION),
+    c.set_cookie("idp_session", _session_cookie("adminsecret", "admin"),
                  domain="localhost")
     return c
 
@@ -150,6 +159,61 @@ def test_admin_login_invalid_mfa(tmp_path):
                        password="AdminPass123!", totp_code="000000")
     assert resp.status_code == 401
     assert b"Invalid MFA" in resp.data
+
+
+def test_admin_login_refused_without_mfa_enrolled(tmp_path):
+    """An idpadmin account with no TOTP cannot log in with a password alone
+    (security review F4: second factor mandatory for administrators)."""
+    app = _make_app(tmp_path, admin_mfa=False)
+    resp = _login_post(app.test_client(), username="admin", password="AdminPass123!")
+    assert resp.status_code == 403
+    assert b"second factor" in resp.data
+
+
+def test_disabled_admin_cookie_denied(tmp_path):
+    """A disabled admin with a live session cookie is denied the panel."""
+    app = _make_app(tmp_path)
+    # Disable the admin account.
+    users = json.loads((tmp_path / "users.json").read_text())
+    for u in users:
+        if u["username"] == "admin":
+            u["enabled"] = False
+    (tmp_path / "users.json").write_text(json.dumps(users))
+    client = _client(app)
+    assert b"Sign in" in client.get("/admin").data
+
+
+def test_unknown_cookie_user_denied(tmp_path):
+    """A session cookie for a user not in the DB is denied."""
+    app = _make_app(tmp_path)
+    client = app.test_client()
+    client.set_cookie("idp_session", _session_cookie("adminsecret", "ghost"),
+                      domain="localhost")
+    assert b"Sign in" in client.get("/admin").data
+
+
+def test_user_detail_invalid_username_redirects(tmp_path):
+    """A charset-invalid path segment is rejected before any lookup."""
+    app = _make_app(tmp_path)
+    client = _client(app)
+    # '%20' decodes to a space, which fails the username charset.
+    assert client.get("/admin/user/bad%20name").status_code in (301, 302)
+    assert client.post("/admin/user/bad%20name", data={}).status_code in (301, 302)
+
+
+def test_admin_reset_password_rejects_history_reuse(tmp_path):
+    """Admin reset_password refuses to reuse the target's current password."""
+    app = _make_app(tmp_path)
+    client = _client(app)
+    html = client.get("/admin").data.decode()
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', html).group(1)
+    auth = re.search(r'name="auth_token" value="([^"]+)"', html).group(1)
+    # bob's current password in the fixture is "AdminPass123!".
+    resp = client.post("/admin", data={
+        "csrf_token": csrf, "auth_token": auth, "action": "reset_password",
+        "target_user": "bob", "new_pw": "AdminPass123!",
+    })
+    assert b"differ from the last" in resp.data
 
 
 def test_admin_login_access_denied_non_admin(tmp_path):
@@ -492,7 +556,7 @@ def test_backups_restore_invalid_archive_with_mfa(tmp_path):
     app = _make_app(tmp_path, admin_mfa=True)
     client = app.test_client()
     client.set_cookie(
-        "idp_session", issue_token("adminsecret", "admin", PURPOSE_SESSION),
+        "idp_session", _session_cookie("adminsecret", "admin"),
         domain="localhost",
     )
     bk.write_archive_listing(tmp_path, ["idp-20260101-000000.tar.gz"])
@@ -881,7 +945,7 @@ def test_backups_restore_trigger_failure(tmp_path):
     app = _make_app(tmp_path, admin_mfa=True)
     client = app.test_client()
     client.set_cookie(
-        "idp_session", issue_token("adminsecret", "admin", PURPOSE_SESSION),
+        "idp_session", _session_cookie("adminsecret", "admin"),
         domain="localhost",
     )
     bk.write_archive_listing(tmp_path, ["idp-20260101-000000.tar.gz"])

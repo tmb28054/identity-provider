@@ -18,7 +18,9 @@ from typing import Any
 from flask import Flask, g, jsonify, render_template_string, request
 
 from . import backup as bk
+from . import notify as _notify
 from . import webauthn_flows as wf
+from .services import is_valid_sp_path
 from .tokens import PURPOSE_ADMIN, issue_token, verify_token
 from .totp import verify_code
 
@@ -492,20 +494,48 @@ def register_admin_routes(
         """Verify an admin token; rejects tokens minted for any other purpose."""
         return verify_token(app.secret_key, token, PURPOSE_ADMIN, max_age)
 
+    def _account_usable(username: str) -> bool:
+        """True if the account may hold a privileged session right now.
+
+        Mirrors the credential-path gate: refuses disabled accounts and ones
+        flagged for forced password rotation. Applied on every session-cookie
+        admin entry point so disabling an admin revokes panel access even while
+        a live ``idp_session`` cookie exists.
+        """
+        user = users.get(username)
+        if not user:  # pragma: no cover - session user is validated upstream
+            return False
+        if user.get("enabled") is False:
+            return False
+        return not user.get("must_set_password")
+
     def _has_claim(username: str, claim: str) -> bool:
         user = users.get(username)
         if not user:
             return False
         return claim in user.get("claims", [])
 
+    def _admin_session_ok(session_user: str | None) -> bool:
+        """Authorize a session-cookie admin entry: idpadmin claim + usable."""
+        return bool(
+            session_user
+            and _has_claim(session_user, "idpadmin")
+            and _account_usable(session_user)
+        )
+
     def _require_admin(auth_token: str) -> str | None:
         """Return the admin username if the token is valid and holds idpadmin.
 
         Central authorization predicate for state-changing admin actions, so
-        the check is defined once rather than copied per handler.
+        the check is defined once rather than copied per handler. Also revokes
+        access for a disabled or rotation-flagged account.
         """
         admin_user = _verify_token(auth_token)
-        if not admin_user or not _has_claim(admin_user, "idpadmin"):
+        if (
+            not admin_user
+            or not _has_claim(admin_user, "idpadmin")
+            or not _account_usable(admin_user)
+        ):
             return None
         return admin_user
 
@@ -528,6 +558,51 @@ def register_admin_routes(
             reason=f"{mutation}:{target}" if target else mutation,
             user_agent=request.headers.get("User-Agent", ""),
         )
+
+    PASSWORD_HISTORY_SIZE = 5
+
+    def _password_reused(user: dict[str, Any], candidate: str) -> bool:
+        """True if ``candidate`` matches the current or a recent stored hash."""
+        if user.get("password") and check_password_fn(user["password"], candidate):
+            return True
+        return any(
+            check_password_fn(old, candidate)
+            for old in user.get("password_history", [])
+        )
+
+    def _set_password_with_history(user: dict[str, Any], new_hash: str) -> None:
+        """Retire the current hash into history, then install ``new_hash``."""
+        current = user.get("password", "")
+        if current:
+            history = list(user.get("password_history", []))
+            history.insert(0, current)
+            user["password_history"] = history[: PASSWORD_HISTORY_SIZE - 1]
+        user["password"] = new_hash
+
+    def _notify_grant_admin(admin_user: str, target: str) -> None:
+        """Best-effort outbound alert when an account is granted idpadmin."""
+        _notify.notify(
+            "grant_idpadmin",
+            f"{admin_user} granted the idpadmin claim to {target}.",
+            severity="warning",
+        )
+
+    def _bump_session_epoch(username: str) -> None:
+        """Invalidate the account's outstanding session cookies.
+
+        Increments the per-user ``session_epoch`` that is baked into every
+        session token at issue time, so disabling, resetting the password of,
+        or changing the privileges of an account immediately revokes any live
+        ``idp_session`` cookie instead of waiting for the idle window.
+        """
+        user = users.get(username)
+        if not user:  # pragma: no cover - callers pass an existing target
+            return
+        try:
+            current = int(user.get("session_epoch", 0))
+        except (TypeError, ValueError):  # pragma: no cover - defensive parse guard
+            current = 0
+        user["session_epoch"] = current + 1
 
     def _valid_username(name: str) -> bool:
         """Charset-validate a username (defaults to allowing all if no fn)."""
@@ -680,7 +755,7 @@ def register_admin_routes(
         # Check session cookie — skip login if user has idpadmin claim
         if verify_session_cookie_fn:
             session_user = verify_session_cookie_fn(request.cookies.get("idp_session", ""))
-            if session_user and _has_claim(session_user, "idpadmin"):
+            if _admin_session_ok(session_user):
                 if audit_logger:
                     audit_logger.log(
                         username=session_user,
@@ -744,9 +819,22 @@ def register_admin_routes(
             and _has_claim(username, "idpadmin")
         )
         credentials = wf.get_credentials(user) if eligible else []
-        if not credentials:
-            return jsonify({"error": "No admin passkey for this account."}), 400
-        options_json, challenge = wf.begin_authentication(webauthn_rp, credentials)
+        # Admin passkeys must carry user verification (two factors). Return a
+        # valid 200 with options in every case so 200-vs-400 no longer
+        # enumerates idpadmin membership; ineligible accounts get decoy options
+        # (and a recorded throttle hit) and still fail at finish.
+        if credentials:
+            options_json, challenge = wf.begin_authentication(
+                webauthn_rp, credentials, require_uv=True,
+            )
+        else:
+            _rl_record()
+            if username:
+                _rl_record(username)
+            options_json, challenge = wf.begin_authentication_decoy(
+                webauthn_rp, username or (request.remote_addr or "unknown"),
+                require_uv=True,
+            )
         handle = passkey_challenges.put(
             challenge=challenge, username=username, purpose="admin",
         )
@@ -785,6 +873,7 @@ def register_admin_routes(
         try:
             new_sign_count = wf.finish_authentication(
                 webauthn_rp, credential_json, entry["challenge"], stored,
+                require_uv=True,
             )
             wf.update_credential_usage(
                 stored, new_sign_count=new_sign_count, now_iso=_now_iso(),
@@ -913,7 +1002,36 @@ def register_admin_routes(
                 resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
                 return resp, 401
 
-            # Check MFA
+            # Check MFA. A second factor is MANDATORY for administrators: an
+            # idpadmin account that has not enrolled TOTP cannot log into the
+            # panel with a password alone — it is directed to enroll at /user.
+            is_admin_account = _has_claim(username, "idpadmin")
+            if is_admin_account and not user.get("totp_secret"):
+                if audit_logger:
+                    audit_logger.log(
+                        username=username,
+                        ip=request.remote_addr or "unknown",
+                        service="admin",
+                        protocol="admin",
+                        result="failure",
+                        reason="mfa_not_enrolled",
+                        user_agent=request.headers.get("User-Agent", ""),
+                    )
+                token = _csrf_token()
+                question, ch_hash = make_challenge_fn()
+                resp = app.make_response(render_template_string(
+                    ADMIN_LOGIN,
+                    error=(
+                        "Administrators must enroll a second factor. "
+                        "Enroll TOTP at /user, then sign in again."
+                    ),
+                    csrf_token=token,
+                    challenge_question=question, challenge_hash=ch_hash,
+                    passkey_available=_admin_passkey_enabled(),
+                ))
+                resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
+                return resp, 403
+
             if user.get("totp_secret"):  # noqa: SIM102 - kept nested for auth-flow clarity
                 if not totp_code or not verify_code(user["totp_secret"], totp_code):
                     _rl_record(username)
@@ -937,7 +1055,7 @@ def register_admin_routes(
                     return resp, 401
 
             # Check idpadmin claim
-            if not _has_claim(username, "idpadmin"):
+            if not is_admin_account:
                 if audit_logger:
                     audit_logger.log(
                         username=username,
@@ -1035,6 +1153,7 @@ def register_admin_routes(
             _audit_admin(admin_user, "add_user", new_username)
             if "idpadmin" in claims:
                 _audit_admin(admin_user, "grant_idpadmin", new_username)
+                _notify_grant_admin(admin_user, new_username)
             return _render_panel(auth_token, message=f"User '{new_username}' created.")
 
         elif action == "delete_user":
@@ -1059,8 +1178,18 @@ def register_admin_routes(
             user = users.get(target)
             if not user:
                 return _render_panel(auth_token, error=f"User '{target}' not found.")
+            if _password_reused(user, new_pw):
+                return _render_panel(
+                    auth_token,
+                    error=(
+                        f"New password for '{target}' must differ from the last "
+                        f"{PASSWORD_HISTORY_SIZE} passwords."
+                    ),
+                )
             import bcrypt
-            user["password"] = bcrypt.hashpw(new_pw.encode(), bcrypt.gensalt()).decode()
+            new_hash = bcrypt.hashpw(new_pw.encode(), bcrypt.gensalt()).decode()
+            _set_password_with_history(user, new_hash)
+            _bump_session_epoch(target)  # revoke the target's live sessions
             if users_path:
                 save_users_fn(users_path, users)
             logger.info("Admin %s reset password for %s", admin_user, target)
@@ -1093,12 +1222,16 @@ def register_admin_routes(
                 )
             had_admin = "idpadmin" in user.get("claims", [])
             user["claims"] = claims
+            # A privilege change must not be bypassable by a cookie minted
+            # under the old claim set, so revoke the target's live sessions.
+            _bump_session_epoch(target)
             if users_path:
                 save_users_fn(users_path, users)
             logger.info("Admin %s set claims for %s: %s", admin_user, target, claims)
             _audit_admin(admin_user, "set_claims", target)
             if "idpadmin" in claims and not had_admin:
                 _audit_admin(admin_user, "grant_idpadmin", target)
+                _notify_grant_admin(admin_user, target)
             return _render_panel(auth_token, message=f"Claims updated for '{target}'.")
 
         elif action == "add_claim":
@@ -1139,7 +1272,7 @@ def register_admin_routes(
 
             if sp_protocol not in ("saml", "oauth"):
                 return _render_panel(auth_token, error="Protocol must be 'saml' or 'oauth'.")
-            if not sp_path or not sp_path.replace("-", "").replace("_", "").isalnum():
+            if not is_valid_sp_path(sp_path):
                 return _render_panel(auth_token, error="Path must be URL-safe (letters, numbers, hyphens, underscores).")
             if not sp_url or not sp_url.startswith("https://"):
                 return _render_panel(auth_token, error="URL must start with https://.")
@@ -1179,6 +1312,9 @@ def register_admin_routes(
             logger.info(
                 "Admin %s %s SP: %s/%s -> %s (%d min)",
                 admin_user, verb, sp_protocol, sp_path, sp_url, sp_duration,
+            )
+            _audit_admin(
+                admin_user, "upsert_sp", f"{sp_protocol}/{sp_path}->{sp_url}"
             )
             return _render_panel(
                 auth_token,
@@ -1241,6 +1377,10 @@ def register_admin_routes(
                 "Admin %s updated duration for %s/%s to %d min",
                 admin_user, sp_protocol, sp_path, sp_duration,
             )
+            _audit_admin(
+                admin_user, "update_sp_duration",
+                f"{sp_protocol}/{sp_path}={sp_duration}min",
+            )
             return _render_panel(
                 auth_token,
                 message=f"Token duration for '/{sp_path}' updated to {sp_duration} minutes.",
@@ -1258,6 +1398,7 @@ def register_admin_routes(
                     del data[sp_protocol]
                 _save_services_yaml(data)
                 logger.info("Admin %s deleted SP: %s/%s", admin_user, sp_protocol, sp_path)
+                _audit_admin(admin_user, "delete_sp", f"{sp_protocol}/{sp_path}")
                 return _render_panel(auth_token, message=f"Service provider '/{sp_path}' deleted.")
             return _render_panel(auth_token, error=f"Service provider '/{sp_path}' not found.")
 
@@ -1369,10 +1510,11 @@ def register_admin_routes(
             session_user = verify_session_cookie_fn(
                 request.cookies.get("idp_session", ""),
             )
-            if session_user and _has_claim(session_user, "idpadmin"):
+            if _admin_session_ok(session_user):
                 entries = []
                 if audit_logger:
                     entries = audit_logger.read_recent(500)
+                    _audit_admin(session_user, "read_audit_log")
                 return render_template_string(
                     ADMIN_AUDIT_LOG, entries=entries,
                 )
@@ -1596,7 +1738,7 @@ def register_admin_routes(
     def admin_backups_get():
         if verify_session_cookie_fn:
             session_user = verify_session_cookie_fn(request.cookies.get("idp_session", ""))
-            if session_user and _has_claim(session_user, "idpadmin"):
+            if _admin_session_ok(session_user):
                 auth_token = _issue_token(session_user)
                 return _render_backups(auth_token)
         return app.redirect("/admin")
@@ -1648,6 +1790,10 @@ def register_admin_routes(
                 return _render_backups(auth_token, error="Retention values must be numbers.")
             bk.save_config(ddir, config)
             logger.info("Admin %s updated backup config", admin_user)
+            _audit_admin(
+                admin_user, "save_backup_config",
+                f"{config.server}/{config.share}/{config.subpath}",
+            )
             return _render_backups(auth_token, message="Backup settings saved.")
 
         if action == "test_backup_connection":
@@ -1735,10 +1881,13 @@ def register_admin_routes(
 
     @app.get("/admin/user/<target_username>")
     def admin_user_detail_get(target_username: str):
+        # Validate the path segment with the same grammar as created usernames.
+        if not _valid_username(target_username):
+            return app.redirect("/admin")
         # Check session cookie
         if verify_session_cookie_fn:
             session_user = verify_session_cookie_fn(request.cookies.get("idp_session", ""))
-            if session_user and _has_claim(session_user, "idpadmin"):
+            if _admin_session_ok(session_user):
                 auth_token = _issue_token(session_user)
                 return _render_user_detail(target_username, auth_token)
         # No session — redirect to admin login
@@ -1746,6 +1895,8 @@ def register_admin_routes(
 
     @app.post("/admin/user/<target_username>")
     def admin_user_detail_post(target_username: str):
+        if not _valid_username(target_username):
+            return app.redirect("/admin")
         form_token = request.form.get("csrf_token", "")
         cookie_token = request.cookies.get("csrf_token", "")
         if not form_token or not hmac.compare_digest(form_token, cookie_token):
@@ -1770,12 +1921,14 @@ def register_admin_routes(
                 )
             if claim_name and claim_name not in user.get("claims", []):
                 user.setdefault("claims", []).append(claim_name)
+                _bump_session_epoch(target_username)  # privilege change
                 if users_path:
                     save_users_fn(users_path, users)
                 logger.info("Admin %s added claim '%s' to user %s", admin_user, claim_name, target_username)
                 _audit_admin(admin_user, "add_user_claim", f"{target_username}:{claim_name}")
                 if claim_name == "idpadmin":
                     _audit_admin(admin_user, "grant_idpadmin", target_username)
+                    _notify_grant_admin(admin_user, target_username)
                 return _render_user_detail(target_username, auth_token, message=f"Claim '{claim_name}' added.")
             return _render_user_detail(target_username, auth_token, error="Claim already assigned or invalid.")
 
@@ -1783,6 +1936,7 @@ def register_admin_routes(
             claim_name = request.form.get("claim_name", "").strip()
             if claim_name in user.get("claims", []):
                 user["claims"].remove(claim_name)
+                _bump_session_epoch(target_username)  # privilege change
                 if users_path:
                     save_users_fn(users_path, users)
                 logger.info("Admin %s removed claim '%s' from user %s", admin_user, claim_name, target_username)

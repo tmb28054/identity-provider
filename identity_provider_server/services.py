@@ -18,6 +18,16 @@ SERVICES_FILENAME = "services.yaml"
 _PATH_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
+def is_valid_sp_path(path: str) -> bool:
+    """Return True if ``path`` is an acceptable service-provider path segment.
+
+    This is the single source of truth for the SP-path grammar: the admin
+    writer and this loader both call it, so a value the writer accepts can
+    never be rejected by the loader (a divergence the security review flagged).
+    """
+    return bool(path) and bool(_PATH_RE.match(path))
+
+
 @dataclass
 class ServiceProvider:
     """A single service provider configuration."""
@@ -33,6 +43,9 @@ class ServiceProvider:
     client_id: str = ""
     scopes: list[str] = field(default_factory=lambda: ["openid", "profile", "email"])
     token_expiry_minutes: int = 60
+    # Incident-response: who to notify if this relying party's trust is affected
+    # (e.g. a signing-key compromise). Free-form (email/distribution list).
+    owner_contact: str = ""
 
 
 def _parse_sp_entry(
@@ -68,6 +81,7 @@ def _parse_sp_entry(
         client_id=extra.get("client_id", path),
         scopes=extra.get("scopes", ["openid", "profile", "email"]),
         token_expiry_minutes=extra.get("token_expiry_minutes", 60),
+        owner_contact=extra.get("owner_contact", ""),
     )
     return sp
 
