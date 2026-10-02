@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `verify-jwt` CLI (`identity_provider_server/verify_jwt.py`): decodes a JWT,
+  prints its header and claims, and validates the RS256 signature against the
+  IdP's RSA public key. The key is read from a local certificate/public-key PEM
+  (`--cert`) or fetched from the SAML metadata endpoint (`--metadata-url`,
+  default `https://idp.botthouse.net/metadata`) by extracting the embedded
+  `X509Certificate`. Supports reading the token from stdin (`-`), decode-only
+  mode (`--no-verify`), and machine-readable output (`--json`). Exits `0` for a
+  valid signature, `2` for an invalid or expired token, and `1` for decode or
+  fetch errors.
+
 ### Fixed
 - The "Enable password-less sign-in" button stayed disabled right after
   registering a first passkey (the enroll page is reached via POST and is not

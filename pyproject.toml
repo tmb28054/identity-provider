@@ -74,6 +74,7 @@ identity-provider-server = "identity_provider_server.__main__:main"
 run-idp = "identity_provider_server.run_gunicorn:main"
 idp-hash-password = "identity_provider_server.hash_password:main"
 get-jwt = "identity_provider_server.get_jwt:main"
+verify-jwt = "identity_provider_server.verify_jwt:main"
 
 [tool.ruff]
 target-version = "py310"
