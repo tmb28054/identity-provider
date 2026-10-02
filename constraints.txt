@@ -11,7 +11,7 @@
 # Run `pip-audit -r constraints.txt` in CI to catch known vulnerabilities.
 bcrypt==5.0.0
 cbor2==6.1.4
-cryptography==49.0.0
+cryptography==50.0.1
 fido2==0.9.3
 Flask==3.1.3
 gunicorn==23.0.0
