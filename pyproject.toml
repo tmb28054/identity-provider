@@ -36,7 +36,7 @@ dev = [
 ]
 integration = [
     "pytest>=8.0,<9.0",
-    "playwright>=1.40",
+    "playwright>=1.63.0",
     "pytest-playwright>=0.5",
     "pyotp>=2.9,<3.0",
     "soft-webauthn>=0.1,<1.0",
