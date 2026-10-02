@@ -40,3 +40,6 @@ scripts/deploy.py
 
 # --- Scratch working files ---
 trash/
+
+# --- macOS ---
+.DS_Store
