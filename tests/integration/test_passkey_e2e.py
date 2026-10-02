@@ -114,57 +114,54 @@ def _enable_virtual_authenticator(page):
     return client, result["authenticatorId"]
 
 
-def test_passkey_register_then_authenticate(passkey_server):
-    """Register a passkey on /user, then log in with it on /aws."""
-    playwright_api = pytest.importorskip("playwright.sync_api")
+def test_passkey_register_then_authenticate(passkey_server, page):
+    """Register a passkey on /user, then log in with it on /aws.
+
+    Drives the browser through the ``page`` fixture from ``pytest-playwright``
+    rather than opening a nested ``sync_playwright()`` context. The nested-sync
+    approach failed intermittently ("Sync API inside the asyncio loop") when
+    this test ran after other integration tests that leave the plugin's event
+    loop running; using the shared fixture avoids that entirely.
+    """
+    import re
+
     base = passkey_server["base"]
+    context = page.context
+    _enable_virtual_authenticator(page)
 
-    with playwright_api.sync_playwright() as pw:
-        try:
-            browser = pw.chromium.launch()
-        except Exception as exc:  # pragma: no cover - env without browser
-            pytest.skip(f"Chromium not available: {exc}")
-        context = browser.new_context()
-        page = context.new_page()
-        _enable_virtual_authenticator(page)
+    # --- sign in to /user (no MFA) ---
+    page.goto(f"{base}/user", wait_until="networkidle")
+    page.fill("#username", TEST_USER)
+    page.fill("#password", TEST_PASSWORD)
+    # Solve the captcha (no MFA on this account).
+    q = re.search(r"What is (\d+)\s*([+\-\u00d7])\s*(\d+)",
+                  page.inner_text(".challenge-question"))
+    a, op, b = int(q.group(1)), q.group(2), int(q.group(3))
+    ans = a + b if op == "+" else (a - b if op == "-" else a * b)
+    page.fill("#challenge_answer", str(ans))
+    page.click("button[type=submit]")
+    page.wait_for_load_state("networkidle")
+    assert page.locator("#passkey-register").count() == 1
 
-        # --- sign in to /user (no MFA) ---
-        page.goto(f"{base}/user", wait_until="networkidle")
-        page.fill("#username", TEST_USER)
-        page.fill("#password", TEST_PASSWORD)
-        # Solve the captcha (no MFA on this account).
-        import re
-        q = re.search(r"What is (\d+)\s*([+\-\u00d7])\s*(\d+)",
-                      page.inner_text(".challenge-question"))
-        a, op, b = int(q.group(1)), q.group(2), int(q.group(3))
-        ans = a + b if op == "+" else (a - b if op == "-" else a * b)
-        page.fill("#challenge_answer", str(ans))
-        page.click("button[type=submit]")
-        page.wait_for_load_state("networkidle")
-        assert page.locator("#passkey-register").count() == 1
+    # --- register a passkey (CDP authenticator answers the prompt) ---
+    page.click("#passkey-register")
+    # On success the list gains a Remove button and the status shows success
+    # (no page reload — the enroll page is POST-reached).
+    page.wait_for_selector("#passkey-list li", timeout=10000)
+    page.wait_for_selector("text=Passkey registered.", timeout=10000)
 
-        # --- register a passkey (CDP authenticator answers the prompt) ---
-        page.click("#passkey-register")
-        # On success the list gains a Remove button and the status shows success
-        # (no page reload — the enroll page is POST-reached).
-        page.wait_for_selector("#passkey-list li", timeout=10000)
-        page.wait_for_selector("text=Passkey registered.", timeout=10000)
+    # Confirm the credential was persisted server-side.
+    users = json.loads((passkey_server["data_dir"] / "users.json").read_text())
+    user = next(u for u in users if u["username"] == TEST_USER)
+    assert len(user.get("webauthn_credentials", [])) == 1
 
-        # Confirm the credential was persisted server-side.
-        users = json.loads((passkey_server["data_dir"] / "users.json").read_text())
-        user = next(u for u in users if u["username"] == TEST_USER)
-        assert len(user.get("webauthn_credentials", [])) == 1
-
-        # --- authenticate with the passkey on /aws ---
-        page.goto(f"{base}/aws", wait_until="networkidle")
-        page.fill("#username", TEST_USER)
-        page.click("#passkey-login")
-        # On success the client auto-POSTs the SAML form to AWS (cross-origin).
-        for _ in range(20):
-            if any(c["name"] == "idp_session" for c in context.cookies()):
-                break
-            time.sleep(0.5)
-        assert any(c["name"] == "idp_session" for c in context.cookies())
-
-        context.close()
-        browser.close()
+    # --- authenticate with the passkey on /aws ---
+    page.goto(f"{base}/aws", wait_until="networkidle")
+    page.fill("#username", TEST_USER)
+    page.click("#passkey-login")
+    # On success the client auto-POSTs the SAML form to AWS (cross-origin).
+    for _ in range(20):
+        if any(c["name"] == "idp_session" for c in context.cookies()):
+            break
+        time.sleep(0.5)
+    assert any(c["name"] == "idp_session" for c in context.cookies())
