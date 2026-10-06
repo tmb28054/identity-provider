@@ -34,7 +34,7 @@ def _make_app(tmp: Path):
             "totp_secret": "JBSWY3DPEHPK3PXP",
         }
     ]))
-    app = create_app(str(tmp), secret_key="testsecret")
+    app = create_app(str(tmp), secret_key="testsecret-000000000000000000000000")
     app.config["TESTING"] = True
     return app
 

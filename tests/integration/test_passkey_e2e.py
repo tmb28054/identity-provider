@@ -76,7 +76,7 @@ def passkey_server(tmp_path_factory):
     runner = (
         "from identity_provider_server.app import create_app; "
         f"create_app({str(data_dir)!r}, host='127.0.0.1', port={port}, "
-        "secret_key='e2e-passkey-secret', secure_cookies=False, "
+        "secret_key='e2e-passkey-secret-000000000000000000', secure_cookies=False, "
         "trust_proxy=False, webauthn_enabled=True, webauthn_rp_id='localhost', "
         f"webauthn_expected_origin={base!r})"
         f".run(host='127.0.0.1', port={port})"

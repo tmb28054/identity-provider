@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (code review idp-20261003)
+
+All 11 findings from the second AWS Security Agent review were validated and
+remediated. See `docs/security-review-20261003-response.md`.
+
+- **Fail closed on a weak/placeholder `SECRET_KEY`** (Critical, F5): `create_app`
+  now rejects a known placeholder or a key shorter than 32 chars; a random key is
+  generated only when none is supplied. `docker-compose.yml` requires the var and
+  the k8s Secret ships unset with out-of-band creation guidance.
+- **Durable lockout applied uniformly** (High, F6): the per-account lockout now
+  also gates `/user` login, `/recover`, and admin login, with an IP-independent
+  per-account bucket on the admin path.
+- **Second-factor mutation hardened** (F7): TOTP enrollment binds a server-issued
+  secret (no client-supplied secret), enroll/disable require the current password
+  (and disable requires a current code), and admin `remove_mfa` revokes sessions.
+- **Bounded rate limiter** (F1): keys are no longer created on read, empty entries
+  are evicted, the key count is LRU-capped, login usernames are charset/length
+  validated before becoming keys, and `MAX_CONTENT_LENGTH` caps request bodies.
+- **Sensitive files written `0600`** (F8): `users.json`, `recovery_tokens.json`,
+  and `audit.log` use atomic owner-only writes; the data directory is `0700`.
+- **Tamper-evident audit log** (F9): hash-chained records (`verify_chain`), an
+  off-host stdout mirror, loud write-failure notifications, and a step-up token
+  required to read `/admin/audit-log`.
+- **Non-ASCII input no longer 500s** (F2): `safe_compare` byte-compares tokens and
+  CSRF values; a catch-all error handler returns a bounded, audited 500.
+- **Passkey finish throttled** (F3): the SP `/passkey/finish` failure branches
+  record the buckets their gate reads, plus an account-scoped gate.
+- **Anti-lockout on factor removal** (F4): `remove_passkey` and `disable` refuse
+  to remove the last usable factor.
+- **Account lifecycle** (F11): admin `disable_user`/`enable_user` (non-destructive
+  suspension, session revocation, audited); a deleted account's cookie is rejected.
+- **Vulnerability management** (F10): scheduled CI scan, Trivy image/OS scan, and a
+  documented risk-ranking + remediation-SLA policy in `docs/security.md`.
+
 ### Added
 - `docs/security-review-20261001-response.md`: validation and remediation plan
   for the AWS Security Agent code review (idp-20261001). All 12 findings were

@@ -21,6 +21,7 @@ over a private channel and let it expire rather than reusing it.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import secrets
 import sys
@@ -86,6 +87,9 @@ def mint_token(
         "expires": now + RECOVERY_TOKEN_EXPIRY,
     }
     tokens_path.write_text(json.dumps(existing, indent=2) + "\n")
+    # Live reset credentials — restrict to owner read/write (F8).
+    with contextlib.suppress(OSError):
+        tokens_path.chmod(0o600)
     return token
 
 

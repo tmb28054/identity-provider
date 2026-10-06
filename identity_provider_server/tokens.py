@@ -37,6 +37,21 @@ PURPOSE_MFA_PENDING = "mfa-pending"
 _SEP = ":"
 
 
+def safe_compare(a: str, b: str) -> bool:
+    """Constant-time string comparison that tolerates non-ASCII input.
+
+    ``hmac.compare_digest`` raises ``TypeError`` when either ``str`` operand
+    contains a non-ASCII character. Since several comparison sites feed raw,
+    attacker-controlled request values (token fields, CSRF tokens), we encode
+    both operands to bytes first — byte comparison has no ASCII restriction —
+    so a crafted non-ASCII value fails the check cleanly instead of raising an
+    unhandled exception / HTTP 500 (finding idp-20261003 F2).
+    """
+    return hmac.compare_digest(
+        a.encode("utf-8", "surrogatepass"), b.encode("utf-8", "surrogatepass")
+    )
+
+
 def _derive_key(secret: str, purpose: str) -> bytes:
     """Derive a per-purpose signing key from the root secret.
 
@@ -88,13 +103,13 @@ def verify_token(secret: str, token: str, purpose: str, max_age: int) -> str | N
     if len(parts) != 4:
         return None
     username, ts_str, tok_purpose, sig = parts
-    if not hmac.compare_digest(tok_purpose, purpose):
+    if not safe_compare(tok_purpose, purpose):
         return None
     payload = f"{username}{_SEP}{ts_str}{_SEP}{tok_purpose}"
     expected = hmac.new(
         _derive_key(secret, purpose), payload.encode(), hashlib.sha256
     ).hexdigest()
-    if not hmac.compare_digest(sig, expected):
+    if not safe_compare(sig, expected):
         return None
     try:
         ts = int(ts_str)

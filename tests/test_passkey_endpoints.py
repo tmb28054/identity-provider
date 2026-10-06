@@ -76,7 +76,7 @@ def _make_client(data_dir: Path, *, enabled: bool = True):
         str(data_dir),
         host="127.0.0.1",
         port=5000,
-        secret_key="test-secret-key-for-passkeys",
+        secret_key="test-secret-key-for-passkeys-00000000",
         webauthn_enabled=enabled,
         webauthn_rp_id=RP_ID if enabled else "",
         webauthn_expected_origin=ORIGIN if enabled else "",
@@ -365,6 +365,35 @@ def test_auth_finish_unknown_credential(client, data_dir):
     })
     assert resp.status_code == 400
     assert "unknown" in resp.get_json()["error"].lower()
+
+
+def test_auth_finish_failures_are_throttled(client, data_dir):
+    """Repeated SP passkey-finish failures trip the per-IP gate (F3): the
+    failure branches now record the bucket the gate actually reads."""
+    device = SoftWebauthnDevice()
+    auth_token, csrf = _user_step_up(data_dir, client)
+    _register_passkey(client, device, auth_token, csrf)
+    other = SoftWebauthnDevice()
+    other.cred_init(RP_ID, b"other-user")
+    saw_429 = False
+    for _ in range(8):
+        csrf = _csrf(client)
+        begin = client.post(
+            "/aws/passkey/begin", json={"csrf_token": csrf, "username": "topaztest"}
+        )
+        if begin.status_code == 429:
+            saw_429 = True
+            break
+        body = begin.get_json()
+        assertion = other.get(_options_to_soft(body["options"]), ORIGIN)
+        resp = client.post("/aws/passkey/finish", json={
+            "csrf_token": csrf, "handle": body["handle"],
+            "credential": _attestation_to_dict(assertion),
+        })
+        if resp.status_code == 429:
+            saw_429 = True
+            break
+    assert saw_429
 
 
 def test_auth_finish_bad_assertion(client, data_dir):

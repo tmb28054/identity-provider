@@ -41,7 +41,7 @@ def _app(tmp_path, users, **kwargs):
     (tmp_path / "users.json").write_text(json.dumps(users))
     kwargs.setdefault("secure_cookies", False)
     kwargs.setdefault("trust_proxy", False)
-    app = create_app(str(tmp_path), secret_key="appsecret", **kwargs)
+    app = create_app(str(tmp_path), secret_key="appsecret-0000000000000000000000000", **kwargs)
     app.config["TESTING"] = True
     return app
 
@@ -205,7 +205,7 @@ def test_disabled_account_session_cookie_revoked(tmp_path):
          "session_epoch": 0},
     ])
     client = app.test_client()
-    cookie = issue_session_token("appsecret", "bob", auth_time=int(time.time()), epoch=0)
+    cookie = issue_session_token("appsecret-0000000000000000000000000", "bob", auth_time=int(time.time()), epoch=0)
     client.set_cookie("idp_session", cookie, domain="localhost")
     # Works while enabled.
     assert client.get("/aws").status_code in (200, 302)
@@ -229,7 +229,7 @@ def test_session_cookie_rejected_after_epoch_bump(tmp_path):
          "session_epoch": 0},
     ])
     client = app.test_client()
-    stale = issue_session_token("appsecret", "bob", auth_time=int(time.time()), epoch=0)
+    stale = issue_session_token("appsecret-0000000000000000000000000", "bob", auth_time=int(time.time()), epoch=0)
     client.set_cookie("idp_session", stale, domain="localhost")
     users = json.loads((tmp_path / "users.json").read_text())
     for u in users:

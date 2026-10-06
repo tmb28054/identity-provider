@@ -6,7 +6,11 @@ services:
     volumes:
       - ./data:/data
     environment:
-      - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
+      # Required — no default. The app refuses to start on a placeholder or a
+      # key shorter than 32 chars. Generate one with:
+      #   python3 -c "import secrets; print(secrets.token_hex(32))"
+      # and set it in a .env file (see docs/howto.md) or your shell.
+      - SECRET_KEY=${SECRET_KEY:?set SECRET_KEY to a real random value}
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health')"]
       interval: 10s

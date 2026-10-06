@@ -43,7 +43,7 @@ def _write_app(tmp_path, users, services=None, **kwargs):
         (tmp_path / "services.yaml").write_text(yaml.dump(services))
     kwargs.setdefault("secure_cookies", False)
     kwargs.setdefault("trust_proxy", False)  # so REMOTE_ADDR overrides work in tests
-    app = create_app(str(tmp_path), secret_key="appsecret", **kwargs)
+    app = create_app(str(tmp_path), secret_key="appsecret-0000000000000000000000000", **kwargs)
     app.config["TESTING"] = True
     return app
 
@@ -186,7 +186,7 @@ def test_mfa_ticket_for_user_without_secret(tmp_path):
     ])
     # Manually craft a valid ticket for bob (no totp_secret on the account).
     from identity_provider_server.tokens import PURPOSE_MFA_PENDING, issue_token as it
-    ticket = it("appsecret", "bob|nonce123", PURPOSE_MFA_PENDING)
+    ticket = it("appsecret-0000000000000000000000000", "bob|nonce123", PURPOSE_MFA_PENDING)
     client = app.test_client()
     form = client.get("/aws")
     resp = client.post("/aws", data={
@@ -256,7 +256,7 @@ def test_session_reuse_saml(tmp_path):
          "claims": []}
     ])
     client = app.test_client()
-    client.set_cookie("idp_session", _session_cookie("appsecret", "bob"),
+    client.set_cookie("idp_session", _session_cookie("appsecret-0000000000000000000000000", "bob"),
                       domain="localhost")
     resp = client.get("/aws")
     assert b"SAMLResponse" in resp.data
@@ -269,7 +269,7 @@ def test_session_reuse_oauth(tmp_path):
         services={"oauth": {"wiki": {"url": "https://wiki.example/cb"}}},
     )
     client = app.test_client()
-    client.set_cookie("idp_session", _session_cookie("appsecret", "bob"),
+    client.set_cookie("idp_session", _session_cookie("appsecret-0000000000000000000000000", "bob"),
                       domain="localhost")
     resp = client.get("/wiki")
     assert resp.status_code == 302
@@ -378,20 +378,24 @@ def test_user_enroll_mfa_and_disable(tmp_path):
     html = enroll.data.decode()
     csrf = _csrf(enroll.data)
     auth = re.search(r'name="auth_token" value="([^"]+)"', html).group(1)
-    secret = re.search(r'name="totp_secret" value="([^"]+)"', html).group(1)
-    # enroll with a valid code
+    handle = re.search(r'name="secret_handle" value="([^"]+)"', html).group(1)
+    secret = re.search(r'class="secret-code">([^<]+)<', html).group(1)
+    # enroll with a valid code — now requires the current password and the
+    # server-bound secret handle (not a client-supplied secret).
     resp = client.post("/user", data={
         "action": "enroll", "csrf_token": csrf, "auth_token": auth,
-        "totp_secret": secret, "totp_code": pyotp.TOTP(secret).now(),
+        "secret_handle": handle, "current_password": PW,
+        "totp_code": pyotp.TOTP(secret).now(),
     })
     assert b"enabled" in resp.data
     users = json.loads((tmp_path / "users.json").read_text())
     assert users[0].get("totp_secret") == secret
-    # disable
+    # disable — requires the current password and a current authenticator code
     csrf2 = _csrf(resp.data)
     auth2 = re.search(rb'name="auth_token" value="([^"]+)"', resp.data).group(1).decode()
     dis = client.post("/user", data={
         "action": "disable", "csrf_token": csrf2, "auth_token": auth2,
+        "current_password": PW, "totp_code": pyotp.TOTP(secret).now(),
     })
     assert dis.status_code == 200
 
@@ -403,10 +407,10 @@ def test_user_enroll_bad_code(tmp_path):
     html = enroll.data.decode()
     csrf = _csrf(enroll.data)
     auth = re.search(r'name="auth_token" value="([^"]+)"', html).group(1)
-    secret = re.search(r'name="totp_secret" value="([^"]+)"', html).group(1)
+    handle = re.search(r'name="secret_handle" value="([^"]+)"', html).group(1)
     resp = client.post("/user", data={
         "action": "enroll", "csrf_token": csrf, "auth_token": auth,
-        "totp_secret": secret, "totp_code": "000000",
+        "secret_handle": handle, "current_password": PW, "totp_code": "000000",
     })
     assert resp.status_code == 401
 
@@ -849,7 +853,7 @@ def test_adfs_login_flow(tmp_path):
     (tmp_path / "services.yaml").write_text(yaml.dump(
         {"saml": {"aws": "https://signin.aws.amazon.com/saml"}}))
     app = create_app(
-        str(tmp_path), secret_key="appsecret", secure_cookies=False,
+        str(tmp_path), secret_key="appsecret-0000000000000000000000000", secure_cookies=False,
         adfs_config={"host": "ldaps://x", "username": "svc", "base_dn": "dc=x",
                      "password": "p"},
         group_role_map={"AWS-Admins": [{"account_id": "1", "role": "Admin"}]},
@@ -873,7 +877,7 @@ def test_adfs_login_no_roles(tmp_path):
     (tmp_path / "services.yaml").write_text(yaml.dump(
         {"saml": {"aws": "https://signin.aws.amazon.com/saml"}}))
     app = create_app(
-        str(tmp_path), secret_key="appsecret", secure_cookies=False,
+        str(tmp_path), secret_key="appsecret-0000000000000000000000000", secure_cookies=False,
         adfs_config={"host": "ldaps://x", "username": "svc", "base_dn": "dc=x",
                      "password": "p"},
         group_role_map={},
@@ -897,7 +901,7 @@ def test_adfs_auth_failure(tmp_path):
     (tmp_path / "services.yaml").write_text(yaml.dump(
         {"saml": {"aws": "https://signin.aws.amazon.com/saml"}}))
     app = create_app(
-        str(tmp_path), secret_key="appsecret", secure_cookies=False,
+        str(tmp_path), secret_key="appsecret-0000000000000000000000000", secure_cookies=False,
         adfs_config={"host": "ldaps://x", "username": "svc", "base_dn": "dc=x",
                      "password": "p"},
     )
@@ -954,7 +958,7 @@ def test_claim_roles_resolution(tmp_path):
     ]))
     (tmp_path / "claim_roles.yaml").write_text(yaml.dump(
         {"awsadmin": [{"account_id": "1", "role": "Admin"}]}))
-    app = create_app(str(tmp_path), secret_key="appsecret", secure_cookies=False)
+    app = create_app(str(tmp_path), secret_key="appsecret-0000000000000000000000000", secure_cookies=False)
     app.config["TESTING"] = True
     client = app.test_client()
     form = client.get("/aws")
@@ -1100,7 +1104,7 @@ def test_user_totp_step_wrong_code(tmp_path):
 def test_user_totp_step_ticket_user_lost_secret(tmp_path):
     app = _write_app(tmp_path, [{"username": "bob", "password": _hash(), "roles": [], "claims": []}])
     from identity_provider_server.tokens import PURPOSE_MFA_PENDING, issue_token as it
-    ticket = it("appsecret", "bob|n1", PURPOSE_MFA_PENDING)
+    ticket = it("appsecret-0000000000000000000000000", "bob|n1", PURPOSE_MFA_PENDING)
     client = app.test_client()
     form = client.get("/user")
     resp = client.post("/user", data={

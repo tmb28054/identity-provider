@@ -219,7 +219,7 @@ def _app(tmp_path):
     (tmp_path / "users.json").write_text(json.dumps([
         {"username": "bob", "password": pw, "roles": [], "claims": []}
     ]))
-    app = create_app(str(tmp_path), secret_key="testsecret", secure_cookies=False)
+    app = create_app(str(tmp_path), secret_key="testsecret-000000000000000000000000", secure_cookies=False)
     app.config["TESTING"] = True
     return app
 
@@ -241,7 +241,7 @@ def test_captcha_single_use_verified_directly(tmp_path):
     """
     from identity_provider_server.app import _generate_challenge, _verify_challenge
 
-    secret = "testsecret"
+    secret = "testsecret-000000000000000000000000"
     _q, answer, token = _generate_challenge(secret)
     store = tokens.NonceStore(ttl_seconds=300)
     # First verification succeeds and consumes the nonce.
@@ -253,7 +253,7 @@ def test_captcha_single_use_verified_directly(tmp_path):
 def test_captcha_rejects_expired_and_tampered(tmp_path):
     from identity_provider_server.app import _verify_challenge
 
-    secret = "testsecret"
+    secret = "testsecret-000000000000000000000000"
     # Tampered signature.
     assert _verify_challenge(secret, "5", "nonce:100:deadbeef") is False
     # Malformed token.
@@ -264,7 +264,7 @@ def test_security_headers_present(tmp_path):
     app = _app(tmp_path)
     app.config.update(SESSION_COOKIE_SECURE=True)
     # secure_cookies=True path exercises HSTS + cookie Secure rewrite.
-    secure_app = create_app(str(tmp_path), secret_key="s", secure_cookies=True)
+    secure_app = create_app(str(tmp_path), secret_key="s-000000000000000000000000000000000", secure_cookies=True)
     secure_app.config["TESTING"] = True
     resp = secure_app.test_client().get("/aws")
     assert "Content-Security-Policy" in resp.headers
@@ -286,7 +286,7 @@ def test_mfa_ticket_flow_blocks_password_skip(tmp_path):
         {"username": "bob", "password": pw, "roles": [], "claims": [],
          "totp_secret": secret}
     ]))
-    app = create_app(str(tmp_path), secret_key="testsecret", secure_cookies=False)
+    app = create_app(str(tmp_path), secret_key="testsecret-000000000000000000000000", secure_cookies=False)
     app.config["TESTING"] = True
     client = app.test_client()
 
@@ -314,7 +314,7 @@ def _app_with_user(tmp_path, extra):
     record = {"username": "bob", "password": pw, "roles": [], "claims": []}
     record.update(extra)
     (tmp_path / "users.json").write_text(json.dumps([record]))
-    app = create_app(str(tmp_path), secret_key="testsecret", secure_cookies=False)
+    app = create_app(str(tmp_path), secret_key="testsecret-000000000000000000000000", secure_cookies=False)
     app.config["TESTING"] = True
     return app
 

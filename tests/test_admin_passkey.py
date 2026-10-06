@@ -74,7 +74,7 @@ def app(tmp_path):
     (tmp_path / "users.json").write_text(json.dumps(users))
     (tmp_path / "claims.json").write_text(json.dumps(["idpadmin", "developer"]))
     application = create_app(
-        str(tmp_path), secret_key="adminsecret", secure_cookies=False,
+        str(tmp_path), secret_key="adminsecret-00000000000000000000000", secure_cookies=False,
         webauthn_enabled=True, webauthn_rp_id=RP_ID, webauthn_expected_origin=ORIGIN,
     )
     application.config["TESTING"] = True
@@ -375,7 +375,7 @@ def test_admin_passkey_disabled_returns_404(tmp_path):
     (tmp_path / "users.json").write_text(json.dumps(
         [{"username": "admin", "password": pw, "roles": [], "claims": ["idpadmin"]}]
     ))
-    application = create_app(str(tmp_path), secret_key="s", secure_cookies=False)
+    application = create_app(str(tmp_path), secret_key="s-000000000000000000000000000000000", secure_cookies=False)
     application.config["TESTING"] = True
     client = application.test_client()
     csrf = _admin_csrf(client)

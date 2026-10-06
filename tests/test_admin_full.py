@@ -51,14 +51,14 @@ def _make_app(tmp_path, *, admin_mfa=False):
     (tmp_path / "services.yaml").write_text(
         "saml:\n  aws: https://signin.aws.amazon.com/saml\n"
     )
-    app = create_app(str(tmp_path), secret_key="adminsecret", secure_cookies=False)
+    app = create_app(str(tmp_path), secret_key="adminsecret-00000000000000000000000", secure_cookies=False)
     app.config["TESTING"] = True
     return app
 
 
 def _client(app):
     c = app.test_client()
-    c.set_cookie("idp_session", _session_cookie("adminsecret", "admin"),
+    c.set_cookie("idp_session", _session_cookie("adminsecret-00000000000000000000000", "admin"),
                  domain="localhost")
     return c
 
@@ -187,7 +187,7 @@ def test_unknown_cookie_user_denied(tmp_path):
     """A session cookie for a user not in the DB is denied."""
     app = _make_app(tmp_path)
     client = app.test_client()
-    client.set_cookie("idp_session", _session_cookie("adminsecret", "ghost"),
+    client.set_cookie("idp_session", _session_cookie("adminsecret-00000000000000000000000", "ghost"),
                       domain="localhost")
     assert b"Sign in" in client.get("/admin").data
 
@@ -556,7 +556,7 @@ def test_backups_restore_invalid_archive_with_mfa(tmp_path):
     app = _make_app(tmp_path, admin_mfa=True)
     client = app.test_client()
     client.set_cookie(
-        "idp_session", _session_cookie("adminsecret", "admin"),
+        "idp_session", _session_cookie("adminsecret-00000000000000000000000", "admin"),
         domain="localhost",
     )
     bk.write_archive_listing(tmp_path, ["idp-20260101-000000.tar.gz"])
@@ -833,13 +833,24 @@ def test_generate_recovery_prunes_expired(tmp_path):
 def test_audit_log_page(tmp_path):
     app = _make_app(tmp_path)
     client = _client(app)
-    resp = client.get("/admin/audit-log")
+    # The audit log now requires a step-up token (not just the session cookie).
+    panel = client.get("/admin").data.decode()
+    auth = re.search(r'name="auth_token" value="([^"]+)"', panel).group(1)
+    resp = client.get(f"/admin/audit-log?auth_token={auth}")
     assert resp.status_code == 200
 
 
 def test_audit_log_no_session_redirects(tmp_path):
     app = _make_app(tmp_path)
     resp = app.test_client().get("/admin/audit-log")
+    assert resp.status_code in (301, 302)
+
+
+def test_audit_log_session_cookie_without_stepup_redirects(tmp_path):
+    """A session cookie alone (no step-up token) no longer suffices (F9)."""
+    app = _make_app(tmp_path)
+    client = _client(app)
+    resp = client.get("/admin/audit-log")
     assert resp.status_code in (301, 302)
 
 
@@ -945,7 +956,7 @@ def test_backups_restore_trigger_failure(tmp_path):
     app = _make_app(tmp_path, admin_mfa=True)
     client = app.test_client()
     client.set_cookie(
-        "idp_session", _session_cookie("adminsecret", "admin"),
+        "idp_session", _session_cookie("adminsecret-00000000000000000000000", "admin"),
         domain="localhost",
     )
     bk.write_archive_listing(tmp_path, ["idp-20260101-000000.tar.gz"])

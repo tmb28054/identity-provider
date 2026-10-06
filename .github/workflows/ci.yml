@@ -1,13 +1,20 @@
 name: CI
 
 # Pre-merge security and quality gate. Runs lint, type checks, security
-# scanning (bandit + whole-tree secret scan + dependency audit), and the unit
-# test suite. Gates run before any deployment.
+# scanning (bandit + whole-tree secret scan + dependency audit + Trivy image
+# scan for OS-package CVEs), and the unit test suite. Also runs on a daily
+# schedule so advisories published between commits are caught. Gates run
+# before any deployment. Remediation SLAs: see docs/security.md.
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  # Scheduled scan so advisories published between commits are still caught
+  # against the pinned dependencies and the base image (finding idp-20261003
+  # F10). Runs daily at 03:17 UTC.
+  schedule:
+    - cron: "17 3 * * *"
 
 # Least-privilege default token scope for every job in this workflow.
 permissions:
@@ -46,6 +53,20 @@ jobs:
 
       - name: Secret scan (gitleaks)
         uses: gitleaks/gitleaks-action@v2
+
+      - name: Build image for scanning
+        run: docker build -t idp-ci-scan:${{ github.sha }} .
+
+      - name: Trivy image scan (OS packages + app deps)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: idp-ci-scan:${{ github.sha }}
+          scan-type: image
+          # Fail the build on fixable HIGH/CRITICAL findings so OS-level CVEs
+          # in the base image do not accumulate silently.
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
 
       - name: Gitignored paths must not be tracked
         run: |

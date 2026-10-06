@@ -82,3 +82,38 @@ Install with pinned versions from `constraints.txt`
 (`pip install -e . -c constraints.txt`), pin the container base image by digest,
 and run `pip-audit` in CI. `docs/` and CI should treat a secret-scanning failure
 as a blocking gate over the whole tree.
+
+### Vulnerability management
+
+Scanning is multi-layered and continuous (`.github/workflows/ci.yml`):
+
+- **Python dependencies** — `pip-audit -c constraints.txt` on every push/PR,
+  blocking.
+- **Container / OS packages** — a Trivy image scan, blocking on fixable
+  HIGH/CRITICAL findings, so base-image CVEs do not accumulate silently.
+- **Static analysis** — `bandit` (medium+) and `ruff`, blocking.
+- **Secrets** — `gitleaks`, blocking.
+- **Schedule** — the full workflow also runs daily (cron), so an advisory
+  published between commits is detected without waiting for the next push.
+
+**Risk ranking.** A finding's severity is its CVSS base severity, escalated by
+exploitability *in this workload*. A finding in a dependency that sits on the
+signing or password path is treated as **Critical regardless of CVSS**, because
+it can affect assertion/JWT integrity or credential handling directly. Those
+dependencies are: `cryptography` (JWT signing), `lxml` / `signxml` (SAML
+assertion signing), `bcrypt` (password hashing), and `pyotp` (TOTP).
+
+**Remediation SLAs** (from detection):
+
+| Severity | Deadline |
+|----------|----------|
+| Critical | 7 days (sooner if actively exploited) |
+| High     | 30 days |
+| Medium   | 90 days |
+| Low      | next regular maintenance window |
+
+**Triage.** A failed `pip-audit`/Trivy run is triaged by the project owner
+(**Topaz Bott**): confirm applicability to this workload, assign a severity per
+the ranking above, and either bump the pin in `constraints.txt` / the base-image
+digest or record a time-boxed, justified acceptance in the changelog. Dependabot
+PRs (`.github/dependabot.yml`) feed the same process weekly.

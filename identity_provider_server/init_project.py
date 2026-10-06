@@ -117,7 +117,10 @@ def run_init(data_dir: str) -> None:
     if users_path.exists():
         print(f"✓ Users file already exists: {users_path}")
     else:
-        users_path.write_text(_USERS_TEMPLATE)
+        # Seed the credential store 0600 (not world-readable) — it will hold
+        # bcrypt hashes and TOTP secrets (finding idp-20261003 F8).
+        from .app import _atomic_write_private
+        _atomic_write_private(users_path, _USERS_TEMPLATE)
         print(f"  ✓ Created: {users_path}")
 
     print()

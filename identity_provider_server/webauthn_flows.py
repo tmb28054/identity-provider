@@ -178,6 +178,36 @@ def meets_passwordless_minimum(user: dict[str, Any]) -> bool:
     return has_password(user) or has_totp(user)
 
 
+def _usable_factor_count(user: dict[str, Any]) -> int:
+    """Count the account's independent authentication factors."""
+    count = len(get_credentials(user))
+    if has_password(user):
+        count += 1
+    if has_totp(user):
+        count += 1
+    return count
+
+
+def may_remove_credential(user: dict[str, Any], credential_id: str) -> bool:
+    """Whether removing ``credential_id`` leaves a usable way to sign in.
+
+    Anti-lockout guard applied on the removal side of the factor transition
+    (finding idp-20261003 F4). Removing a credential the user does not have is
+    a no-op and allowed. Otherwise the post-removal state must still have at
+    least one usable factor (a password, a TOTP secret, or another passkey).
+    """
+    if find_credential(user, credential_id) is None:
+        return True
+    return _usable_factor_count(user) - 1 >= 1
+
+
+def may_remove_totp(user: dict[str, Any]) -> bool:
+    """Whether removing TOTP leaves a usable way to sign in (anti-lockout)."""
+    if not has_totp(user):
+        return True
+    return _usable_factor_count(user) - 1 >= 1
+
+
 # --- Challenge store --------------------------------------------------------
 
 

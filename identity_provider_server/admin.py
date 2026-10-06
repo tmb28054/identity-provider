@@ -5,7 +5,6 @@ Accessible at /admin to users with the 'idpadmin' claim.
 
 from __future__ import annotations
 
-import hmac
 import json
 import logging
 import secrets
@@ -21,7 +20,7 @@ from . import backup as bk
 from . import notify as _notify
 from . import webauthn_flows as wf
 from .services import is_valid_sp_path
-from .tokens import PURPOSE_ADMIN, issue_token, verify_token
+from .tokens import PURPOSE_ADMIN, issue_token, safe_compare, verify_token
 from .totp import verify_code
 
 logger = logging.getLogger(__name__)
@@ -147,7 +146,7 @@ ADMIN_PANEL = """
 <body>
 <div class="container">
   <h1>Admin Panel <a href="/admin" style="font-size:0.7rem;color:#0073bb;text-decoration:none;margin-left:1rem;">↻ Reload</a>
-  <a href="/admin/audit-log" style="font-size:0.7rem;color:#0073bb;text-decoration:none;margin-left:1rem;">Audit Log</a>
+  <a href="/admin/audit-log?auth_token={{ auth_token }}" style="font-size:0.7rem;color:#0073bb;text-decoration:none;margin-left:1rem;">Audit Log</a>
   <a href="/admin/backups" style="font-size:0.7rem;color:#0073bb;text-decoration:none;margin-left:1rem;">Backups</a></h1>
   {% if backup_failing %}<div style="background:#fde8e8;border:1px solid #f5b5b5;color:#d13212;padding:0.6rem 1rem;border-radius:6px;margin-bottom:1rem;font-size:0.85rem;font-weight:600;">⚠ The last backup failed. <a href="/admin/backups" style="color:#d13212;">View backups →</a></div>{% endif %}
   {% if message %}<p class="success">{{ message }}</p>{% endif %}
@@ -413,6 +412,25 @@ ADMIN_USER_DETAIL = """
     <div class="info-row"><span class="label">Email:</span> {{ user.get('email', '—') }}</div>
     <div class="info-row"><span class="label">MFA:</span> {{ 'Enabled' if user.get('totp_secret') else 'Disabled' }}</div>
     <div class="info-row"><span class="label">Claims:</span> {{ user.get('claims', [])|length }}</div>
+    <div class="info-row"><span class="label">Status:</span> {{ 'Disabled' if user.get('enabled') is false else 'Enabled' }}</div>
+    <div class="info-row"><span class="label">Last login:</span> {{ user.get('last_login', '—') }}</div>
+  </div>
+
+  <h2>Account Status</h2>
+  <div class="card">
+    <p style="font-size:0.85rem;color:#555;margin-bottom:0.75rem;">Suspend this account without deleting it. Disabling blocks every sign-in path and immediately revokes the account's active sessions.</p>
+    <form method="post" action="/admin">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="auth_token" value="{{ auth_token }}">
+      <input type="hidden" name="target_user" value="{{ user.username }}">
+      {% if user.get('enabled') is false %}
+      <input type="hidden" name="action" value="enable_user">
+      <button type="submit">Enable account</button>
+      {% else %}
+      <input type="hidden" name="action" value="disable_user">
+      <button type="submit" class="btn-danger">Disable account</button>
+      {% endif %}
+    </form>
   </div>
 
   <h2>Recovery Link</h2>
@@ -455,6 +473,9 @@ def register_admin_routes(
     validate_username_fn=None,
     validate_claim_fn=None,
     password_policy_fn=None,
+    account_locked_fn=None,
+    register_auth_failure_fn=None,
+    reset_auth_failures_fn=None,
     webauthn_rp=None,
     passkey_challenges=None,
     passkey_available_fn=None,
@@ -480,6 +501,30 @@ def register_admin_routes(
     def _rl_record(username: str = "") -> None:
         if rate_limiter:
             rate_limiter.record(_rl_key(username))
+
+    def _rl_acct_limited(username: str) -> bool:
+        """IP-independent per-account throttle (bounds a spray across many IPs)."""
+        return bool(rate_limiter and username) and rate_limiter.is_limited(
+            f"acct:{username}"
+        )
+
+    def _rl_acct_record(username: str) -> None:
+        if rate_limiter and username:
+            rate_limiter.record(f"acct:{username}")
+
+    def _account_locked(username: str) -> bool:
+        """Durable per-account lockout check (shared with the SP/user paths)."""
+        return bool(account_locked_fn) and bool(account_locked_fn(username))
+
+    def _register_auth_failure(username: str) -> None:
+        """Record a failed admin auth toward the durable per-account lockout."""
+        if register_auth_failure_fn and username:
+            register_auth_failure_fn(username)
+
+    def _reset_auth_failures(username: str) -> None:
+        """Clear the durable lockout counters after a successful admin login."""
+        if reset_auth_failures_fn and username:
+            reset_auth_failures_fn(username)
 
     def _csrf_token() -> str:
         return secrets.token_hex(32)
@@ -647,7 +692,10 @@ def register_admin_routes(
     def _save_recovery_tokens(tokens: dict[str, dict]) -> None:
         path = _recovery_tokens_path()
         if path:
-            path.write_text(json.dumps(tokens, indent=2) + "\n")
+            # Live reset credentials — write 0600 so they are not world-readable
+            # (finding idp-20261003 F8).
+            from .app import _atomic_write_private
+            _atomic_write_private(path, json.dumps(tokens, indent=2) + "\n")
 
     def _generate_recovery_token(username: str) -> str:
         """Generate a secure recovery token for a user. Returns the token string."""
@@ -792,7 +840,7 @@ def register_admin_routes(
         """Validate the CSRF double-submit token on a JSON passkey request."""
         form_token = payload.get("csrf_token", "")
         cookie_token = request.cookies.get("csrf_token", "")
-        return bool(form_token) and hmac.compare_digest(str(form_token), cookie_token)
+        return bool(form_token) and safe_compare(str(form_token), cookie_token)
 
     @app.post("/admin/passkey/begin")
     def admin_passkey_begin():
@@ -907,7 +955,7 @@ def register_admin_routes(
     def admin_post():
         form_token = request.form.get("csrf_token", "")
         cookie_token = request.cookies.get("csrf_token", "")
-        if not form_token or not hmac.compare_digest(form_token, cookie_token):
+        if not form_token or not safe_compare(form_token, cookie_token):
             token = _csrf_token()
             question, ch_hash = make_challenge_fn()
             resp = app.make_response(render_template_string(
@@ -921,8 +969,18 @@ def register_admin_routes(
 
         if action == "login":
             login_username = request.form.get("username", "")
-            # Throttle admin credential guessing (per IP and per account).
-            if _rl_limited() or (login_username and _rl_limited(login_username)):
+            # Throttle admin credential guessing: per IP, per composite key,
+            # the IP-independent per-account bucket, AND the durable lockout —
+            # so the idpadmin password cannot be guessed by pacing under the
+            # window or by rotating the source IP (finding idp-20261003 F6).
+            if (
+                _rl_limited()
+                or (login_username and _rl_limited(login_username))
+                or _rl_acct_limited(login_username)
+                or _account_locked(login_username)
+            ):
+                # Count the throttled attempt toward the durable lockout too.
+                _register_auth_failure(login_username)
                 if audit_logger:
                     audit_logger.log(
                         username=login_username,
@@ -983,6 +1041,8 @@ def register_admin_routes(
             )
             if not account_usable or not check_password_fn(user["password"], password):
                 _rl_record(username)
+                _rl_acct_record(username)  # IP-independent per-account bucket
+                _register_auth_failure(username)  # durable lockout counter
                 if audit_logger:
                     audit_logger.log(
                         username=username,
@@ -1035,6 +1095,8 @@ def register_admin_routes(
             if user.get("totp_secret"):  # noqa: SIM102 - kept nested for auth-flow clarity
                 if not totp_code or not verify_code(user["totp_secret"], totp_code):
                     _rl_record(username)
+                    _rl_acct_record(username)
+                    _register_auth_failure(username)  # durable lockout counter
                     if audit_logger:
                         audit_logger.log(
                             username=username,
@@ -1076,6 +1138,7 @@ def register_admin_routes(
                 resp.set_cookie("csrf_token", token, httponly=True, samesite="Strict")
                 return resp, 403
 
+            _reset_auth_failures(username)  # clear durable lockout on success
             auth_token = _issue_token(username)
             if audit_logger:
                 audit_logger.log(
@@ -1169,6 +1232,30 @@ def register_admin_routes(
                 return _render_panel(auth_token, message=f"User '{target}' deleted.")
             return _render_panel(auth_token, error=f"User '{target}' not found.")
 
+        elif action in ("disable_user", "enable_user"):
+            # Non-destructive account suspension (finding idp-20261003 F11):
+            # flip the `enabled` flag that every login path already honours,
+            # preserving the account record (unlike delete_user) and revoking
+            # the target's live sessions via the epoch bump.
+            target = request.form.get("target_user", "")
+            if target == admin_user and action == "disable_user":
+                return _render_panel(auth_token, error="Cannot disable yourself.")
+            user = users.get(target)
+            if not user:
+                return _render_panel(auth_token, error=f"User '{target}' not found.")
+            if action == "disable_user":
+                user["enabled"] = False
+                _bump_session_epoch(target)  # revoke live sessions immediately
+                verb = "disabled"
+            else:
+                user["enabled"] = True
+                verb = "enabled"
+            if users_path:
+                save_users_fn(users_path, users)
+            logger.info("Admin %s %s user %s", admin_user, verb, target)
+            _audit_admin(admin_user, action, target)
+            return _render_panel(auth_token, message=f"User '{target}' {verb}.")
+
         elif action == "reset_password":
             target = request.form.get("target_user", "")
             new_pw = request.form.get("new_pw", "")
@@ -1202,6 +1289,9 @@ def register_admin_routes(
             if not user:
                 return _render_panel(auth_token, error=f"User '{target}' not found.")
             user.pop("totp_secret", None)
+            # Removing a factor must revoke the target's live sessions, matching
+            # reset_password / set_claims (finding idp-20261003 F7).
+            _bump_session_epoch(target)
             if users_path:
                 save_users_fn(users_path, users)
             logger.info("Admin %s removed MFA for %s", admin_user, target)
@@ -1505,21 +1595,18 @@ def register_admin_routes(
 
     @app.get("/admin/audit-log")
     def admin_audit_log_get():
-        # Check session cookie
-        if verify_session_cookie_fn:
-            session_user = verify_session_cookie_fn(
-                request.cookies.get("idp_session", ""),
-            )
-            if _admin_session_ok(session_user):
-                entries = []
-                if audit_logger:
-                    entries = audit_logger.read_recent(500)
-                    _audit_admin(session_user, "read_audit_log")
-                return render_template_string(
-                    ADMIN_AUDIT_LOG, entries=entries,
-                )
-        # No session — redirect to admin login
-        return app.redirect("/admin")
+        # The audit log is the most PII-dense read in the panel, so it requires
+        # a step-up token (the same gate as state-changing actions), not merely
+        # a session cookie (finding idp-20261003 F9). The panel link carries the
+        # current auth_token.
+        admin_user = _require_admin(request.args.get("auth_token", ""))
+        if not admin_user:
+            return app.redirect("/admin")
+        entries = []
+        if audit_logger:
+            entries = audit_logger.read_recent(500)
+            _audit_admin(admin_user, "read_audit_log")
+        return render_template_string(ADMIN_AUDIT_LOG, entries=entries)
 
     # --- Backups page ---
     ADMIN_BACKUPS = """
@@ -1747,7 +1834,7 @@ def register_admin_routes(
     def admin_backups_post():
         form_token = request.form.get("csrf_token", "")
         cookie_token = request.cookies.get("csrf_token", "")
-        if not form_token or not hmac.compare_digest(form_token, cookie_token):
+        if not form_token or not safe_compare(form_token, cookie_token):
             return app.redirect("/admin")
 
         auth_token = request.form.get("auth_token", "")
@@ -1899,7 +1986,7 @@ def register_admin_routes(
             return app.redirect("/admin")
         form_token = request.form.get("csrf_token", "")
         cookie_token = request.cookies.get("csrf_token", "")
-        if not form_token or not hmac.compare_digest(form_token, cookie_token):
+        if not form_token or not safe_compare(form_token, cookie_token):
             return app.redirect("/admin")
 
         auth_token = request.form.get("auth_token", "")
