@@ -1508,8 +1508,9 @@ def create_app(
                         claims=user.get("claims", []),
                         email=user.get("email"),
                     )
-                    separator = "&" if "?" in sp.url else "?"
-                    resp = app.make_response(redirect(f"{sp.url}{separator}token={token}"))
+                    # Deliver the JWT in the URL fragment so it never reaches
+                    # server access logs or the Referer header (idp-20261006 F2).
+                    resp = app.make_response(redirect(f"{sp.url}#token={token}"))
                     # Slide the idle window but keep the absolute-cap anchor.
                     _set_session_cookie(resp, session_user, auth_time=session_auth_time)
                     return resp
@@ -1711,8 +1712,9 @@ def create_app(
                     claims=users.get(username, {}).get("claims", []),
                     email=users.get(username, {}).get("email"),
                 )
-                separator = "&" if "?" in sp.url else "?"
-                resp = redirect(f"{sp.url}{separator}token={token}")
+                # Deliver the JWT in the URL fragment so it never reaches
+                # server access logs or the Referer header (idp-20261006 F2).
+                resp = redirect(f"{sp.url}#token={token}")
                 _set_session_cookie(resp, username)
                 return resp
             else:
@@ -1926,8 +1928,9 @@ def create_app(
                 claims=users.get(username, {}).get("claims", []),
                 email=users.get(username, {}).get("email"),
             )
-            separator = "&" if "?" in sp.url else "?"
-            resp = app.make_response(redirect(f"{sp.url}{separator}token={token}"))
+            # Deliver the JWT in the URL fragment so it never reaches
+            # server access logs or the Referer header (idp-20261006 F2).
+            resp = app.make_response(redirect(f"{sp.url}#token={token}"))
             # Establish the SSO session cookie here too — the MFA-ticket and
             # passkey paths already do, and omitting it on the no-MFA path was a
             # known inconsistency that broke SSO for password-only accounts.
@@ -2902,8 +2905,9 @@ def create_app(
                 claims=users.get(username, {}).get("claims", []),
                 email=users.get(username, {}).get("email"),
             )
-            separator = "&" if "?" in sp.url else "?"
-            resp = jsonify({"redirect": f"{sp.url}{separator}token={token}"})
+            # Deliver the JWT in the URL fragment so it never reaches
+            # server access logs or the Referer header (idp-20261006 F2).
+            resp = jsonify({"redirect": f"{sp.url}#token={token}"})
             _set_session_cookie(resp, username)
             return resp
         sp_acs_url = sp.url if sp else ACS_URL

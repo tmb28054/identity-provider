@@ -147,7 +147,11 @@ ADMIN_PANEL = """
 <body>
 <div class="container">
   <h1>Admin Panel <a href="/admin" style="font-size:0.7rem;color:#0073bb;text-decoration:none;margin-left:1rem;">↻ Reload</a>
-  <a href="/admin/audit-log?auth_token={{ auth_token }}" style="font-size:0.7rem;color:#0073bb;text-decoration:none;margin-left:1rem;">Audit Log</a>
+  <form method="post" action="/admin/audit-log" style="display:inline;margin-left:1rem;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="auth_token" value="{{ auth_token }}">
+    <button type="submit" style="background:none;border:none;padding:0;font-size:0.7rem;color:#0073bb;text-decoration:none;cursor:pointer;">Audit Log</button>
+  </form>
   <a href="/admin/backups" style="font-size:0.7rem;color:#0073bb;text-decoration:none;margin-left:1rem;">Backups</a></h1>
   {% if backup_failing %}<div style="background:#fde8e8;border:1px solid #f5b5b5;color:#d13212;padding:0.6rem 1rem;border-radius:6px;margin-bottom:1rem;font-size:0.85rem;font-weight:600;">⚠ The last backup failed. <a href="/admin/backups" style="color:#d13212;">View backups →</a></div>{% endif %}
   {% if message %}<p class="success">{{ message }}</p>{% endif %}
@@ -1627,20 +1631,23 @@ def register_admin_routes(
 </html>
 """
 
-    @app.get("/admin/audit-log")
-    def admin_audit_log_get():
+    @app.post("/admin/audit-log")
+    def admin_audit_log_post():
         # The audit log is the most PII-dense read in the panel, so it requires
         # a step-up token (the same gate as state-changing actions), not merely
-        # a session cookie (finding idp-20261003 F9). The panel link carries the
-        # current auth_token.
-        admin_user = _require_admin(request.args.get("auth_token", ""))
+        # a session cookie (finding idp-20261003 F9). The step-up token is
+        # submitted in the POST body (not the URL query string) so it is never
+        # written to the gunicorn access log (finding idp-20261006 F2).
+        admin_user = _require_admin(request.form.get("auth_token", ""))
         if not admin_user:
             return app.redirect("/admin")
         entries = []
         if audit_logger:
             entries = audit_logger.read_recent(500)
             _audit_admin(admin_user, "read_audit_log")
-        return render_template_string(ADMIN_AUDIT_LOG, entries=entries)
+        resp = app.make_response(render_template_string(ADMIN_AUDIT_LOG, entries=entries))
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
 
     # --- Backups page ---
     ADMIN_BACKUPS = """

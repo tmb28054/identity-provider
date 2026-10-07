@@ -97,7 +97,64 @@ def test_oauth_login_no_mfa(tmp_path):
         "challenge_answer": ans, "challenge_hash": ch,
     })
     assert resp.status_code == 302
-    assert "token=" in resp.headers["Location"]
+    _assert_fragment_token(resp.headers["Location"])
+
+
+def _assert_fragment_token(location: str) -> None:
+    """Assert the OAuth JWT is delivered in a URL fragment, not a query string.
+
+    Keeping the bearer token out of the query string stops it being written to
+    gunicorn access logs or leaked via the Referer header (idp-20261006 F2).
+    """
+    assert "#token=" in location
+    assert "?token=" not in location
+    assert "&token=" not in location
+
+
+@pytest.mark.smoke
+def test_oauth_login_delivers_token_in_fragment(tmp_path):
+    """Smoke: password-only OAuth login hands the JWT back in a URL fragment."""
+    app = _write_app(
+        tmp_path,
+        [{"username": "bob", "password": _hash(), "roles": [], "claims": ["dev"],
+          "email": "b@e.com"}],
+        services={"oauth": {"wiki": {"url": "https://wiki.example/cb",
+                                     "token_expiry_minutes": 60}}},
+    )
+    client = app.test_client()
+    form = client.get("/wiki")
+    ans, ch = _solve(form.data)
+    resp = client.post("/wiki", data={
+        "username": "bob", "password": PW, "csrf_token": _csrf(form.data),
+        "challenge_answer": ans, "challenge_hash": ch,
+    })
+    assert resp.status_code == 302
+    _assert_fragment_token(resp.headers["Location"])
+
+
+def test_oauth_fragment_preserved_for_url_with_query(tmp_path):
+    """Even when the SP callback URL has a query string, the token stays in the
+    fragment (never appended as another query parameter) (F2)."""
+    app = _write_app(
+        tmp_path,
+        [{"username": "bob", "password": _hash(), "roles": [], "claims": ["dev"],
+          "email": "b@e.com"}],
+        services={"oauth": {"wiki": {"url": "https://wiki.example/cb?rp=1",
+                                     "token_expiry_minutes": 60}}},
+    )
+    client = app.test_client()
+    form = client.get("/wiki")
+    ans, ch = _solve(form.data)
+    resp = client.post("/wiki", data={
+        "username": "bob", "password": PW, "csrf_token": _csrf(form.data),
+        "challenge_answer": ans, "challenge_hash": ch,
+    })
+    assert resp.status_code == 302
+    location = resp.headers["Location"]
+    assert "#token=" in location
+    assert "&token=" not in location
+    # The SP's own query string is untouched; only our token moved to the frag.
+    assert location.split("#", 1)[0] == "https://wiki.example/cb?rp=1"
 
 
 # --- SP login: MFA via single-use ticket ------------------------------------
@@ -146,7 +203,7 @@ def test_oauth_login_with_mfa_ticket(tmp_path):
         "totp_code": pyotp.TOTP(secret).now(),
     })
     assert resp.status_code == 302
-    assert "token=" in resp.headers["Location"]
+    _assert_fragment_token(resp.headers["Location"])
 
 
 def test_mfa_ticket_wrong_code_rerenders(tmp_path):
@@ -273,6 +330,8 @@ def test_session_reuse_oauth(tmp_path):
                       domain="localhost")
     resp = client.get("/wiki")
     assert resp.status_code == 302
+    # SSO short-circuit GET must also deliver the JWT in the fragment (F2).
+    _assert_fragment_token(resp.headers["Location"])
 
 
 # --- forced password change --------------------------------------------------
@@ -1437,7 +1496,7 @@ def test_passkey_oauth_issuance(tmp_path):
     assert _pk_register(client, device, auth_token, csrf).status_code == 200
     finish = _pk_authenticate(client, device, "/wiki")
     assert finish.status_code == 200
-    assert "token=" in finish.get_json()["redirect"]
+    _assert_fragment_token(finish.get_json()["redirect"])
     assert "idp_session" in finish.headers.get("Set-Cookie", "")
 
 

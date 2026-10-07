@@ -24,6 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   account's last epoch. `_user_session_epoch` returns the max of the live record
   epoch and the tombstone, so a stale cookie for a deleted-then-recreated
   username no longer re-authenticates as the new principal.
+- **Bearer tokens kept out of logged URLs** (Medium, F2): the admin audit-log
+  link is now a POST form carrying the step-up token in the request body, and
+  `GET /admin/audit-log` returns 405, so the 1-hour token is no longer written
+  to the gunicorn access log. The audit-log response now sets
+  `Cache-Control: no-store, no-cache, must-revalidate, max-age=0`. The OAuth
+  RS256 JWT is delivered via a URL fragment (`#token=`) instead of a query
+  string at all four redirect sites (SSO short-circuit GET, MFA tail, password
+  tail, passkey JSON), keeping it out of access logs and the Referer header.
+  The SAML auto-POST delivery path is unchanged.
 
 ### Security (code review idp-20261003)
 

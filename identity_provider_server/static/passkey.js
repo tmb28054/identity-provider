@@ -260,6 +260,8 @@
           username: username,
         });
         if (result.redirect) {
+          // result.redirect is a full URL already containing any #token
+          // fragment (OAuth), so assigning it directly still works unchanged.
           window.location.href = result.redirect;
         } else if (result.html) {
           document.open();

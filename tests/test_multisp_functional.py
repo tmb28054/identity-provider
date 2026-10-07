@@ -116,7 +116,10 @@ def test_oauth_sp_redirects_with_token():
         assert resp.status_code == 302
         location = resp.headers["Location"]
         assert location.startswith("https://docs.example.com/")
-        assert "token=" in location
+        # The JWT must ride in the URL fragment, not the query string (F2).
+        assert "#token=" in location
+        assert "?token=" not in location
+        assert "&token=" not in location
     finally:
         shutil.rmtree(tmp)
 

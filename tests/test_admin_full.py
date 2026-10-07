@@ -833,16 +833,40 @@ def test_generate_recovery_prunes_expired(tmp_path):
 def test_audit_log_page(tmp_path):
     app = _make_app(tmp_path)
     client = _client(app)
-    # The audit log now requires a step-up token (not just the session cookie).
-    panel = client.get("/admin").data.decode()
-    auth = re.search(r'name="auth_token" value="([^"]+)"', panel).group(1)
-    resp = client.get(f"/admin/audit-log?auth_token={auth}")
+    # The audit log now requires a step-up token delivered in the POST body
+    # (never in the query string) so it is not written to access logs (F2).
+    csrf, auth = _tokens(client)
+    resp = client.post(
+        "/admin/audit-log", data={"csrf_token": csrf, "auth_token": auth}
+    )
     assert resp.status_code == 200
+
+
+def test_audit_log_response_is_cache_suppressed(tmp_path):
+    """The PII-dense audit-log response must not be cached (F2)."""
+    app = _make_app(tmp_path)
+    client = _client(app)
+    csrf, auth = _tokens(client)
+    resp = client.post(
+        "/admin/audit-log", data={"csrf_token": csrf, "auth_token": auth}
+    )
+    assert resp.status_code == 200
+    assert resp.headers["Cache-Control"] == (
+        "no-store, no-cache, must-revalidate, max-age=0"
+    )
+
+
+def test_audit_log_get_not_allowed(tmp_path):
+    """GET is no longer a valid method; the token must come via POST body (F2)."""
+    app = _make_app(tmp_path)
+    client = _client(app)
+    resp = client.get("/admin/audit-log")
+    assert resp.status_code == 405
 
 
 def test_audit_log_no_session_redirects(tmp_path):
     app = _make_app(tmp_path)
-    resp = app.test_client().get("/admin/audit-log")
+    resp = app.test_client().post("/admin/audit-log")
     assert resp.status_code in (301, 302)
 
 
@@ -850,7 +874,7 @@ def test_audit_log_session_cookie_without_stepup_redirects(tmp_path):
     """A session cookie alone (no step-up token) no longer suffices (F9)."""
     app = _make_app(tmp_path)
     client = _client(app)
-    resp = client.get("/admin/audit-log")
+    resp = client.post("/admin/audit-log")
     assert resp.status_code in (301, 302)
 
 
