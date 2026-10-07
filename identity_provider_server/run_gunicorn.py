@@ -135,6 +135,7 @@ def main() -> None:
         provider_name=config.saml.provider_name,
         session_duration_hours=config.saml.session_duration_hours,
         secret_key=config.security.secret_key or None,
+        audit_chain_key=config.security.audit_chain_key,
         rate_limit_max_attempts=config.security.rate_limit_max_attempts,
         rate_limit_window_seconds=config.security.rate_limit_window_seconds,
         users_file=config.data.users_file,

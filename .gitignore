@@ -2,6 +2,7 @@
 data/idp.key
 data/users.json
 data/audit.log
+data/audit_chain.key
 data/backup_config.json
 data/recovery_tokens.json
 data/backup_status.json

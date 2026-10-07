@@ -37,6 +37,7 @@ _DEFAULTS: dict[str, Any] = {
     },
     "security": {
         "secret_key": "",  # nosec B105
+        "audit_chain_key": "",  # nosec B105
         "rate_limit_max_attempts": 5,
         "rate_limit_window_seconds": 60,
     },
@@ -80,6 +81,7 @@ class LoggingConfig:
 @dataclass
 class SecurityConfig:
     secret_key: str = ""
+    audit_chain_key: str = ""
     rate_limit_max_attempts: int = 5
     rate_limit_window_seconds: int = 60
 
@@ -172,7 +174,8 @@ def _apply_env_overrides(config: dict) -> dict:
         IDP_PROVIDER_NAME, IDP_SESSION_DURATION_HOURS,
         IDP_USERS_FILE, IDP_CERTIFICATE_FILE, IDP_PRIVATE_KEY_FILE,
         IDP_LOG_LEVEL,
-        SECRET_KEY, IDP_RATE_LIMIT_MAX_ATTEMPTS, IDP_RATE_LIMIT_WINDOW_SECONDS
+        SECRET_KEY, IDP_AUDIT_CHAIN_KEY,
+        IDP_RATE_LIMIT_MAX_ATTEMPTS, IDP_RATE_LIMIT_WINDOW_SECONDS
     """
     env_map = {
         "IDP_HOST": ("server", "host"),
@@ -186,6 +189,7 @@ def _apply_env_overrides(config: dict) -> dict:
         "IDP_PRIVATE_KEY_FILE": ("data", "private_key_file"),
         "IDP_LOG_LEVEL": ("logging", "level"),
         "SECRET_KEY": ("security", "secret_key"),
+        "IDP_AUDIT_CHAIN_KEY": ("security", "audit_chain_key"),
         "IDP_RATE_LIMIT_MAX_ATTEMPTS": ("security", "rate_limit_max_attempts"),
         "IDP_RATE_LIMIT_WINDOW_SECONDS": ("security", "rate_limit_window_seconds"),
         "IDP_WEBAUTHN_ENABLED": ("webauthn", "enabled"),

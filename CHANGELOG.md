@@ -18,6 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `validate_archive` now rejects members whose mode carries setuid, setgid,
   sticky, group/other-write, or other-execute bits; and `restore_archive`
   extracts with the tarfile `data` filter. See review idp-2026-10-06, Finding 1.
+- **Audit-log hash chain independently keyed and verified** (Medium, F4): the
+  per-record hash chain is now keyed by a dedicated `IDP_AUDIT_CHAIN_KEY`
+  (config `security.audit_chain_key`) or a stable, auto-created `0600`
+  `data/audit_chain.key`, never `app.secret_key`, so the chain stays verifiable
+  across restarts and secret rotation. A new `AuditChainKeyError` fails closed
+  if no stable key can be established. `verify_chain` now runs at startup
+  (firing a `critical` `audit_chain_invalid` notification on failure) and on
+  every admin audit-log render (showing an in-page integrity banner on
+  failure). The stdout AUDIT mirror is redacted — the User-Agent is replaced
+  with a short sha256 digest and the username is truncated — while the on-disk
+  record and hash chain are byte-for-byte unchanged. `docs/security.md` now
+  states a concrete 12-month retention (3 months hot) and the operator's
+  rotation/WORM responsibilities; `docs/configuration.md` documents
+  `IDP_AUDIT_CHAIN_KEY`. The in-memory chain cursor remains per-process
+  (single-worker topology); externalising chain state is out of scope.
 - **X-Forwarded-For trust made opt-in** (Medium, F3): `create_app`'s
   `trust_proxy` now defaults to `False` and is wired through a new
   `server.trust_proxy` config field / `IDP_TRUST_PROXY` env var (threaded via

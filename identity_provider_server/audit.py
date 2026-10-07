@@ -31,6 +31,49 @@ AUDIT_LOG_FILENAME = "audit.log"
 # Genesis value for the per-record hash chain (first record's prev_hash).
 _CHAIN_GENESIS = "0" * 64
 
+# Keep only this many leading characters of a username in the stdout mirror.
+_USERNAME_PREFIX_LEN = 3
+
+
+def _redact_username(username: str) -> str:
+    """Return a truncated, length-tagged form of ``username`` for stdout.
+
+    Keeps the first few characters plus the total length so an operator can
+    correlate entries without the full identifier being duplicated into the
+    stdout sink. Empty input is passed through unchanged.
+
+    Args:
+        username: The full username from the on-disk record.
+
+    Returns:
+        A redacted form such as ``"ali…(5)"`` for ``"alice"``; ``""`` stays
+        ``""``.
+    """
+    if not username:
+        return ""
+    if len(username) <= _USERNAME_PREFIX_LEN:
+        return f"{username}…({len(username)})"
+    return f"{username[:_USERNAME_PREFIX_LEN]}…({len(username)})"
+
+
+def _hash_user_agent(user_agent: str) -> str:
+    """Return a short sha256 digest of ``user_agent`` for stdout.
+
+    The full User-Agent can carry identifying detail, so the stdout mirror
+    records only a short digest (prefixed ``sha256:``) that still lets an
+    operator group identical clients. Empty input is passed through unchanged.
+
+    Args:
+        user_agent: The full User-Agent string from the on-disk record.
+
+    Returns:
+        ``""`` for empty input, else ``"sha256:<first 12 hex chars>"``.
+    """
+    if not user_agent:
+        return ""
+    digest = hashlib.sha256(user_agent.encode()).hexdigest()
+    return f"sha256:{digest[:12]}"
+
 
 @dataclass
 class AuditEntry:
@@ -178,10 +221,17 @@ class AuditLogger:
                     logger.exception("Audit failure callback raised")
             return
         # Mirror off-host via stdout (collected by the container/systemd layer)
-        # so the local file is not the only copy.
+        # so the local file is not the only copy. The stdout mirror is REDACTED
+        # (User-Agent hashed, username truncated) to avoid duplicating full PII
+        # into a second, often less-protected sink; the on-disk record above and
+        # the hash chain are byte-for-byte unchanged (F4).
         if self._mirror_stdout:
+            redacted = dict(payload)
+            redacted["username"] = _redact_username(entry.username)
+            redacted["user_agent"] = _hash_user_agent(entry.user_agent)
+            mirror_line = json.dumps(redacted, separators=(",", ":"))
             try:
-                sys.stdout.write("AUDIT " + line + "\n")
+                sys.stdout.write("AUDIT " + mirror_line + "\n")
                 sys.stdout.flush()
             except (OSError, ValueError):  # pragma: no cover - stdout closed
                 pass

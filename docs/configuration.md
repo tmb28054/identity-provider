@@ -43,6 +43,7 @@ logging:
 # Security
 security:
   secret_key: ""                   # Flask CSRF secret. Empty = auto-generate.
+  audit_chain_key: ""              # Audit-log hash-chain key. Empty = stable data/audit_chain.key.
   rate_limit_max_attempts: 5       # Failed logins before rate limiting
   rate_limit_window_seconds: 60    # Rate limit window
 
@@ -86,6 +87,7 @@ Environment variables override config file values. Useful for injecting secrets 
 | `IDP_PRIVATE_KEY_FILE` | `data.private_key_file` | Path to private key |
 | `IDP_LOG_LEVEL` | `logging.level` | Log level |
 | `SECRET_KEY` | `security.secret_key` | Flask CSRF secret key |
+| `IDP_AUDIT_CHAIN_KEY` | `security.audit_chain_key` | Dedicated key for the audit-log hash chain. Empty = a stable per-deployment key is read from (or created in) `data/audit_chain.key`. Never derived from `SECRET_KEY`, so the chain stays verifiable across restarts and secret rotation. |
 | `IDP_RATE_LIMIT_MAX_ATTEMPTS` | `security.rate_limit_max_attempts` | Rate limit threshold |
 | `IDP_RATE_LIMIT_WINDOW_SECONDS` | `security.rate_limit_window_seconds` | Rate limit window |
 | `IDP_WEBAUTHN_ENABLED` | `webauthn.enabled` | `true`/`false` — enable passkeys |
@@ -240,6 +242,7 @@ All data files live in a single directory (default: `./data`, configurable via `
 | `adfs_config.yaml` | ADFS/LDAP connection settings (ADFS auth mode) |
 | `idp.crt` | PEM-encoded X.509 signing certificate (public) |
 | `idp.key` | PEM-encoded RSA private key — keep secret |
+| `audit_chain.key` | Audit-log hash-chain key (0600) — auto-created if `IDP_AUDIT_CHAIN_KEY` is unset; keep secret |
 
 File paths in `config.yaml` can be relative (resolved against the data directory) or absolute.
 

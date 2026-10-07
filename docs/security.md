@@ -14,7 +14,7 @@ findings and their fixes).
 | Recovery tokens | `data/recovery_tokens.json` | Secret | 384-bit random, single-use, 24 h expiry | Pruned on expiry/use |
 | Backup SMB credentials | `data/backup_config.json` | Secret | 0600 on disk | Until reconfigured |
 | Session / admin / step-up tokens | Cookies + hidden fields (transient) | Confidential | HMAC-signed, purpose-scoped, per-purpose key, short TTL | Seconds–hours |
-| Access audit log | `data/audit.log` | Confidential (PII: usernames, IPs) | Append-only file; centralise + rotate in prod | Per retention policy |
+| Access audit log | `data/audit.log` | Confidential (PII: usernames, IPs) | Append-only, hash-chained (keyed by `IDP_AUDIT_CHAIN_KEY`); centralise + rotate in prod | 12 months; most recent 3 months immediately queryable |
 | Personal data (username, email) | `data/users.json` | Confidential (PII) | Same as user records | Until account removed |
 
 Personal data handled: usernames, email addresses, source IPs, and AD group
@@ -61,13 +61,42 @@ alert on clock drift. In Kubernetes, rely on the node's time sync.
 
 ### Log protection and monitoring
 
-`data/audit.log` is append-only JSON. In production:
+`data/audit.log` is append-only JSON, with each record linked to the previous
+one by a keyed hash chain (see "Audit-log integrity" below). In production:
 
 - Ship it to a central, access-controlled log store (tamper-evidence).
 - Rotate locally (e.g. `logrotate`) to bound disk use.
 - Alert on: repeated `rate_limited` / `invalid_credentials`, any `mutation`
   event granting `idpadmin` (`grant_idpadmin`), `restore` events, and backup
   failures.
+
+**Retention.** Retain audit records for **12 months**. Keep at least the most
+recent **3 months immediately queryable** (hot); older records may be moved to
+cheaper, slower storage so long as they remain retrievable within the retention
+window. Local rotation and forwarding to an **external append-only (WORM)**
+store are the **operator's responsibility** — the application only writes and
+hash-chains the local file; it does not rotate, expire, or forward it.
+
+### Audit-log integrity
+
+Each record carries a keyed `entry_hash` over its own body plus the previous
+record's hash, so any truncation or in-place rewrite is detectable by
+re-walking the chain. The chain is keyed by a **dedicated** key, resolved
+independently of the Flask `SECRET_KEY`:
+
+- `IDP_AUDIT_CHAIN_KEY` if set, otherwise
+- a stable per-deployment key stored 0600 at `data/audit_chain.key` (created on
+  first start).
+
+Keying the chain separately keeps the log verifiable across restarts and secret
+rotation. The chain is verified at startup (a failure fires a `critical`
+`audit_chain_invalid` notification) and on every admin audit-log render (a
+failure shows an in-page integrity banner). If the key cannot be established the
+app fails closed rather than auditing on an ephemeral key.
+
+The in-memory sequence/last-hash cursor is **per-process**: a verifiable chain
+assumes the documented **single-worker** topology. Running multiple workers over
+one file would require externalising chain state and is out of scope.
 
 ### Signing-key and certificate rotation
 

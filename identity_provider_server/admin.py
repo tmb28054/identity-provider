@@ -1597,6 +1597,12 @@ def register_admin_routes(
 <div class="container">
   <a href="/admin" class="back-link">&larr; Back to Admin Panel</a>
   <h1>Access Audit Log</h1>
+  {% if not chain_ok %}
+  <div style="background:#fde8e8;border:1px solid #f5b5b5;color:#d13212;padding:0.6rem 1rem;border-radius:6px;margin-bottom:1rem;font-size:0.85rem;font-weight:600;">
+    &#9888; Audit log integrity check FAILED &mdash; the hash chain does not
+    verify. The log may have been truncated or altered. Investigate immediately
+    and consult the off-host copy.</div>
+  {% endif %}
   <p class="count">Showing {{ entries|length }} most recent entries</p>
   <div class="card">
     <table>
@@ -1642,10 +1648,15 @@ def register_admin_routes(
         if not admin_user:
             return app.redirect("/admin")
         entries = []
+        # Re-verify the hash chain on every render so an operator viewing the
+        # log is warned in-band if it was truncated or rewritten (F4).
+        chain_ok = audit_logger.verify_chain() if audit_logger else True
         if audit_logger:
             entries = audit_logger.read_recent(500)
             _audit_admin(admin_user, "read_audit_log")
-        resp = app.make_response(render_template_string(ADMIN_AUDIT_LOG, entries=entries))
+        resp = app.make_response(
+            render_template_string(ADMIN_AUDIT_LOG, entries=entries, chain_ok=chain_ok)
+        )
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
 

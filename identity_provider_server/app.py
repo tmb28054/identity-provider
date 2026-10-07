@@ -947,6 +947,67 @@ def _resolve_secret_key(secret_key: str | None) -> str:
     return secrets.token_hex(32)
 
 
+AUDIT_CHAIN_KEY_FILENAME = "audit_chain.key"
+
+
+class AuditChainKeyError(RuntimeError):
+    """Raised when a stable audit-log chain key cannot be established.
+
+    The audit hash chain must be keyed with a value that survives restarts; if
+    it were keyed with an ephemeral secret the chain could never be verified
+    after a restart. We fail closed rather than silently auditing on a key that
+    disappears, so this is raised when no key is supplied and a persistent key
+    file cannot be read or created (e.g. the data dir is not writable).
+    """
+
+
+def _resolve_audit_chain_key(audit_chain_key: str | None, data_dir: Path) -> str:
+    """Resolve the dedicated audit-log hash-chain key, failing closed.
+
+    Resolution:
+      * If a value is supplied (argument or ``IDP_AUDIT_CHAIN_KEY`` env), use it
+        verbatim.
+      * Otherwise establish a STABLE per-deployment key by reading an existing
+        ``data / audit_chain.key`` or creating it (0600, ``secrets.token_hex``).
+
+    The resolved key is deliberately independent of ``app.secret_key`` so the
+    audit chain stays verifiable even when the Flask secret rotates or is
+    ephemeral.
+
+    Args:
+        audit_chain_key: The explicitly-passed key, if any.
+        data_dir: The resolved data directory holding the persistent key file.
+
+    Returns:
+        A stable chain-key string.
+
+    Raises:
+        AuditChainKeyError: If no key is supplied and a persistent key file can
+            neither be read nor created.
+    """
+    supplied = audit_chain_key or os.environ.get("IDP_AUDIT_CHAIN_KEY")
+    if supplied:
+        return supplied
+    key_path = Path(data_dir) / AUDIT_CHAIN_KEY_FILENAME
+    try:
+        if key_path.exists():
+            existing = key_path.read_text().strip()
+            if existing:
+                return existing
+        key = secrets.token_hex(32)
+        # Create 0600 before any secret bytes land so it is never readable.
+        fd = os.open(key_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(key)
+        return key
+    except OSError as exc:
+        raise AuditChainKeyError(
+            "Could not establish a stable audit-log chain key: set "
+            "IDP_AUDIT_CHAIN_KEY or make the data directory writable so "
+            f"{AUDIT_CHAIN_KEY_FILENAME} can be created ({exc})."
+        ) from exc
+
+
 def _atomic_write_private(path: Path, text: str) -> None:
     """Write ``text`` to ``path`` as mode 0600, atomically.
 
@@ -977,6 +1038,7 @@ def create_app(
     provider_name: str = "local-idp",
     session_duration_hours: int = 1,
     secret_key: str | None = None,
+    audit_chain_key: str = "",
     rate_limit_max_attempts: int = 5,
     rate_limit_window_seconds: int = 60,
     users_file: str = "users.json",
@@ -1001,6 +1063,10 @@ def create_app(
         provider_name: SAML provider name registered in AWS IAM.
         session_duration_hours: SAML assertion validity in hours (1–12).
         secret_key: Flask secret key for CSRF tokens. Auto-generated if None.
+        audit_chain_key: Dedicated key for the audit-log hash chain. When empty,
+            a stable per-deployment key is read from (or created in)
+            ``data_dir/audit_chain.key``; it is never derived from secret_key so
+            the chain stays verifiable across restarts and secret rotation.
         rate_limit_max_attempts: Max failed login attempts per IP before limiting.
         rate_limit_window_seconds: Rate limit window in seconds.
         users_file: Filename or path to users JSON file (relative to data_dir).
@@ -1245,11 +1311,30 @@ def create_app(
         from . import notify  # pragma: no cover
         notify.notify("audit_write_failed", message, severity="critical")  # pragma: no cover
 
+    # Key the audit hash chain with a dedicated, stable key — never reuse
+    # app.secret_key, which may be ephemeral (and thus leave the chain
+    # unverifiable after a restart). Fails closed via AuditChainKeyError.
+    resolved_audit_chain_key = _resolve_audit_chain_key(audit_chain_key, data)
     audit = AuditLogger(
         data_dir,
-        chain_key=app.secret_key,
+        chain_key=resolved_audit_chain_key,
         failure_callback=_audit_write_failed,
     )
+    # Verify the on-disk chain at startup; a mismatch means the log was
+    # truncated or rewritten, so notify loudly. NOTE: the in-memory _seq /
+    # _last_hash cursor is per-process — externalising chain state for a
+    # multi-worker topology is deliberately out of scope (single-worker by
+    # design); see docs/security.md.
+    if not audit.verify_chain():
+        logger.error("Audit log chain verification failed at startup")
+        from . import notify
+
+        notify.notify(
+            "audit_chain_invalid",
+            "audit log hash chain failed verification at startup "
+            "(possible truncation or tampering)",
+            severity="critical",
+        )
 
     # Store config on app for access in tests
     app.config["IDP_ENTITY_ID"] = idp_entity_id
