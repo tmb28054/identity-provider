@@ -1,7 +1,0 @@
-{
-  "task_id": "sec-f2-f5-medium",
-  "task_description": "Remediate four Medium-severity findings (F2 bearer creds in URLs + audit-log cache; F3 X-Forwarded-For trusted unconditionally; F4 audit log integrity/retention; F5 session cookie resurrection) from AWS Security Agent code review idp-2026-10-06, in the identity-provider worktree. Honor the hard boundary: do NOT touch Finding 1 backup-restore code (admin restore guard, backup_cli.py restore branch, backup.py restore_archive/validate_archive/tar.extract).",
-  "status": "completed",
-  "feature_order": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005"],
-  "blocked_reason": null
-}

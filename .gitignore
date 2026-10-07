@@ -41,6 +41,7 @@ scripts/deploy.py
 
 # --- Scratch working files ---
 trash/
+.agents/
 
 # --- macOS ---
 .DS_Store
