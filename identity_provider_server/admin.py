@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import secrets
 import subprocess  # nosec
 import time
@@ -649,6 +650,31 @@ def register_admin_routes(
             current = 0
         user["session_epoch"] = current + 1
 
+    def _write_deleted_epoch(target: str, epoch: int) -> None:
+        """Persist a deleted account's last session epoch as a tombstone.
+
+        Writes ``data_dir / 'deleted_epochs.json'`` (owner-only 0600) mapping a
+        deleted username to the highest epoch it has held. The tombstone lets
+        the session verifier floor a recreated username's epoch at the deleted
+        account's last value, preventing a stale cookie from resurrecting as the
+        new principal (finding idp-2026-10-06 F5).
+
+        Args:
+            target: The deleted username.
+            epoch: The account's last session epoch at deletion time.
+        """
+        if data_dir is None:  # pragma: no cover - production always passes data_dir
+            return
+        path = data_dir / "deleted_epochs.json"
+        try:
+            mapping = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            mapping = {}
+        mapping[target] = max(int(mapping.get(target, 0)), epoch)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(mapping))
+
     def _valid_username(name: str) -> bool:
         """Charset-validate a username (defaults to allowing all if no fn)."""
         return validate_username_fn(name) if validate_username_fn else True
@@ -1205,6 +1231,9 @@ def register_admin_routes(
                 "claims": claims,
                 "created_at": _now_iso(),
                 "enabled": True,
+                # Non-zero floor so a recreated username never restarts at epoch
+                # 0, which a stale cookie could still match (idp-2026-10-06 F5).
+                "session_epoch": int(time.time()),
             }
             if new_email:
                 new_user["email"] = new_email
@@ -1224,6 +1253,11 @@ def register_admin_routes(
             if target == admin_user:
                 return _render_panel(auth_token, error="Cannot delete yourself.")
             if target in users:
+                # Bump then persist the epoch as a tombstone so a later recreate
+                # of the same username cannot reset the floor and resurrect a
+                # stale session cookie (idp-2026-10-06 F5).
+                _bump_session_epoch(target)
+                _write_deleted_epoch(target, int(users[target].get("session_epoch", 0)))
                 del users[target]
                 if users_path:
                     save_users_fn(users_path, users)

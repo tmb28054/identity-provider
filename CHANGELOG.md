@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `validate_archive` now rejects members whose mode carries setuid, setgid,
   sticky, group/other-write, or other-execute bits; and `restore_archive`
   extracts with the tarfile `data` filter. See review idp-2026-10-06, Finding 1.
+- **Session cookie resurrection fixed** (Medium, F5): `add_user` now stamps a
+  non-zero `session_epoch` floor and `delete_user` persists a
+  `data/deleted_epochs.json` tombstone (owner-only `0600`) recording the deleted
+  account's last epoch. `_user_session_epoch` returns the max of the live record
+  epoch and the tombstone, so a stale cookie for a deleted-then-recreated
+  username no longer re-authenticates as the new principal.
 
 ### Security (code review idp-20261003)
 

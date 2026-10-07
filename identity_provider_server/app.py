@@ -2015,19 +2015,46 @@ def create_app(
     SESSION_MAX_AGE = 12 * 3600  # 12 hours (absolute cap, enforced server-side)
     SESSION_IDLE_MAX_AGE = 15 * 60  # 15 minutes of inactivity
 
+    def _load_deleted_epochs() -> dict[str, int]:
+        """Return the persisted deleted-account epoch tombstones.
+
+        Reads ``data / 'deleted_epochs.json'`` (written by the admin
+        ``delete_user`` path) which maps a deleted username to the last
+        session epoch it held. The tombstone survives a delete/recreate so a
+        recreated username cannot reset its epoch below the deleted account's
+        last value, defeating stale-cookie resurrection (finding
+        idp-2026-10-06 F5).
+
+        Returns:
+            A mapping of username to epoch, or an empty dict when the file is
+            absent or unreadable.
+        """
+        try:
+            raw = (data / "deleted_epochs.json").read_text()
+            return json.loads(raw)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
     def _user_session_epoch(username: str) -> int:
         """Return the account's current session-revocation epoch.
 
         The epoch is bumped whenever outstanding sessions must be invalidated
         (account disabled, password reset, claims changed). A cookie minted with
         a stale epoch no longer verifies, giving server-side revocation on top
-        of the stateless token.
+        of the stateless token. The effective epoch is the larger of the live
+        record epoch and any deleted-account tombstone, so a recreated username
+        inherits the deleted account's floor (finding idp-2026-10-06 F5).
         """
         user = users.get(username) or {}
         try:
-            return int(user.get("session_epoch", 0))
+            record_epoch = int(user.get("session_epoch", 0))
         except (TypeError, ValueError):
-            return 0
+            record_epoch = 0
+        try:
+            tombstone_epoch = int(_load_deleted_epochs().get(username, 0))
+        except (TypeError, ValueError):
+            tombstone_epoch = 0
+        return max(record_epoch, tombstone_epoch)
 
     def _issue_session_cookie(username: str, *, auth_time: int | None = None) -> str:
         """Issue a signed session cookie value binding auth_time and epoch.
