@@ -959,14 +959,14 @@ def test_backups_restore_trigger_failure(tmp_path):
         "idp_session", _session_cookie("adminsecret-00000000000000000000000", "admin"),
         domain="localhost",
     )
-    bk.write_archive_listing(tmp_path, ["idp-20260101-000000.tar.gz"])
+    bk.write_archive_listing(tmp_path, ["idp-20260101-000000.tar.gz.enc"])
     with (
         mock.patch("identity_provider_server.admin.verify_code", return_value=True),
         mock.patch("identity_provider_server.admin.subprocess.run",
                    return_value=mock.Mock(returncode=1, stdout="", stderr="nope")),
     ):
         resp = _bpost(client, {
-            "action": "restore_backup", "archive": "idp-20260101-000000.tar.gz",
+            "action": "restore_backup", "archive": "idp-20260101-000000.tar.gz.enc",
             "confirm_answer": "123456",
         })
     assert b"Could not start restore" in resp.data

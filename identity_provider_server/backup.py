@@ -555,12 +555,16 @@ def validate_archive(archive_path: str | Path) -> list[str]:
     """Validate an archive is safe to extract and return its member names.
 
     Rejects absolute paths, parent-directory traversal, and non-file
-    members (symlinks, devices).
+    members (symlinks, devices). Also rejects members whose mode carries
+    dangerous permission bits: setuid, setgid, sticky, group- or
+    other-writable, or other-executable.
 
     Raises:
         ValueError: If the archive contains an unsafe member.
         tarfile.TarError / OSError: If the archive cannot be read.
     """
+    # setuid | setgid | sticky | group/other-write | other-execute.
+    forbidden_mode_bits = 0o4000 | 0o2000 | 0o1000 | 0o0022 | 0o0001
     names: list[str] = []
     with tarfile.open(archive_path, "r:gz") as tar:
         for member in tar.getmembers():
@@ -572,6 +576,10 @@ def validate_archive(archive_path: str | Path) -> list[str]:
             if member_path.is_absolute() or ".." in member_path.parts:
                 raise ValueError(
                     f"Unsafe archive member path: {member.name}"
+                )
+            if member.mode & forbidden_mode_bits:
+                raise ValueError(
+                    f"Unsafe archive member mode {member.mode:o}: {member.name}"
                 )
             names.append(member.name)
     return names
@@ -601,7 +609,10 @@ def restore_archive(
             if not _is_within(data_dir, dest):
                 raise ValueError(f"Refusing to extract outside data dir: {member.name}")
             # Members are validated by validate_archive() (regular files only,
-            # no absolute paths, no traversal) and _is_within() re-checks each.
-            tar.extract(member, path=data_dir)  # nosec B202
+            # no absolute paths, no traversal, safe modes) and _is_within()
+            # re-checks each. The tarfile ``data`` filter is a second layer
+            # that neutralises traversal, links, device nodes, and setuid/
+            # setgid bits at extraction time.
+            tar.extract(member, path=data_dir, filter="data")
     logger.info("Restored %d files from %s", len(names), archive_path)
     return names

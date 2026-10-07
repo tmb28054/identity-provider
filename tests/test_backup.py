@@ -11,6 +11,7 @@ import json
 import tarfile
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -378,3 +379,58 @@ def test_restore_rejects_unsafe_archive(tmp_path):
     with pytest.raises(ValueError):
         bk.restore_archive(bad, dest)
     assert not (tmp_path / "escape.txt").exists()
+
+
+def test_validate_archive_rejects_setuid_member(tmp_path):
+    """A member carrying the setuid bit is rejected."""
+    bad = tmp_path / "bad.tar.gz"
+    with tarfile.open(bad, "w:gz") as tar:
+        info = tarfile.TarInfo(name="payload")
+        info.size = 0
+        info.mode = 0o4755
+        tar.addfile(info)
+    with pytest.raises(ValueError, match="Unsafe archive member mode"):
+        bk.validate_archive(bad)
+
+
+def test_validate_archive_rejects_world_writable_member(tmp_path):
+    """A world/group-writable member is rejected."""
+    bad = tmp_path / "bad.tar.gz"
+    with tarfile.open(bad, "w:gz") as tar:
+        info = tarfile.TarInfo(name="payload")
+        info.size = 0
+        info.mode = 0o666
+        tar.addfile(info)
+    with pytest.raises(ValueError, match="Unsafe archive member mode"):
+        bk.validate_archive(bad)
+
+
+def test_validate_archive_accepts_benign_modes(tmp_path):
+    """Benign owner-only read/write modes are accepted (no over-rejection)."""
+    good = tmp_path / "good.tar.gz"
+    with tarfile.open(good, "w:gz") as tar:
+        info_644 = tarfile.TarInfo(name="users.json")
+        info_644.size = 0
+        info_644.mode = 0o644
+        tar.addfile(info_644)
+        info_600 = tarfile.TarInfo(name="idp.key")
+        info_600.size = 0
+        info_600.mode = 0o600
+        tar.addfile(info_600)
+    assert bk.validate_archive(good) == ["users.json", "idp.key"]
+
+
+def test_restore_archive_uses_data_filter(tmp_path):
+    """restore_archive extracts members with the tarfile ``data`` filter."""
+    src = tmp_path / "good.tar.gz"
+    with tarfile.open(src, "w:gz") as tar:
+        info = tarfile.TarInfo(name="users.json")
+        info.size = 0
+        info.mode = 0o600
+        tar.addfile(info)
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    with mock.patch.object(tarfile.TarFile, "extract") as extract:
+        bk.restore_archive(src, dest)
+    assert extract.called
+    assert extract.call_args.kwargs.get("filter") == "data"

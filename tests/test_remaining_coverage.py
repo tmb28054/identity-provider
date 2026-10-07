@@ -157,7 +157,7 @@ def test_do_restore_mount_failure(tmp_path):
     _cfg(tmp_path)
     with mock.patch.object(backup_cli, "_mount_smb",
                            side_effect=backup_cli.MountError("no route")):
-        assert backup_cli.do_restore(str(tmp_path), "idp-1-2.tar.gz") == 1
+        assert backup_cli.do_restore(str(tmp_path), "idp-1-2.tar.gz.enc") == 1
 
 
 def test_do_restore_archive_not_found(tmp_path):
@@ -166,7 +166,7 @@ def test_do_restore_archive_not_found(tmp_path):
         mock.patch.object(backup_cli, "_mount_smb"),
         mock.patch.object(backup_cli, "_umount"),
     ):
-        assert backup_cli.do_restore(str(tmp_path), "idp-1-2.tar.gz") == 1
+        assert backup_cli.do_restore(str(tmp_path), "idp-1-2.tar.gz.enc") == 1
 
 
 def test_do_restore_oserror(tmp_path):
@@ -175,7 +175,7 @@ def test_do_restore_oserror(tmp_path):
     def fake_mount(config, mount_dir):
         base = Path(mount_dir) / config.subpath / "daily"
         base.mkdir(parents=True, exist_ok=True)
-        (base / "idp-1-2.tar.gz").write_text("x")
+        (base / "idp-1-2.tar.gz.enc").write_text("x")
 
     with (
         mock.patch.object(backup_cli, "_mount_smb", side_effect=fake_mount),
@@ -183,7 +183,7 @@ def test_do_restore_oserror(tmp_path):
         mock.patch.object(backup_cli.bk, "snapshot_current",
                           side_effect=OSError("snap fail")),
     ):
-        assert backup_cli.do_restore(str(tmp_path), "idp-1-2.tar.gz") == 1
+        assert backup_cli.do_restore(str(tmp_path), "idp-1-2.tar.gz.enc") == 1
 
 
 def test_test_connection_mount_failure(tmp_path):

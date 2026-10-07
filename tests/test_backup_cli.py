@@ -139,7 +139,8 @@ def test_do_restore_rejects_bad_archive_name(tmp_path):
     assert rc == 2
 
 
-def test_do_restore_happy_path(tmp_path):
+def test_do_restore_refuses_plaintext_archive(tmp_path):
+    """A plaintext .tar.gz name fails closed: rejected before any mount."""
     data = tmp_path / "data"
     data.mkdir()
     _seed(data)
@@ -150,28 +151,19 @@ def test_do_restore_happy_path(tmp_path):
 
     archive = "idp-20260101-000000.tar.gz"
 
-    def fake_mount(config, mount_dir):
-        # Lay down a valid archive on the "share".
-        daily = Path(mount_dir) / "idp-backup" / "daily"
-        daily.mkdir(parents=True, exist_ok=True)
-        # Build an archive from a different data set to prove restore overwrites.
-        other = Path(mount_dir) / "src"
-        other.mkdir()
-        (other / "users.json").write_text(json.dumps([{"username": "restored"}]))
-        (other / "idp.key").write_text("RESTORED-KEY")
-        bk.create_archive(other, daily / archive)
-
-    with mock.patch.object(backup_cli, "_mount_smb", side_effect=fake_mount), \
+    # The name guard rejects non-.enc archives before the share is touched,
+    # so neither mount nor extraction may run.
+    with mock.patch.object(backup_cli, "_mount_smb") as mount, \
          mock.patch.object(backup_cli, "_umount"):
         rc = backup_cli.do_restore(str(data), archive)
 
-    assert rc == 0
-    assert (data / "idp.key").read_text() == "RESTORED-KEY"
-    # A pre-restore snapshot was taken.
-    snaps = list((data / "pre-restore-snapshots").glob("pre-restore-*.tar.gz"))
-    assert len(snaps) == 1
+    assert rc == 2
+    mount.assert_not_called()
+    # No pre-restore snapshot and no data overwrite occurred.
+    assert not (data / "pre-restore-snapshots").exists()
 
 
+@pytest.mark.smoke
 def test_do_restore_encrypted_archive(tmp_path):
     """do_restore decrypts a .tar.gz.enc archive and restores its contents."""
     data = tmp_path / "data"

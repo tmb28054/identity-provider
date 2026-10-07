@@ -170,7 +170,7 @@ def test_restore_requires_confirmation(tmp_path):
     """Restore with a wrong MFA code is aborted (no unit started)."""
     app = _make_app(tmp_path)
     # Make an archive available in the listing.
-    bk.write_archive_listing(tmp_path, ["idp-20260101-000000.tar.gz"])
+    bk.write_archive_listing(tmp_path, ["idp-20260101-000000.tar.gz.enc"])
     client = _client_with_session(app)
     token, auth = _get_csrf(client)
 
@@ -181,7 +181,7 @@ def test_restore_requires_confirmation(tmp_path):
         resp = client.post("/admin/backups", data={
             "csrf_token": token, "auth_token": auth,
             "action": "restore_backup",
-            "archive": "idp-20260101-000000.tar.gz",
+            "archive": "idp-20260101-000000.tar.gz.enc",
             "confirm_answer": "000000",
         })
     assert "Confirmation failed" in resp.data.decode()
@@ -190,7 +190,7 @@ def test_restore_requires_confirmation(tmp_path):
 
 def test_restore_with_valid_mfa_triggers_unit(tmp_path):
     app = _make_app(tmp_path)
-    bk.write_archive_listing(tmp_path, ["idp-20260101-000000.tar.gz"])
+    bk.write_archive_listing(tmp_path, ["idp-20260101-000000.tar.gz.enc"])
     client = _client_with_session(app)
     token, auth = _get_csrf(client)
 
@@ -203,13 +203,58 @@ def test_restore_with_valid_mfa_triggers_unit(tmp_path):
         resp = client.post("/admin/backups", data={
             "csrf_token": token, "auth_token": auth,
             "action": "restore_backup",
-            "archive": "idp-20260101-000000.tar.gz",
+            "archive": "idp-20260101-000000.tar.gz.enc",
             "confirm_answer": "123456",
         })
     assert resp.status_code == 200
     assert "Restore" in resp.data.decode()
     started = " ".join(run.call_args[0][0])
-    assert "idp-restore@idp-20260101-000000.tar.gz.service" in started
+    assert "idp-restore@idp-20260101-000000.tar.gz.enc.service" in started
+
+
+def test_restore_rejects_plaintext_archive_name(tmp_path):
+    """A non-encrypted .tar.gz name is rejected before any unit is started."""
+    app = _make_app(tmp_path)
+    bk.write_archive_listing(tmp_path, ["idp-20260101-000000.tar.gz"])
+    client = _client_with_session(app)
+    token, auth = _get_csrf(client)
+
+    with (
+        mock.patch("identity_provider_server.admin.subprocess.run") as run,
+        mock.patch("identity_provider_server.admin.verify_code", return_value=True),
+    ):
+        resp = client.post("/admin/backups", data={
+            "csrf_token": token, "auth_token": auth,
+            "action": "restore_backup",
+            "archive": "idp-20260101-000000.tar.gz",
+            "confirm_answer": "123456",
+        })
+    assert "Invalid archive name" in resp.data.decode()
+    run.assert_not_called()
+
+
+def test_restore_accepts_encrypted_archive_name(tmp_path):
+    """A .tar.gz.enc name passes the guard and reaches the systemd unit."""
+    app = _make_app(tmp_path)
+    bk.write_archive_listing(tmp_path, ["idp-20260101-000000.tar.gz.enc"])
+    client = _client_with_session(app)
+    token, auth = _get_csrf(client)
+
+    fake = mock.Mock(returncode=0, stdout="", stderr="")
+    with (
+        mock.patch("identity_provider_server.admin.subprocess.run", return_value=fake) as run,
+        mock.patch("identity_provider_server.admin.verify_code", return_value=True),
+    ):
+        resp = client.post("/admin/backups", data={
+            "csrf_token": token, "auth_token": auth,
+            "action": "restore_backup",
+            "archive": "idp-20260101-000000.tar.gz.enc",
+            "confirm_answer": "123456",
+        })
+    assert resp.status_code == 200
+    run.assert_called_once()
+    started = " ".join(run.call_args[0][0])
+    assert "idp-restore@idp-20260101-000000.tar.gz.enc.service" in started
 
 
 def test_restore_rejects_bad_archive_name(tmp_path):

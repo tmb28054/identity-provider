@@ -179,9 +179,11 @@ def do_restore(data_dir: str, archive: str) -> int:
         return 2
 
     # Guard the archive name against path traversal before touching the share.
-    # Accept encrypted archives (.tar.gz.enc) and legacy plaintext (.tar.gz).
-    valid_suffix = archive.endswith(".tar.gz") or archive.endswith(".tar.gz.enc")
-    if "/" in archive or ".." in archive or not valid_suffix:
+    # Only integrity-protected encrypted archives (.tar.gz.enc) are accepted;
+    # restore fails closed on anything it cannot authenticate.
+    if "/" in archive or ".." in archive or not archive.endswith(
+        ".tar.gz" + bk.ENCRYPTED_SUFFIX
+    ):
         logger.error("Invalid archive name: %s", archive)
         return 2
 
@@ -207,12 +209,10 @@ def do_restore(data_dir: str, archive: str) -> int:
             snap = bk.snapshot_current(data_dir, snap_dir)
             logger.info("Pre-restore snapshot written: %s", snap)
 
-            if archive.endswith(bk.ENCRYPTED_SUFFIX):
-                key = bk.resolve_backup_key(data_dir)
-                bk.restore_encrypted_archive(src, data_dir, key)
-            else:
-                # Legacy plaintext archive (pre-encryption).
-                bk.restore_archive(src, data_dir)
+            # Encrypted-only: the name guard above rejects any non-.enc
+            # archive, so there is no unverified plaintext extraction path.
+            key = bk.resolve_backup_key(data_dir)
+            bk.restore_encrypted_archive(src, data_dir, key)
             logger.info("Restore complete from %s", archive)
         except (OSError, ValueError, bk.BackupKeyError) as exc:
             logger.error("Restore failed: %s", exc)

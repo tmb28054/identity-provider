@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (code review idp-2026-10-06)
+
+- **Harden backup restore against unverified/unsafe archives** (High, Finding 1):
+  the admin portal restore guard now accepts only integrity-protected
+  `.tar.gz.enc` archives (keeping the existing `/` and `..` rejection); the
+  privileged restore CLI (`backup_cli.do_restore`) fails closed, with the legacy
+  plaintext fallback removed, so any archive it cannot authenticate (detached
+  SHA-256 digest + Fernet tag) is refused instead of silently extracted;
+  `validate_archive` now rejects members whose mode carries setuid, setgid,
+  sticky, group/other-write, or other-execute bits; and `restore_archive`
+  extracts with the tarfile `data` filter. See review idp-2026-10-06, Finding 1.
+
 ### Security (code review idp-20261003)
 
 All 11 findings from the second AWS Security Agent review were validated and

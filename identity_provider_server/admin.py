@@ -1928,8 +1928,12 @@ def register_admin_routes(
                         result="failure", reason="confirm_failed", user_agent=ua,
                     )
                 return _render_backups(auth_token, error="Confirmation failed. Restore aborted.")
-            # Guard the archive name before handing it to systemd.
-            if "/" in archive or ".." in archive or not archive.endswith(".tar.gz"):
+            # Guard the archive name before handing it to systemd. Only
+            # integrity-protected encrypted archives (.tar.gz.enc) may be
+            # selected; plaintext archives carry no digest/Fernet tag and
+            # cannot be authenticated.
+            enc_suffix = ".tar.gz" + bk.ENCRYPTED_SUFFIX
+            if "/" in archive or ".." in archive or not archive.endswith(enc_suffix):
                 return _render_backups(auth_token, error="Invalid archive name.")
             unit = f"idp-restore@{archive}.service"
             ok, detail = _trigger_unit(unit)
