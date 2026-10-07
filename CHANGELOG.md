@@ -33,15 +33,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rotation/WORM responsibilities; `docs/configuration.md` documents
   `IDP_AUDIT_CHAIN_KEY`. The in-memory chain cursor remains per-process
   (single-worker topology); externalising chain state is out of scope.
-- **X-Forwarded-For trust made opt-in** (Medium, F3): `create_app`'s
-  `trust_proxy` now defaults to `False` and is wired through a new
-  `server.trust_proxy` config field / `IDP_TRUST_PROXY` env var (threaded via
-  both entrypoints). A directly exposed deployment (e.g. the `docker-compose`
-  file that publishes `:5000`) no longer trusts attacker-controlled
-  `X-Forwarded-For`/`X-Forwarded-Proto`, closing the rate-limit bypass and
-  audit source-IP forgery. Enable it only behind a single trusted reverse
-  proxy; the Kubernetes manifest sets it `true` because an Ingress fronts the
-  pod. Documented in `docs/configuration.md`.
 - **Session cookie resurrection fixed** (Medium, F5): `add_user` now stamps a
   non-zero `session_epoch` floor and `delete_user` persists a
   `data/deleted_epochs.json` tombstone (owner-only `0600`) recording the deleted
@@ -57,6 +48,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   string at all four redirect sites (SSO short-circuit GET, MFA tail, password
   tail, passkey JSON), keeping it out of access logs and the Referer header.
   The SAML auto-POST delivery path is unchanged.
+
+### Changed (code review idp-2026-10-06)
+
+- **`IDP_TRUST_PROXY` now defaults to `false`** (F3): `create_app` /
+  `IDP_TRUST_PROXY` (new `server.trust_proxy` config field, threaded through
+  both entrypoints) no longer trusts proxy forwarding headers by default, so a
+  direct deployment (e.g. the `docker-compose` file that publishes `:5000`)
+  keeps the real socket peer address — closing the rate-limit bypass and audit
+  source-IP forgery. **Set `IDP_TRUST_PROXY=true` only when running behind a
+  single trusted reverse proxy/ingress**; the Kubernetes manifest sets it
+  `true` because an Ingress fronts the pod. Documented in
+  `docs/configuration.md`.
+- **New recommended `IDP_AUDIT_CHAIN_KEY` setting** (F4): operators should set
+  a stable `IDP_AUDIT_CHAIN_KEY` (config `security.audit_chain_key`) for a
+  stable, verifiable audit chain across restarts and secret rotation. When
+  unset, the IdP persists an auto-created `0600` `data/audit_chain.key` and
+  fails closed (`AuditChainKeyError`) if no stable key can be established.
+  Documented in `docs/configuration.md`.
 
 ### Security (code review idp-20261003)
 
