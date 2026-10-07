@@ -31,6 +31,12 @@ spec:
                 secretKeyRef:
                   name: idp-secrets
                   key: SECRET_KEY
+            # Safe to trust X-Forwarded-For/Proto here: an Ingress fronts the
+            # pod and is the only client that reaches the container, so the
+            # forwarded headers reflect the real client. This lets rate
+            # limiting and the audit trail key on the true source IP.
+            - name: IDP_TRUST_PROXY
+              value: "true"
           volumeMounts:
             - name: config
               mountPath: /data/config.yaml

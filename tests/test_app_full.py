@@ -64,6 +64,24 @@ def _csrf(html: bytes):
     return re.search(rb'name="csrf_token" value="([^"]+)"', html).group(1).decode()
 
 
+# --- trust_proxy / ProxyFix (finding idp-2026-10-06 F3) ---------------------
+
+def test_trust_proxy_true_installs_proxyfix(tmp_path):
+    """When trust_proxy=True, create_app wraps the WSGI app in ProxyFix."""
+    from werkzeug.middleware.proxy_fix import ProxyFix
+
+    app = _write_app(tmp_path, [], trust_proxy=True)
+    assert isinstance(app.wsgi_app, ProxyFix)
+
+
+def test_trust_proxy_false_skips_proxyfix(tmp_path):
+    """The default (trust_proxy=False) leaves the WSGI app unwrapped."""
+    from werkzeug.middleware.proxy_fix import ProxyFix
+
+    app = _write_app(tmp_path, [])  # helper defaults trust_proxy=False
+    assert not isinstance(app.wsgi_app, ProxyFix)
+
+
 # --- SP login: password only (no MFA) ---------------------------------------
 
 def test_saml_login_no_mfa(tmp_path):

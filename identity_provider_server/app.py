@@ -986,7 +986,7 @@ def create_app(
     group_role_map: dict[str, list[dict[str, str]]] | None = None,
     skip_ldap_ssl_verify: bool = False,
     secure_cookies: bool = True,
-    trust_proxy: bool = True,
+    trust_proxy: bool = False,
     webauthn_enabled: bool = False,
     webauthn_rp_id: str = "",
     webauthn_rp_name: str = "Identity Provider",
@@ -1011,9 +1011,11 @@ def create_app(
         skip_ldap_ssl_verify: If True, disable TLS certificate verification for LDAP.
         secure_cookies: If True (default), set the Secure flag on all cookies.
             Set False only for local HTTP development.
-        trust_proxy: If True (default), honour X-Forwarded-For/Proto from a
-            single upstream reverse proxy so rate limiting keys on the real
-            client IP.
+        trust_proxy: If False (default), ignore X-Forwarded-For/Proto headers
+            and key rate limiting on the direct peer address. Enable only when
+            the service runs behind exactly one trusted reverse proxy; trusting
+            these headers on a directly exposed deployment lets a client forge
+            its source IP (rate-limit bypass and audit source-IP forgery).
         webauthn_enabled: If True, enable passkey (WebAuthn) endpoints and UI.
         webauthn_rp_id: WebAuthn Relying Party ID (the effective domain).
         webauthn_rp_name: Human-readable RP name shown by authenticators.

@@ -23,6 +23,7 @@ server:
   host: "0.0.0.0"          # Bind address
   port: 5000               # TCP port
   debug: false             # Flask debug mode
+  trust_proxy: false       # Trust X-Forwarded-For/Proto from one upstream proxy
 
 # SAML settings
 saml:
@@ -77,6 +78,7 @@ Environment variables override config file values. Useful for injecting secrets 
 | `IDP_HOST` | `server.host` | Bind address |
 | `IDP_PORT` | `server.port` | TCP port |
 | `IDP_DEBUG` | `server.debug` | `true`/`false` |
+| `IDP_TRUST_PROXY` | `server.trust_proxy` | `true`/`false` — trust `X-Forwarded-For`/`X-Forwarded-Proto` from exactly one upstream reverse proxy. Default `false`. Enable only behind a trusted proxy; trusting these headers on a directly exposed deployment lets clients forge their source IP. |
 | `IDP_PROVIDER_NAME` | `saml.provider_name` | SAML provider name |
 | `IDP_SESSION_DURATION_HOURS` | `saml.session_duration_hours` | Assertion validity |
 | `IDP_USERS_FILE` | `data.users_file` | Path to users JSON |

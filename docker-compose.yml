@@ -11,6 +11,12 @@ services:
       #   python3 -c "import secrets; print(secrets.token_hex(32))"
       # and set it in a .env file (see docs/howto.md) or your shell.
       - SECRET_KEY=${SECRET_KEY:?set SECRET_KEY to a real random value}
+      # Keep IDP_TRUST_PROXY unset/false here. This compose file publishes
+      # :5000 directly with no reverse proxy in front, so X-Forwarded-For/Proto
+      # headers are attacker-controlled. Trusting them would let a client forge
+      # its source IP (rate-limit bypass + audit source-IP forgery). Only set
+      # IDP_TRUST_PROXY=true when a trusted reverse proxy terminates traffic in
+      # front of the service.
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health')"]
       interval: 10s

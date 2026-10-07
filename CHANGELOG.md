@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `validate_archive` now rejects members whose mode carries setuid, setgid,
   sticky, group/other-write, or other-execute bits; and `restore_archive`
   extracts with the tarfile `data` filter. See review idp-2026-10-06, Finding 1.
+- **X-Forwarded-For trust made opt-in** (Medium, F3): `create_app`'s
+  `trust_proxy` now defaults to `False` and is wired through a new
+  `server.trust_proxy` config field / `IDP_TRUST_PROXY` env var (threaded via
+  both entrypoints). A directly exposed deployment (e.g. the `docker-compose`
+  file that publishes `:5000`) no longer trusts attacker-controlled
+  `X-Forwarded-For`/`X-Forwarded-Proto`, closing the rate-limit bypass and
+  audit source-IP forgery. Enable it only behind a single trusted reverse
+  proxy; the Kubernetes manifest sets it `true` because an Ingress fronts the
+  pod. Documented in `docs/configuration.md`.
 - **Session cookie resurrection fixed** (Medium, F5): `add_user` now stamps a
   non-zero `session_epoch` floor and `delete_user` persists a
   `data/deleted_epochs.json` tombstone (owner-only `0600`) recording the deleted

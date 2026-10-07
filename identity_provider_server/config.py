@@ -21,6 +21,7 @@ _DEFAULTS: dict[str, Any] = {
         "host": "127.0.0.1",
         "port": 5000,
         "debug": False,
+        "trust_proxy": False,
     },
     "saml": {
         "provider_name": "local-idp",
@@ -55,6 +56,7 @@ class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 5000
     debug: bool = False
+    trust_proxy: bool = False
 
 
 @dataclass
@@ -166,7 +168,7 @@ def _apply_env_overrides(config: dict) -> dict:
     """Apply environment variable overrides.
 
     Supported environment variables:
-        IDP_HOST, IDP_PORT, IDP_DEBUG,
+        IDP_HOST, IDP_PORT, IDP_DEBUG, IDP_TRUST_PROXY,
         IDP_PROVIDER_NAME, IDP_SESSION_DURATION_HOURS,
         IDP_USERS_FILE, IDP_CERTIFICATE_FILE, IDP_PRIVATE_KEY_FILE,
         IDP_LOG_LEVEL,
@@ -176,6 +178,7 @@ def _apply_env_overrides(config: dict) -> dict:
         "IDP_HOST": ("server", "host"),
         "IDP_PORT": ("server", "port"),
         "IDP_DEBUG": ("server", "debug"),
+        "IDP_TRUST_PROXY": ("server", "trust_proxy"),
         "IDP_PROVIDER_NAME": ("saml", "provider_name"),
         "IDP_SESSION_DURATION_HOURS": ("saml", "session_duration_hours"),
         "IDP_USERS_FILE": ("data", "users_file"),

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import yaml
 
 from identity_provider_server.config import (
@@ -252,3 +253,20 @@ def test_webauthn_config_loaded_from_env(monkeypatch, tmp_path):
     assert cfg.webauthn.rp_id == "idp.example.com"
     assert cfg.webauthn.rp_name == "Example IdP"
     cfg.webauthn.validate()  # should not raise
+
+
+# --- trust_proxy (finding idp-2026-10-06 F3) ---
+
+
+@pytest.mark.smoke
+def test_trust_proxy_defaults_to_false(tmp_path):
+    """X-Forwarded-For trust is opt-in: default resolves to False."""
+    config = load_config(str(tmp_path))
+    assert config.server.trust_proxy is False
+
+
+def test_trust_proxy_enabled_from_env(monkeypatch, tmp_path):
+    """IDP_TRUST_PROXY=true flips server.trust_proxy on."""
+    monkeypatch.setenv("IDP_TRUST_PROXY", "true")
+    config = load_config(str(tmp_path))
+    assert config.server.trust_proxy is True
