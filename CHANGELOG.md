@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security (code review idp-2026-10-06)
 
+All six findings from the AWS Security Agent review `idp-2026-10-06` were
+validated and remediated (five in code, one — resilience — as documentation plus
+a flagged architectural follow-up). See `docs/security-review-20261006-response.md`.
+
 - **Harden backup restore against unverified/unsafe archives** (High, Finding 1):
   the admin portal restore guard now accepts only integrity-protected
   `.tar.gz.enc` archives (keeping the existing `/` and `..` rejection); the
