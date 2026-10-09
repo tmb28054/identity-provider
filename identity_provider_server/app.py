@@ -1777,6 +1777,7 @@ def create_app(
         session = _verify_session_cookie_full(request.cookies.get(SESSION_COOKIE_NAME, ""))
         session_user = session[0] if session else None
         session_auth_time = session[1] if session else None
+        session_mfa = session[2] if session else False
         if session_user and not use_adfs:
             user = users.get(session_user)
             # Re-apply the account-state gate on this credential-issuing path:
@@ -1809,8 +1810,12 @@ def create_app(
                     # Deliver the JWT in the URL fragment so it never reaches
                     # server access logs or the Referer header (idp-20261006 F2).
                     resp = app.make_response(redirect(f"{sp.url}#token={token}"))
-                    # Slide the idle window but keep the absolute-cap anchor.
-                    _set_session_cookie(resp, session_user, auth_time=session_auth_time)
+                    # Slide the idle window but keep the absolute-cap anchor and
+                    # the factor marker (never upgrade a one-factor session).
+                    _set_session_cookie(
+                        resp, session_user,
+                        auth_time=session_auth_time, mfa=session_mfa,
+                    )
                     return resp
                 else:
                     sp_acs_url = sp.url if sp else ACS_URL
@@ -1825,7 +1830,10 @@ def create_app(
                     resp = app.make_response(
                         render_template_string(SAML_POST, acs=sp_acs_url, saml=saml_b64)
                     )
-                    _set_session_cookie(resp, session_user, auth_time=session_auth_time)
+                    _set_session_cookie(
+                        resp, session_user,
+                        auth_time=session_auth_time, mfa=session_mfa,
+                    )
                     return resp
 
         sp = _get_service(service_path)
@@ -1913,7 +1921,17 @@ def create_app(
                 ), 401
             auth_username, ticket_nonce = ticket_info
             user = users.get(auth_username)
-            if not user or not user.get("totp_secret"):
+            # Re-run the full eligibility predicate before issuance — the
+            # account can be disabled or locked between the password leg (which
+            # minted the ticket) and this second leg, and the siblings (password
+            # leg + SP passkey finish) already gate here (finding
+            # idp-2026-10-06 F2).
+            if (
+                not user
+                or not user.get("totp_secret")
+                or not _user_can_login(user)
+                or _account_locked(auth_username)
+            ):
                 question, new_hash = _make_challenge()
                 return render_template_string(
                     LOGIN_FORM,
@@ -2013,7 +2031,8 @@ def create_app(
                 # Deliver the JWT in the URL fragment so it never reaches
                 # server access logs or the Referer header (idp-20261006 F2).
                 resp = redirect(f"{sp.url}#token={token}")
-                _set_session_cookie(resp, username)
+                # Second factor verified — mark the session two-factor.
+                _set_session_cookie(resp, username, mfa=True)
                 return resp
             else:
                 if use_adfs and not roles:  # pragma: no cover - unreachable: ADFS accounts have no local totp_secret to reach this MFA-ticket branch
@@ -2038,7 +2057,8 @@ def create_app(
                 resp = app.make_response(
                     render_template_string(SAML_POST, acs=sp_acs_url, saml=saml_b64)
                 )
-                _set_session_cookie(resp, username)
+                # Second factor verified — mark the session two-factor.
+                _set_session_cookie(resp, username, mfa=True)
                 return resp
 
         username = request.form.get("username", "")
@@ -2357,14 +2377,19 @@ def create_app(
             tombstone_epoch = 0
         return max(record_epoch, tombstone_epoch)
 
-    def _issue_session_cookie(username: str, *, auth_time: int | None = None) -> str:
-        """Issue a signed session cookie value binding auth_time and epoch.
+    def _issue_session_cookie(
+        username: str, *, auth_time: int | None = None, mfa: bool = False
+    ) -> str:
+        """Issue a signed session cookie value binding auth_time, epoch and mfa.
 
         Args:
             username: The authenticated subject.
             auth_time: The absolute-cap anchor. ``None`` starts a fresh session
                 (anchored at now); re-mints pass the original value to keep the
                 absolute window fixed while the idle window slides.
+            mfa: Whether a real second factor established the session. Preserved
+                verbatim across re-mints so a one-factor session never silently
+                becomes two-factor (finding idp-2026-10-06 F6).
         """
         now = int(time.time())
         return issue_session_token(
@@ -2372,21 +2397,23 @@ def create_app(
             username,
             auth_time=now if auth_time is None else auth_time,
             epoch=_user_session_epoch(username),
+            mfa=mfa,
         )
 
-    def _verify_session_cookie_full(cookie_val: str) -> tuple[str, int] | None:
+    def _verify_session_cookie_full(cookie_val: str) -> tuple[str, int, bool] | None:
         """Verify a session cookie against idle, absolute, and revocation limits.
 
-        Returns ``(username, auth_time)`` so the caller can preserve the
-        absolute-cap anchor when re-minting, or ``None`` if the cookie is
-        expired (idle or absolute), tampered, or revoked by an epoch bump.
+        Returns ``(username, auth_time, mfa)`` so the caller can preserve the
+        absolute-cap anchor and the factor marker when re-minting, or ``None``
+        if the cookie is expired (idle or absolute), tampered, or revoked by an
+        epoch bump.
         """
         result = verify_session_token(
             app.secret_key, cookie_val, SESSION_IDLE_MAX_AGE, SESSION_MAX_AGE
         )
         if result is None:
             return None
-        username, auth_time, epoch = result
+        username, auth_time, epoch, mfa = result
         # Reject a cookie for an account that no longer exists. In local-user
         # mode a deleted account must not keep a usable session just because the
         # epoch of an absent user defaults to 0 (finding idp-20261003 F11).
@@ -2396,7 +2423,7 @@ def create_app(
         if epoch != _user_session_epoch(username):
             logger.info("Rejected session cookie with stale epoch for user=%s", username)
             return None
-        return username, auth_time
+        return username, auth_time, mfa
 
     def _verify_session_cookie(cookie_val: str) -> str | None:
         """Verify a session cookie and return the username, or ``None``.
@@ -2408,15 +2435,29 @@ def create_app(
         result = _verify_session_cookie_full(cookie_val)
         return result[0] if result else None
 
-    def _set_session_cookie(resp, username: str, *, auth_time: int | None = None):
+    def _session_cookie_is_mfa(cookie_val: str) -> bool:
+        """True only if the session cookie records a verified second factor.
+
+        Used by privileged entry points to refuse a single-factor cookie
+        (finding idp-2026-10-06 F6). A legacy or tampered cookie reads as
+        single-factor.
+        """
+        result = _verify_session_cookie_full(cookie_val)
+        return bool(result and result[2])
+
+    def _set_session_cookie(
+        resp, username: str, *, auth_time: int | None = None, mfa: bool = False
+    ):
         """Set the session cookie on a response (Secure in non-debug mode).
 
         ``auth_time`` is passed through on re-mint so sliding the idle window
-        does not reset the absolute lifetime cap.
+        does not reset the absolute lifetime cap. ``mfa`` records whether a
+        real second factor established the session; it is preserved across
+        re-mints so a one-factor cookie cannot be upgraded by activity alone.
         """
         resp.set_cookie(
             SESSION_COOKIE_NAME,
-            _issue_session_cookie(username, auth_time=auth_time),
+            _issue_session_cookie(username, auth_time=auth_time, mfa=mfa),
             max_age=SESSION_MAX_AGE,
             httponly=True,
             samesite="Strict",
@@ -2503,7 +2544,15 @@ def create_app(
                 return resp, 401
             username, ticket_nonce = ticket_info
             user = users.get(username)
-            if not user or not user.get("totp_secret"):
+            # Re-run the full eligibility predicate before granting access — the
+            # account can be disabled or locked between the password leg and
+            # this second leg (finding idp-2026-10-06 F2).
+            if (
+                not user
+                or not user.get("totp_secret")
+                or not _user_can_login(user)
+                or _account_locked(username)
+            ):
                 token = _generate_csrf_token()
                 resp = app.make_response(render_template_string(
                     USER_PAGE_LOGIN, error="Invalid request. Please sign in again.",
@@ -3777,6 +3826,7 @@ def create_app(
         verify_challenge_fn=_check_challenge,
         services_path=services_path,
         verify_session_cookie_fn=_verify_session_cookie,
+        session_mfa_fn=_session_cookie_is_mfa,
         set_session_cookie_fn=_set_session_cookie,
         audit_logger=audit,
         data_dir=data,

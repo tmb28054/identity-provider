@@ -120,8 +120,9 @@ def verify_token(secret: str, token: str, purpose: str, max_age: int) -> str | N
     return username
 
 
-# Session tokens carry two extra fields beyond the plain token subject so the
-# server can enforce an absolute lifetime and revoke outstanding cookies:
+# Session tokens carry three extra fields beyond the plain token subject so the
+# server can enforce an absolute lifetime, revoke outstanding cookies, and tell
+# a one-factor session apart from a two-factor one:
 #
 #   * ``auth_time`` — the wall-clock second the session was first established.
 #     It is preserved verbatim when the cookie is re-minted on each request, so
@@ -129,10 +130,17 @@ def verify_token(secret: str, token: str, purpose: str, max_age: int) -> str | N
 #   * ``epoch`` — a per-user revocation counter copied from the user record at
 #     issue time. Bumping the stored counter (on disable / password reset /
 #     claim change) invalidates every cookie minted with the old value.
+#   * ``mfa`` — a tamper-proof factor marker (``1`` when a real second factor
+#     was verified when the session was established, else ``0``). It lives
+#     inside the signed subject, so it cannot be forged without the signing
+#     key, and it lets a privileged entry point refuse a single-factor cookie
+#     (finding idp-2026-10-06 F6).
 #
 # These are packed into the token *subject* with ``|`` as the separator. The
 # username charset (see ``app._USERNAME_RE``) excludes ``|`` and ``:``, so the
-# outer four-field ``:`` token format is unaffected.
+# outer four-field ``:`` token format is unaffected. The ``mfa`` field is
+# appended last so an older three-field cookie (minted before the field
+# existed) still verifies — it is simply read back as single-factor.
 _SESSION_SEP = "|"
 
 
@@ -142,9 +150,10 @@ def issue_session_token(
     *,
     auth_time: int,
     epoch: int,
+    mfa: bool = False,
     now: int | None = None,
 ) -> str:
-    """Issue a session token binding ``auth_time`` and the revocation ``epoch``.
+    """Issue a session token binding ``auth_time``, ``epoch`` and ``mfa``.
 
     Args:
         secret: The application root secret.
@@ -152,12 +161,18 @@ def issue_session_token(
         auth_time: The second the session was first established (absolute-cap
             anchor); preserved across re-mints.
         epoch: The user's current revocation counter.
+        mfa: Whether a real second factor was verified when the session was
+            established. Preserved across re-mints so sliding the idle window
+            never upgrades a one-factor session to two-factor.
         now: Optional issue timestamp override (seconds) for the idle window.
 
     Returns:
         The encoded session token string.
     """
-    subject = f"{username}{_SESSION_SEP}{int(auth_time)}{_SESSION_SEP}{int(epoch)}"
+    subject = (
+        f"{username}{_SESSION_SEP}{int(auth_time)}"
+        f"{_SESSION_SEP}{int(epoch)}{_SESSION_SEP}{1 if mfa else 0}"
+    )
     return issue_token(secret, subject, PURPOSE_SESSION, now=now)
 
 
@@ -166,13 +181,17 @@ def verify_session_token(
     token: str,
     idle_max_age: int,
     absolute_max_age: int,
-) -> tuple[str, int, int] | None:
+) -> tuple[str, int, int, bool] | None:
     """Verify a session token against the idle *and* absolute lifetime limits.
 
     The signed issue timestamp is treated as the last-activity marker (the
     cookie is re-minted on each authenticated request) and is checked against
     ``idle_max_age``. The embedded ``auth_time`` is checked against
     ``absolute_max_age`` so an actively-used session still faces a hard ceiling.
+
+    An older three-field token (minted before the ``mfa`` marker existed)
+    verifies as single-factor rather than being rejected, so the field is a
+    backward-compatible extension of the signed subject.
 
     Args:
         secret: The application root secret.
@@ -181,23 +200,27 @@ def verify_session_token(
         absolute_max_age: Maximum seconds since the session was established.
 
     Returns:
-        ``(username, auth_time, epoch)`` if valid, else ``None``.
+        ``(username, auth_time, epoch, mfa)`` if valid, else ``None``.
     """
     subject = verify_token(secret, token, PURPOSE_SESSION, idle_max_age)
     if subject is None:
         return None
     parts = subject.split(_SESSION_SEP)
-    if len(parts) != 3:
+    if len(parts) == 3:
+        # Legacy cookie without the mfa marker — treat as single-factor.
+        parts = [*parts, "0"]
+    if len(parts) != 4:
         return None
-    username, auth_time_str, epoch_str = parts
+    username, auth_time_str, epoch_str, mfa_str = parts
     try:
         auth_time = int(auth_time_str)
         epoch = int(epoch_str)
+        mfa = int(mfa_str)
     except ValueError:
         return None
     if auth_time < 0 or time.time() - auth_time > absolute_max_age:
         return None
-    return username, auth_time, epoch
+    return username, auth_time, epoch, bool(mfa)
 
 
 @dataclass

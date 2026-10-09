@@ -45,8 +45,10 @@ def _admin_session_cookie(app) -> str:
 
     from identity_provider_server.tokens import issue_session_token
 
+    # Admin panel entry requires a two-factor session (finding
+    # idp-2026-10-06 F6); simulate a password+TOTP admin login.
     return issue_session_token(
-        app.secret_key, "admin", auth_time=int(_time.time()), epoch=0,
+        app.secret_key, "admin", auth_time=int(_time.time()), epoch=0, mfa=True,
     )
 
 

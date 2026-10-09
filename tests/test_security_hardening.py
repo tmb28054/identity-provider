@@ -36,7 +36,7 @@ def test_session_token_roundtrip_smoke():
     now = int(__import__("time").time())
     tok = tokens.issue_session_token("s3cret", "alice", auth_time=now, epoch=2, now=now)
     out = tokens.verify_session_token("s3cret", tok, 3600, 12 * 3600)
-    assert out == ("alice", now, 2)
+    assert out == ("alice", now, 2, False)
 
 
 def test_session_token_absolute_cap_enforced():

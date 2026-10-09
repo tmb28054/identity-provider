@@ -470,6 +470,7 @@ def register_admin_routes(
     services_path: Path | None = None,
     reload_services_fn=None,
     verify_session_cookie_fn=None,
+    session_mfa_fn=None,
     set_session_cookie_fn=None,
     audit_logger=None,
     data_dir: Path | None = None,
@@ -565,13 +566,26 @@ def register_admin_routes(
             return False
         return claim in user.get("claims", [])
 
-    def _admin_session_ok(session_user: str | None) -> bool:
-        """Authorize a session-cookie admin entry: idpadmin claim + usable."""
-        return bool(
+    def _admin_session_ok(session_user: str | None, cookie_val: str = "") -> bool:
+        """Authorize a session-cookie admin entry.
+
+        Requires the idpadmin claim, a usable account, AND — because a second
+        factor is MANDATORY for administrators — that the session cookie was
+        established with a verified second factor. The ``idp_session`` cookie
+        carries a signed factor marker (``mfa``); a single-factor cookie (e.g.
+        a password-only SP login, or a bare SP passkey without user
+        verification) is refused here even for an idpadmin, closing the GET
+        /admin bypass of the mandatory-MFA gate (finding idp-2026-10-06 F6).
+        """
+        if not (
             session_user
             and _has_claim(session_user, "idpadmin")
             and _account_usable(session_user)
-        )
+        ):
+            return False
+        # Enforce the mandatory second factor on the cookie entry path. When no
+        # mfa predicate was wired in, fall back to refusing (fail closed).
+        return bool(session_mfa_fn and session_mfa_fn(cookie_val))
 
     def _require_admin(auth_token: str) -> str | None:
         """Return the admin username if the token is valid and holds idpadmin.
@@ -832,8 +846,9 @@ def register_admin_routes(
     def admin_get():
         # Check session cookie — skip login if user has idpadmin claim
         if verify_session_cookie_fn:
-            session_user = verify_session_cookie_fn(request.cookies.get("idp_session", ""))
-            if _admin_session_ok(session_user):
+            cookie_val = request.cookies.get("idp_session", "")
+            session_user = verify_session_cookie_fn(cookie_val)
+            if _admin_session_ok(session_user, cookie_val):
                 if audit_logger:
                     audit_logger.log(
                         username=session_user,
@@ -936,8 +951,17 @@ def register_admin_routes(
             return jsonify({"error": "Authentication session expired."}), 400
         username = entry["username"]
         user = users.get(username)
-        # Re-check idpadmin at finish (begin/finish are separate requests).
-        if not user or not _has_claim(username, "idpadmin"):
+        # Re-run the SAME eligibility predicate the begin step used (enabled,
+        # not forced-rotation, holds idpadmin). The account can be disabled or
+        # flagged between begin and finish (separate requests); the earlier
+        # claim-only re-check let a just-disabled admin complete the ceremony
+        # and mint a fresh session (finding idp-2026-10-06 F2).
+        if not (
+            user
+            and user.get("enabled") is not False
+            and not user.get("must_set_password")
+            and _has_claim(username, "idpadmin")
+        ):
             _rl_record()
             _rl_record(username)
             return jsonify({"error": "Unknown passkey."}), 400
@@ -978,7 +1002,10 @@ def register_admin_routes(
             )
         resp = jsonify({"redirect": "/admin"})
         if set_session_cookie_fn:
-            set_session_cookie_fn(resp, username)
+            # Admin passkeys require user verification (require_uv=True), so the
+            # assertion proves two factors (possession + PIN/biometric). Mark
+            # the session two-factor so the admin-entry gate accepts it.
+            set_session_cookie_fn(resp, username, mfa=True)
         return resp
 
     @app.post("/admin")
@@ -1181,7 +1208,11 @@ def register_admin_routes(
                 )
             resp = _render_panel(auth_token)
             if set_session_cookie_fn:
-                set_session_cookie_fn(resp, username)
+                # The admin login path enforces a mandatory second factor for
+                # idpadmin accounts above, so this session is two-factor. Mark
+                # it so the GET admin-entry gate accepts it (finding
+                # idp-2026-10-06 F6).
+                set_session_cookie_fn(resp, username, mfa=True)
             return resp
 
         # All other actions require a valid auth token with idpadmin
@@ -1326,6 +1357,20 @@ def register_admin_routes(
             user = users.get(target)
             if not user:
                 return _render_panel(auth_token, error=f"User '{target}' not found.")
+            # A second factor is MANDATORY for administrators. Refuse to strip
+            # the last factor from an idpadmin account: TOTP may only be removed
+            # when a registered passkey remains, otherwise the account would be
+            # left able to log in with a password alone — the very precondition
+            # the GET /admin bypass exploited (finding idp-2026-10-06 F6).
+            if _has_claim(target, "idpadmin") and not wf.get_credentials(user):
+                return _render_panel(
+                    auth_token,
+                    error=(
+                        f"Cannot remove MFA for '{target}': administrators must "
+                        "keep a second factor. Register a passkey first, or "
+                        "revoke the idpadmin claim before removing MFA."
+                    ),
+                )
             user.pop("totp_secret", None)
             # Removing a factor must revoke the target's live sessions, matching
             # reset_password / set_claims (finding idp-20261003 F7).
@@ -1876,8 +1921,9 @@ def register_admin_routes(
     @app.get("/admin/backups")
     def admin_backups_get():
         if verify_session_cookie_fn:
-            session_user = verify_session_cookie_fn(request.cookies.get("idp_session", ""))
-            if _admin_session_ok(session_user):
+            cookie_val = request.cookies.get("idp_session", "")
+            session_user = verify_session_cookie_fn(cookie_val)
+            if _admin_session_ok(session_user, cookie_val):
                 auth_token = _issue_token(session_user)
                 return _render_backups(auth_token)
         return app.redirect("/admin")
@@ -2029,8 +2075,9 @@ def register_admin_routes(
             return app.redirect("/admin")
         # Check session cookie
         if verify_session_cookie_fn:
-            session_user = verify_session_cookie_fn(request.cookies.get("idp_session", ""))
-            if _admin_session_ok(session_user):
+            cookie_val = request.cookies.get("idp_session", "")
+            session_user = verify_session_cookie_fn(cookie_val)
+            if _admin_session_ok(session_user, cookie_val):
                 auth_token = _issue_token(session_user)
                 return _render_user_detail(target_username, auth_token)
         # No session — redirect to admin login

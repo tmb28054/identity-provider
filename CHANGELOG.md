@@ -72,6 +72,34 @@ a flagged architectural follow-up). See `docs/security-review-20261006-response.
   string at all four redirect sites (SSO short-circuit GET, MFA tail, password
   tail, passkey JSON), keeping it out of access logs and the Referer header.
   The SAML auto-POST delivery path is unchanged.
+- **Mandatory administrator MFA enforced on the GET /admin entry path** (High,
+  Finding 6 — admin-MFA bypass): the `idp_session` cookie now carries a signed,
+  tamper-proof factor marker (`mfa`) packed into the token subject
+  (`username|auth_time|epoch|mfa`); `issue_session_token` /
+  `verify_session_token` set and read it in a backward-compatible way (an older
+  three-field cookie verifies as single-factor instead of crashing). Every
+  `_set_session_cookie` call site populates the marker — the SP/`/admin` TOTP
+  legs and the admin passkey finish (which requires user verification) mark the
+  session two-factor, while the password-only and bare SP-passkey paths stay
+  single-factor — and the session-reuse path preserves it verbatim so activity
+  alone never upgrades a one-factor session. The three session-cookie admin
+  entry points (`GET /admin`, `GET /admin/backups`, `GET /admin/user/<u>`) now
+  refuse a single-factor cookie via `_admin_session_ok`, so a password-only (or
+  user-verification-less passkey) session can no longer skip the mandatory-MFA
+  gate to render the panel or mint a `PURPOSE_ADMIN` step-up token. A TOTP-less
+  idpadmin cannot reach the panel via GET at all. As a hardening precondition,
+  `remove_mfa` refuses to strip the last factor from an idpadmin account unless
+  a registered passkey remains. See review idp-2026-10-06, Finding 6.
+- **Account-eligibility re-check restored on three second-leg handlers**
+  (Medium, Finding 2): the SP-login TOTP leg, the `/user` TOTP leg, and the
+  admin passkey finish now re-run the full eligibility predicate immediately
+  before issuance — matching the SP passkey finish handler — so an account
+  disabled or locked between the first and second legs is refused with the
+  existing generic error and no success audit record or credential is emitted.
+  The SP/`/user` TOTP legs add `_user_can_login` + `_account_locked` to the
+  existing `totp_secret` check; the admin passkey finish extends its claim-only
+  re-check to the begin-time predicate (enabled, not forced-rotation, holds
+  idpadmin). See review idp-2026-10-06, Finding 2.
 
 ### Changed (code review idp-2026-10-06)
 

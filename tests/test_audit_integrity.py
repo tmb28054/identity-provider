@@ -53,7 +53,11 @@ def _admin_client(app):
     client = app.test_client()
     client.set_cookie(
         "idp_session",
-        issue_session_token(GOOD_SECRET, "admin", auth_time=int(time.time()), epoch=0),
+        # Admin panel entry requires a two-factor session (finding
+        # idp-2026-10-06 F6); simulate a password+TOTP admin login.
+        issue_session_token(
+            GOOD_SECRET, "admin", auth_time=int(time.time()), epoch=0, mfa=True,
+        ),
         domain="localhost",
     )
     return client

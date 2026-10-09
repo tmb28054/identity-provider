@@ -254,7 +254,9 @@ def test_admin_remove_mfa_bumps_epoch(tmp_path):
     client = app.test_client()
     client.set_cookie(
         "idp_session",
-        issue_session_token(GOOD_SECRET, "admin", auth_time=int(time.time()), epoch=0),
+        issue_session_token(
+            GOOD_SECRET, "admin", auth_time=int(time.time()), epoch=0, mfa=True,
+        ),
         domain="localhost",
     )
     panel = client.get("/admin").data.decode()
@@ -591,7 +593,9 @@ def _admin_client(app):
     client = app.test_client()
     client.set_cookie(
         "idp_session",
-        issue_session_token(GOOD_SECRET, "admin", auth_time=int(time.time()), epoch=0),
+        issue_session_token(
+            GOOD_SECRET, "admin", auth_time=int(time.time()), epoch=0, mfa=True,
+        ),
         domain="localhost",
     )
     return client

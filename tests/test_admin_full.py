@@ -24,12 +24,17 @@ from identity_provider_server.tokens import issue_session_token
 DATA_SRC = Path(__file__).parent.parent / "data"
 
 
-def _session_cookie(secret: str, username: str) -> str:
-    """Mint a session cookie in the current (epoch + auth_time) scheme."""
+def _session_cookie(secret: str, username: str, *, mfa: bool = True) -> str:
+    """Mint a session cookie in the current (epoch + auth_time + mfa) scheme.
+
+    Admin panel entry now requires a two-factor session (finding
+    idp-2026-10-06 F6), so these helpers mint a two-factor cookie by default to
+    simulate an admin who logged in with a password plus a second factor.
+    """
     import time as _time
 
     return issue_session_token(
-        secret, username, auth_time=int(_time.time()), epoch=0,
+        secret, username, auth_time=int(_time.time()), epoch=0, mfa=mfa,
     )
 ADMIN_TOTP = pyotp.random_base32()
 
@@ -606,6 +611,7 @@ def test_helpers_fallback_without_validators(tmp_path):
         make_challenge_fn=lambda: ("Q", "H"),
         verify_challenge_fn=lambda a, h: True,
         verify_session_cookie_fn=lambda c: "admin" if c else None,
+        session_mfa_fn=lambda c: True,  # two-factor session (F6 gate)
         services_path=None,
         data_dir=None,
         # validate_username_fn / validate_claim_fn / password_policy_fn /
@@ -1040,6 +1046,7 @@ def test_save_services_calls_reload_fn(_kill, tmp_path):
         make_challenge_fn=lambda: ("Q", "H"),
         verify_challenge_fn=lambda a, h: True,
         verify_session_cookie_fn=lambda c: "admin" if c else None,
+        session_mfa_fn=lambda c: True,  # two-factor session (F6 gate)
         services_path=tmp_path / "services.yaml",
         reload_services_fn=lambda: reloaded.__setitem__("n", reloaded["n"] + 1),
         data_dir=tmp_path,
@@ -1077,6 +1084,7 @@ def test_backups_no_data_dir(tmp_path):
         make_challenge_fn=lambda: ("Q", "H"),
         verify_challenge_fn=lambda a, h: True,
         verify_session_cookie_fn=lambda c: "admin" if c else None,
+        session_mfa_fn=lambda c: True,  # two-factor session (F6 gate)
         services_path=None, data_dir=None,
     )
     flask_app.config["TESTING"] = True
