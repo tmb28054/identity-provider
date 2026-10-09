@@ -103,9 +103,11 @@ def test_account_locks_after_threshold(tmp_path):
     assert bob.get("failed_count", 0) >= 10
 
 
-def test_prelocked_account_shows_locked_message(tmp_path):
-    """An account already within its lockout hold gets the lock message, even
-    on the first request (no per-IP window involvement)."""
+def test_prelocked_account_returns_generic_throttle_message(tmp_path):
+    """An account already within its lockout hold is still refused with 429 on
+    the first request, but the body is the GENERIC rate-limit message — it must
+    NOT disclose that the account is locked (and therefore exists). Only the
+    audit record keeps the true ``account_locked`` reason (idp-2026-10-06 F5)."""
     app = _app(tmp_path, [
         {"username": "bob", "password": _hash(),
          "roles": [{"account_id": "1", "role": "R"}], "claims": [],
@@ -114,7 +116,11 @@ def test_prelocked_account_shows_locked_message(tmp_path):
     client = app.test_client()
     resp = _login_post(client, "/aws", "bob", PW)
     assert resp.status_code == 429
-    assert b"locked" in resp.data.lower()
+    assert b"Too many attempts. Try again later." in resp.data
+    assert b"locked" not in resp.data.lower()
+    # The operator-facing audit record still records the real cause.
+    audit = (tmp_path / "audit.log").read_text()
+    assert '"reason":"account_locked"' in audit
 
 
 # --- F4: password history ---------------------------------------------------

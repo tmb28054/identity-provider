@@ -668,6 +668,10 @@ _BCRYPT_PREFIXES = ("$2a$", "$2b$", "$2y$")
 # value is unusable so an attacker cannot distinguish that case from a wrong
 # password. It is never expected to match any real input.
 _DUMMY_BCRYPT_HASH = b"$2b$12$xqbTfXWMEaMp3sym0SL0/.xghcHMx7WPgGncfpJYimAFLypk8ddDm"
+# A short, always-under-72-byte input for the dummy timing check so the dummy
+# path can never itself raise (bcrypt rejects >72-byte inputs). Used when the
+# real candidate is over-long and must be refused without hitting ``checkpw``.
+_DUMMY_PASSWORD = b"x"
 
 
 def _user_can_login(user: dict[str, Any]) -> bool:
@@ -714,6 +718,14 @@ def _check_password(stored: str, provided: str) -> bool:
     """
     import bcrypt
 
+    # bcrypt 5.0.0 raises ValueError on inputs over 72 bytes instead of
+    # truncating, so an over-long candidate must never reach ``checkpw`` with
+    # the raw value. Refuse it, but still spend one dummy bcrypt check (with a
+    # short, always-valid input) so timing does not distinguish this case and
+    # no ValueError can propagate to the caller (finding idp-2026-10-06 F4).
+    if len(provided.encode("utf-8")) > MAX_PASSWORD_BYTES:
+        bcrypt.checkpw(_DUMMY_PASSWORD, _DUMMY_BCRYPT_HASH)
+        return False
     if stored.startswith(_BCRYPT_PREFIXES):
         return bcrypt.checkpw(provided.encode(), stored.encode())
     # Non-bcrypt stored value: refuse, but spend comparable time.
@@ -775,6 +787,11 @@ class _RateLimiter:
 
 
 MIN_PASSWORD_LENGTH = 12
+# bcrypt (5.0.0, constraints.txt) raises ValueError for inputs over 72 bytes
+# rather than silently truncating, so cap the UTF-8 byte length up front. The
+# cap is measured on the encoded form because bcrypt counts bytes, not code
+# points (finding idp-2026-10-06 F4).
+MAX_PASSWORD_BYTES = 72
 
 # Durable account lockout. The sliding-window rate limiter bounds burst guessing
 # but self-clears after its window; these settings add a persisted lockout so a
@@ -797,7 +814,8 @@ def _now_iso() -> str:
 def _password_policy_error(password: str) -> str | None:
     """Validate a password against the complexity policy.
 
-    Requires at least ``MIN_PASSWORD_LENGTH`` characters and a mix of character
+    Requires at least ``MIN_PASSWORD_LENGTH`` characters, at most
+    ``MAX_PASSWORD_BYTES`` bytes (bcrypt's hard limit), and a mix of character
     classes (lower, upper, digit, symbol — at least three of the four).
 
     Args:
@@ -808,6 +826,8 @@ def _password_policy_error(password: str) -> str | None:
     """
     if not password or len(password) < MIN_PASSWORD_LENGTH:
         return f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
+    if len(password.encode("utf-8")) > MAX_PASSWORD_BYTES:
+        return f"Password must be at most {MAX_PASSWORD_BYTES} bytes."
     classes = sum(
         bool(match)
         for match in (
@@ -2082,6 +2102,12 @@ def create_app(
             ), 401
 
         # Durable per-account lockout (survives the sliding window and restarts).
+        # The user-facing body/status is IDENTICAL to the sliding-window branch
+        # below so a locked REAL account cannot be told apart from an unknown
+        # username (which only ever hits the sliding-window path): both read
+        # "Too many attempts. Try again later." / 429. The audit record keeps
+        # the true ``account_locked`` reason so operators still see the cause in
+        # the hash-chained log (finding idp-2026-10-06 F5).
         if _account_locked(username):
             audit.log(
                 username=username,
@@ -2095,7 +2121,7 @@ def create_app(
             question, new_hash = _make_challenge()
             return render_template_string(
                 LOGIN_FORM,
-                error="Account temporarily locked. Try again later.",
+                error="Too many attempts. Try again later.",
                 csrf_token=_generate_csrf_token(),
                 challenge_question=question,
                 challenge_hash=new_hash,
@@ -2153,7 +2179,22 @@ def create_app(
                 service_title=title,
             ), 401
 
-        success, auth_result = _authenticate_user(username, password)
+        # Count the attempt toward throttling and the durable lockout even if
+        # the credential check itself raises (e.g. a malformed stored hash). An
+        # exception must never bypass the failure bookkeeping and let an
+        # attacker probe for free (finding idp-2026-10-06 F4).
+        try:
+            success, auth_result = _authenticate_user(username, password)
+        except Exception:  # pylint: disable=broad-except  # noqa: BLE001
+            # Any failure here is a failed attempt; record it, then re-raise so
+            # the catch-all handler still returns a generic 500. The broad catch
+            # is intentional — the bookkeeping must run for every exception type.
+            rate_limiter.record(_rl_key(client_ip, username))
+            rate_limiter.record(client_ip)
+            if username:
+                rate_limiter.record(f"acct:{username}")
+                _register_auth_failure(username)
+            raise
         if not success:
             rate_limiter.record(_rl_key(client_ip, username))
             rate_limiter.record(client_ip)  # also throttle at the IP level

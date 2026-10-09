@@ -133,6 +133,40 @@ a flagged architectural follow-up). See `docs/security-review-20261006-response.
   only route to `CERT_NONE` and now logs at WARNING on every authentication.
   `docs/faq.md` and `docs/configuration.md` are corrected to describe the new
   default. See review idp-2026-10-06, Finding 7.
+- **Maximum password length enforced so bcrypt can never raise mid-login**
+  (Low, Finding 4 — unbounded password → bcrypt `ValueError` → unhandled 500
+  that skipped failure accounting): the pinned `bcrypt==5.0.0` raises
+  `ValueError` on inputs over 72 bytes instead of truncating, so an anonymous
+  login POST that solved the captcha and named an existing, enabled account
+  with a 73+-byte password reached `bcrypt.checkpw` and raised; the catch-all
+  handler returned a generic 500 but unwound BEFORE the three
+  `rate_limiter.record` calls and `_register_auth_failure`, so the probe was
+  never counted toward any rate-limit bucket or the durable lockout and each
+  attempt appended a stack-trace audit record. A new `MAX_PASSWORD_BYTES = 72`
+  cap (measured on the UTF-8 encoding) is enforced in `_password_policy_error`,
+  so enrollment, recovery, and the admin add-user/reset-password paths reject
+  over-long values up front before any `bcrypt.hashpw`. `_check_password` now
+  returns `False` immediately for an over-long candidate while still spending
+  one dummy `bcrypt.checkpw` (with a short, always-valid input) so timing is
+  unchanged and no `ValueError` can reach the caller. The SP-login credential
+  check is additionally wrapped so the per-IP/per-account `rate_limiter.record`
+  calls and `_register_auth_failure` run even if authentication raises, then the
+  exception re-raises — an exception can no longer bypass throttling or lockout.
+  See review idp-2026-10-06, Finding 4.
+- **Durable-lockout response no longer discloses account existence** (Low,
+  Finding 5 — username enumeration): a durable lockout is only ever entered by
+  an account that EXISTS, and the SP-login lockout branch returned
+  `"Account temporarily locked. Try again later."` / 429 — a body no other path
+  produced — while every path an unknown username took returned either
+  "Invalid credentials"/401 or the generic "Too many attempts. Try again
+  later."/429, letting an attacker confirm a valid username by reading the
+  distinct locked response. The SP-login lockout branch now returns the SAME
+  body and status as the sliding-window branch ("Too many attempts. Try again
+  later." / 429), so a locked real account is indistinguishable from an unknown
+  name. (The `/user` login path already emitted the generic response.) The
+  audit record keeps its true `reason="account_locked"`, so operators still see
+  the real cause in the hash-chained log. The lockout mechanism itself is
+  unchanged. See review idp-2026-10-06, Finding 5.
 
 ### Changed (code review idp-2026-10-06)
 
