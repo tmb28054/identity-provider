@@ -58,7 +58,7 @@ jobs:
         run: docker build -t idp-ci-scan:${{ github.sha }} .
 
       - name: Trivy image scan (OS packages + app deps)
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: idp-ci-scan:${{ github.sha }}
           scan-type: image
