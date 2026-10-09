@@ -4,7 +4,7 @@
 # Re-pin after a deliberate base-image bump with:
 #   docker buildx imagetools inspect python:3.13.7-slim
 # tag: python:3.13.7-slim
-FROM python:3.13.7-slim@sha256:8d9d0b8bcf6506481eae4907c18f5e3e7902e629f5f6d684f9e7c32e85e3ddf0
+FROM python:3.14.7-slim@sha256:51dafde81dbdb6ebde285137a295cf18a47ca95234fe388a343719cb97305b3d
 
 # Create an unprivileged user to run the service (never run as root).
 RUN groupadd --system idp && useradd --system --gid idp --home /app idp
