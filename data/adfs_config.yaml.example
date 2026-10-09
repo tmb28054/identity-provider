@@ -14,7 +14,16 @@ base_dn: "DC=corp,DC=example,DC=com"
 # Service account password
 password: "your-service-account-password"
 
+# Path to a PEM bundle for a private/internal CA (optional).
+# When set, ldaps:// server certificates are validated against this CA in
+# addition to the system trust store. Use this to trust an internal issuer
+# WITHOUT disabling verification. Leave unset to use the system trust store.
+# ca_certs_file: "/etc/idp/internal-ca.pem"
+
 # Skip TLS certificate verification for LDAP connections (optional, default: false)
-# Set to true if your AD server uses a self-signed or internal CA certificate.
-# Not recommended for production — install the CA certificate instead.
+# WARNING: this disables validation entirely and exposes the bind — including
+# the user's cleartext password and the memberOf groups that drive AWS role
+# mapping — to man-in-the-middle attacks. Prefer ca_certs_file for internal
+# CAs. Only enable for throwaway development environments. A WARNING is logged
+# on every authentication when this is active.
 # skip_ssl_verify: true

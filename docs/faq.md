@@ -224,7 +224,7 @@ The JWT is signed with RS256 using `idp.key`. Verify it with the public key from
 Check that:
 1. The `host` in your ADFS config is reachable from the server (try `telnet <host> 636` for LDAPS or port 389 for LDAP).
 2. The service account `username` and `password` are correct.
-3. If using `ldaps://`, the server's TLS certificate is trusted. Use `--skip-ldap-ssl-verify` for self-signed certs.
+3. If using `ldaps://`, the server's TLS certificate must be trusted. By default the certificate is validated against the system trust store, so a self-signed or internal-CA certificate will fail the bind until you trust its issuer. Point `ca_certs_file` in the ADFS config at your CA's PEM bundle to trust an internal CA without weakening validation. As a last resort for throwaway development only, `--skip-ldap-ssl-verify` disables validation entirely (not recommended — it exposes the bind to man-in-the-middle attacks).
 
 ---
 

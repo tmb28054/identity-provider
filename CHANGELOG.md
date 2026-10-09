@@ -100,6 +100,39 @@ a flagged architectural follow-up). See `docs/security-review-20261006-response.
   existing `totp_secret` check; the admin passkey finish extends its claim-only
   re-check to the begin-time predicate (enabled, not forced-rotation, holds
   idpadmin). See review idp-2026-10-06, Finding 2.
+- **Logout now revokes the session server-side** (Medium, Finding 3 — logout
+  performed no revocation): `GET /<sp>/logout` and the `/aws` fallback
+  previously only deleted the `idp_session` / `csrf_token` cookies, so the
+  surrendered stateless-HMAC cookie stayed a valid credential for the rest of
+  its idle/absolute window and could be replayed against the session-reuse GET
+  path to mint a fresh signed SAML assertion / RS256 JWT with no further
+  credential. Logout now resolves the session user and bumps their
+  `session_epoch` (persisted via `_save_users_and_update_mtime`), so the
+  surrendered cookie fails the epoch check in `_verify_session_cookie_full` and
+  can no longer mint anything. The handlers also write a hash-chained audit
+  record (`protocol="session"`, `result="success"`, `reason="logout"`) and now
+  require a `csrf_token` double-submit (query/form token matched against the
+  `csrf_token` cookie), so a third party cannot force a logout via an `<img>`
+  tag or cross-site link; a missing or mismatched token is refused with 403.
+  See review idp-2026-10-06, Finding 3.
+- **LDAP/AD bind enforces server-certificate validation by default** (High,
+  Finding 7 — ldap3 `CERT_NONE` default): `authenticate_adfs` previously built
+  an explicit `Tls` object only on the insecure branch, leaving `tls=None` on
+  the secure branch; ldap3 then substituted its own default `Tls()` whose
+  `validate` is `ssl.CERT_NONE`, so no configuration validated the ldaps://
+  server certificate and `--skip-ldap-ssl-verify` only toggled between two
+  non-validating configurations. Both the service-account bind and the
+  end-user cleartext-password bind crossed this unauthenticated channel, and
+  the returned `memberOf` group CNs flow into the AWS role attributes of a
+  validly signed assertion, so a MITM could steal credentials and inject a
+  privileged group. The secure branch now builds `Tls(validate=CERT_REQUIRED,
+  ca_certs_file=...)` and shares the one validated `Server` across both binds;
+  a new optional `ca_certs_file` config key (validated by `load_adfs_config`
+  and documented in `data/adfs_config.yaml.example`) lets an internal/private
+  CA be trusted without weakening validation. `skip_ssl_verify` remains the
+  only route to `CERT_NONE` and now logs at WARNING on every authentication.
+  `docs/faq.md` and `docs/configuration.md` are corrected to describe the new
+  default. See review idp-2026-10-06, Finding 7.
 
 ### Changed (code review idp-2026-10-06)
 

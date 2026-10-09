@@ -3370,6 +3370,54 @@ def create_app(
             _save_users_and_update_mtime(users_path, users)
         return _issue_passkey_login(username, service_path)
 
+    def _do_logout(path: str):
+        """Revoke the current session server-side and clear the cookies.
+
+        Beyond deleting the ``idp_session`` / ``csrf_token`` cookies, this bumps
+        the user's ``session_epoch`` so the surrendered stateless-HMAC cookie
+        can no longer be replayed against the session-reuse GET path to mint a
+        fresh assertion (finding idp-2026-10-06 F3). A ``csrf_token``
+        double-submit check (query/form token vs cookie) makes logout
+        unforgeable by a third-party ``<img>``/link, and the event is written to
+        the hash-chained audit log.
+
+        Args:
+            path: The service path whose logout was invoked (used for the audit
+                ``service`` field and the "sign in again" link).
+
+        Returns:
+            A Flask response: the logout page on success, or a 403 when the CSRF
+            double-submit token is missing or does not match.
+        """
+        form_token = request.values.get("csrf_token", "")
+        cookie_token = request.cookies.get("csrf_token", "")
+        if not form_token or not safe_compare(form_token, cookie_token):
+            logger.info("Rejected logout for service=%s: CSRF token mismatch", path)
+            return app.make_response(("Invalid request (CSRF)", 403))
+
+        username = _verify_session_cookie(
+            request.cookies.get(SESSION_COOKIE_NAME, "")
+        )
+        if username and not use_adfs and users_path is not None and username in users:
+            _bump_session_epoch_local(username)
+            _save_users_and_update_mtime(users_path, users)
+
+        audit.log(
+            username=username or "",
+            ip=request.remote_addr or "unknown",
+            service=path,
+            protocol="session",
+            result="success",
+            reason="logout",
+            user_agent=request.headers.get("User-Agent", ""),
+        )
+        resp = app.make_response(render_template_string(
+            LOGOUT_PAGE, service_path=path,
+        ))
+        resp.delete_cookie(SESSION_COOKIE_NAME)
+        resp.delete_cookie("csrf_token")
+        return resp
+
     # --- Register routes ---
     if _services:
         # Dynamic routes from services.yaml
@@ -3389,12 +3437,7 @@ def create_app(
 
             def _make_logout(path: str):
                 def _logout():
-                    resp = app.make_response(render_template_string(
-                        LOGOUT_PAGE, service_path=path,
-                    ))
-                    resp.delete_cookie(SESSION_COOKIE_NAME)
-                    resp.delete_cookie("csrf_token")
-                    return resp
+                    return _do_logout(path)
                 _logout.__name__ = f"logout_{path}"
                 return _logout
 
@@ -3450,12 +3493,7 @@ def create_app(
 
         @app.get("/aws/logout")
         def logout_aws():
-            resp = app.make_response(render_template_string(
-                LOGOUT_PAGE, service_path="aws",
-            ))
-            resp.delete_cookie(SESSION_COOKIE_NAME)
-            resp.delete_cookie("csrf_token")
-            return resp
+            return _do_logout("aws")
 
     @app.get("/metadata")
     def metadata():

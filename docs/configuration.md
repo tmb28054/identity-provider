@@ -561,14 +561,25 @@ identity-provider-server --adfs-config data/adfs_config.yaml
 - The ADFS config file contains a password — keep it secure (restrict file permissions, use Kubernetes Secrets in production).
 - Use `ldaps://` for the host to encrypt LDAP traffic with TLS.
 - The user search uses `sAMAccountName` — users log in with their AD username (not email or UPN).
-- Use `--skip-ldap-ssl-verify` to disable TLS certificate verification (e.g. for self-signed certs on the AD server). Not recommended for production.
+- On `ldaps://`, the server certificate is validated by default against the system trust store. Both the service-account bind and the end-user password bind cross this channel, and the returned `memberOf` groups drive AWS role mapping, so validation is enforced to block man-in-the-middle credential theft and group injection.
 
-### Skipping LDAP SSL verification
+### Trusting an internal / private CA
 
-If your AD server uses a self-signed or internal CA certificate that isn't in the system trust store:
+If your AD server presents a certificate issued by an internal CA that isn't in the system trust store, point `ca_certs_file` at that CA's PEM bundle in the ADFS config instead of disabling validation:
+
+```yaml
+# data/adfs_config.yaml
+ca_certs_file: "/etc/idp/internal-ca.pem"
+```
+
+The certificate is then validated against that CA (in addition to the system trust store). This keeps full certificate verification while trusting your private issuer.
+
+### Skipping LDAP SSL verification (not recommended)
+
+As a last resort for throwaway development environments:
 
 ```bash
 identity-provider-server --adfs-config data/adfs_config.yaml --skip-ldap-ssl-verify
 ```
 
-This disables certificate validation on the LDAP connection. Only takes effect when the host uses `ldaps://`. Use this for development or when you cannot install the CA certificate on the server.
+This disables certificate validation entirely on the `ldaps://` connection — it does **not** fall back to any partial check. The bind, including the user's cleartext password and the `memberOf` groups used for role mapping, becomes vulnerable to man-in-the-middle attacks, so a MITM could both steal credentials and inject a privileged group CN into a validly signed assertion. A WARNING is logged on every authentication while this is active. Prefer `ca_certs_file` for internal CAs. Only takes effect when the host uses `ldaps://`.

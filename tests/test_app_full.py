@@ -1321,7 +1321,9 @@ def test_users_digest_none_on_missing(tmp_path):
 
 def test_logout_fallback_route(tmp_path):
     app = _write_app(tmp_path, [{"username": "bob", "password": _hash(), "roles": [], "claims": []}])
-    resp = app.test_client().get("/aws/logout")
+    client = app.test_client()
+    client.set_cookie("csrf_token", "tok")
+    resp = client.get("/aws/logout?csrf_token=tok")
     assert resp.status_code == 200
 
 
@@ -1331,7 +1333,9 @@ def test_logout_dynamic_route(tmp_path):
         [{"username": "bob", "password": _hash(), "roles": [], "claims": []}],
         services={"saml": {"aws": "https://signin.aws.amazon.com/saml"}},
     )
-    resp = app.test_client().get("/aws/logout")
+    client = app.test_client()
+    client.set_cookie("csrf_token", "tok")
+    resp = client.get("/aws/logout?csrf_token=tok")
     assert resp.status_code == 200
 
 

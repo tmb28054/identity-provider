@@ -8,6 +8,8 @@ The ADFS config file is a YAML file with keys:
     username: Bind DN or user (e.g. CN=svc-idp,OU=Service,DC=corp,DC=com)
     base_dn: Base DN for user searches (e.g. DC=corp,DC=com)
     password: Bind password
+    ca_certs_file: Optional PEM bundle for a private CA used to validate
+        ldaps:// server certificates (defaults to the system trust store)
 
 If the config file does not exist, the user is prompted for the values
 and the file is written automatically.
@@ -69,7 +71,8 @@ def load_adfs_config(config_path: str | Path) -> dict[str, str]:
         config_path: Path to the ADFS config YAML file.
 
     Returns:
-        Dict with keys: host, username, base_dn, password.
+        Dict with keys: host, username, base_dn, password, and the optional
+        ca_certs_file (a PEM bundle path for a private CA).
     """
     import yaml
 
@@ -87,6 +90,18 @@ def load_adfs_config(config_path: str | Path) -> dict[str, str]:
         print(f"Error: ADFS config {path} is missing required keys: {missing}", file=sys.stderr)
         sys.exit(1)
 
+    # Optional: path to a PEM bundle for a private/internal CA, so ldaps://
+    # certificate validation can trust an internal issuer without disabling
+    # verification (finding idp-2026-10-06 F7). Reject a non-string value early.
+    ca_certs_file = config.get("ca_certs_file")
+    if ca_certs_file is not None and not isinstance(ca_certs_file, str):
+        logger.error("ADFS config %s has a non-string ca_certs_file", path)
+        print(
+            f"Error: ADFS config {path} key 'ca_certs_file' must be a string path",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     return config
 
 
@@ -102,8 +117,11 @@ def authenticate_adfs(
     Args:
         username: The username to authenticate (sAMAccountName).
         password: The user's password.
-        adfs_config: Dict with host, username (bind DN), base_dn, password (bind password).
-        skip_ssl_verify: If True, disable TLS certificate verification for LDAP connections.
+        adfs_config: Dict with host, username (bind DN), base_dn, password (bind
+            password), and an optional ca_certs_file (PEM bundle for a private CA
+            used to validate ldaps:// certificates).
+        skip_ssl_verify: If True, disable TLS certificate verification for LDAP
+            connections. Insecure; logged at WARNING on every use.
 
     Returns:
         List of group CNs the user belongs to, or None if authentication failed.
@@ -128,11 +146,30 @@ def authenticate_adfs(
 
     use_ssl = host.startswith("ldaps://")
 
-    # Configure TLS settings
+    # Configure TLS settings. On ldaps:// the server certificate is validated
+    # against the system trust store (or an explicit ``ca_certs_file``) by
+    # default; this is the only safe posture, since the service-account bind,
+    # the end-user cleartext-password bind, and the returned ``memberOf`` group
+    # CNs (which drive AWS role mapping) all cross this channel. ldap3 would
+    # otherwise substitute a default ``Tls()`` whose ``validate`` is
+    # ``ssl.CERT_NONE``, so leaving ``tls=None`` silently disables validation
+    # (finding idp-2026-10-06 F7). For plain ldap:// there is no TLS to build.
     tls = None
-    if use_ssl and skip_ssl_verify:
-        tls = Tls(validate=ssl.CERT_NONE)
-        logger.debug("LDAP SSL certificate verification disabled")
+    if use_ssl:
+        if skip_ssl_verify:
+            # skip_ssl_verify is an explicit, documented opt-in to the
+            # non-validating LDAP channel; keep it available for throwaway dev.
+            tls = Tls(validate=ssl.CERT_NONE)
+            logger.warning(
+                "LDAP SSL certificate verification DISABLED (skip_ssl_verify); "
+                "the channel to %s is vulnerable to MITM",
+                host,
+            )
+        else:
+            tls = Tls(
+                validate=ssl.CERT_REQUIRED,
+                ca_certs_file=adfs_config.get("ca_certs_file") or None,
+            )
 
     # First, bind with the service account to look up the user's DN
     try:
