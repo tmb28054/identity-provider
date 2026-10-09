@@ -1831,3 +1831,125 @@ def test_enroll_page_shows_passwordless_toggle(tmp_path):
     })
     assert b"Password-less sign-in" in page.data
     assert b'value="set_passwordless"' in page.data
+
+
+# --- create_app as single config entry point (finding idp-2026-10-06 F1) ----
+
+
+def _write_data_files(tmp_path, users=None):
+    """Copy cert/key and a users.json into tmp_path (no create_app call)."""
+    shutil.copy(DATA_SRC / "idp.crt", tmp_path / "idp.crt")
+    shutil.copy(DATA_SRC / "idp.key", tmp_path / "idp.key")
+    (tmp_path / "users.json").write_text(json.dumps(users or []))
+
+
+def test_create_app_reads_config_yaml_no_kwargs(tmp_path):
+    """config.yaml alone drives trust_proxy and webauthn via create_app()."""
+    from werkzeug.middleware.proxy_fix import ProxyFix
+
+    _write_data_files(tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "server": {"trust_proxy": True},
+                "webauthn": {
+                    "enabled": True,
+                    "rp_id": "idp.example.com",
+                    "rp_name": "Example IdP",
+                    "expected_origin": "https://idp.example.com",
+                },
+            }
+        )
+    )
+
+    app = create_app(str(tmp_path))
+
+    assert isinstance(app.wsgi_app, ProxyFix)
+    assert app.config["WEBAUTHN_ENABLED"] is True
+    assert app.config["WEBAUTHN_RP_ID"] == "idp.example.com"
+    assert app.config["WEBAUTHN_RP_NAME"] == "Example IdP"
+    assert app.config["WEBAUTHN_EXPECTED_ORIGIN"] == "https://idp.example.com"
+
+
+def test_create_app_reads_idp_env_vars_no_kwargs(tmp_path, monkeypatch):
+    """IDP_* env vars drive trust_proxy/webauthn via create_app() (no file)."""
+    from werkzeug.middleware.proxy_fix import ProxyFix
+
+    _write_data_files(tmp_path)
+    monkeypatch.setenv("IDP_TRUST_PROXY", "true")
+    monkeypatch.setenv("IDP_WEBAUTHN_ENABLED", "true")
+    monkeypatch.setenv("IDP_WEBAUTHN_RP_ID", "idp.env.test")
+    monkeypatch.setenv("IDP_WEBAUTHN_EXPECTED_ORIGIN", "https://idp.env.test")
+
+    app = create_app(str(tmp_path))
+
+    assert isinstance(app.wsgi_app, ProxyFix)
+    assert app.config["WEBAUTHN_ENABLED"] is True
+    assert app.config["WEBAUTHN_RP_ID"] == "idp.env.test"
+    assert app.config["WEBAUTHN_EXPECTED_ORIGIN"] == "https://idp.env.test"
+
+
+def test_create_app_explicit_kwarg_overrides_config(tmp_path):
+    """An explicit kwarg still wins over config.yaml (CLI-launcher path)."""
+    from werkzeug.middleware.proxy_fix import ProxyFix
+
+    _write_data_files(tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"server": {"trust_proxy": True}})
+    )
+
+    # Caller passes trust_proxy=False explicitly: it must shadow the config.
+    app = create_app(str(tmp_path), trust_proxy=False)
+
+    assert not isinstance(app.wsgi_app, ProxyFix)
+
+
+def test_unconsumed_config_guard_fires(tmp_path, caplog):
+    """The guard raises and logs at ERROR when a supplied field is dropped."""
+    from identity_provider_server.app import (
+        ConfigNotConsumedError,
+        _assert_config_consumed,
+    )
+    from identity_provider_server.config import load_config
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"server": {"trust_proxy": True}})
+    )
+    cfg = load_config(str(tmp_path))
+
+    # Feed a resolved map that is missing a mapped field (trust_proxy) to
+    # simulate a loader field that was never threaded through create_app.
+    resolved = {"host": cfg.server.host, "port": cfg.server.port}
+
+    with caplog.at_level("ERROR"):
+        with pytest.raises(ConfigNotConsumedError) as excinfo:
+            _assert_config_consumed(str(tmp_path), cfg, resolved)
+
+    assert "trust_proxy" in str(excinfo.value)
+    assert any("not applied" in rec.message for rec in caplog.records)
+
+
+def test_unconsumed_config_guard_silent_without_config(tmp_path):
+    """With no config file or env vars, the guard never fires on any input."""
+    from identity_provider_server.app import _assert_config_consumed
+    from identity_provider_server.config import load_config
+
+    cfg = load_config(str(tmp_path))
+    # Even a deliberately empty resolved map is fine: nothing was supplied.
+    _assert_config_consumed(str(tmp_path), cfg, {})
+
+
+@pytest.mark.smoke
+def test_create_app_config_entrypoint_smoke(tmp_path):
+    """Smoke: documented create_app('/data') path honors config end-to-end."""
+    from werkzeug.middleware.proxy_fix import ProxyFix
+
+    _write_data_files(tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"server": {"trust_proxy": True}})
+    )
+
+    app = create_app(str(tmp_path))
+
+    assert app is not None
+    assert isinstance(app.wsgi_app, ProxyFix)

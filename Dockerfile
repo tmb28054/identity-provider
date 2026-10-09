@@ -33,4 +33,7 @@ HEALTHCHECK --interval=10s --timeout=5s --retries=3 --start-period=5s \
 ENTRYPOINT ["gunicorn"]
 # Single worker: in-memory rate-limit and single-use nonce state is per-process.
 # Behind a TLS-terminating proxy, so ProxyFix + Secure cookies apply.
+# create_app('/data') is the single configuration entry point: it loads
+# /data/config.yaml and all IDP_* environment variables itself, so settings
+# such as IDP_TRUST_PROXY (ProxyFix) take effect on this gunicorn path.
 CMD ["--bind", "0.0.0.0:5000", "--workers", "1", "--access-logfile", "-", "identity_provider_server:create_app('/data')"]

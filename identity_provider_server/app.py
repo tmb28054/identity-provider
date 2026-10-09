@@ -36,6 +36,109 @@ from .totp import generate_secret, provisioning_uri, qr_code_data_uri, verify_co
 
 logger = logging.getLogger(__name__)
 
+# Sentinel marking a ``create_app`` keyword argument the caller did not supply.
+# It is distinct from any legitimate value (including ``None`` and ``""``), so
+# the factory can tell "caller omitted this" from "caller passed the literal
+# default" and fall back to the ``load_config`` value only in the former case.
+_UNSET: Any = object()
+
+
+class ConfigNotConsumedError(RuntimeError):
+    """Raised at startup when a supplied setting could not be applied.
+
+    ``create_app`` loads ``config.yaml`` and ``IDP_*`` env vars itself and uses
+    them as defaults. This error fails closed if a setting was supplied by the
+    operator yet never threaded through to the running app, so a silently
+    ignored configuration value can never masquerade as applied.
+    """
+
+
+# Mapping of each create_app resolution key to the AppConfig attribute path it
+# is sourced from, and the env var(s) that supply it. This is the authoritative
+# list of settings create_app must thread through from load_config; the guard
+# checks every entry so a future field added to the loader but not to the
+# resolution block fails closed instead of being silently dropped.
+_CONFIG_FIELD_SOURCES: dict[str, tuple[str, str]] = {
+    "host": ("server", "host"),
+    "port": ("server", "port"),
+    "provider_name": ("saml", "provider_name"),
+    "session_duration_hours": ("saml", "session_duration_hours"),
+    "secret_key": ("security", "secret_key"),
+    "audit_chain_key": ("security", "audit_chain_key"),
+    "rate_limit_max_attempts": ("security", "rate_limit_max_attempts"),
+    "rate_limit_window_seconds": ("security", "rate_limit_window_seconds"),
+    "users_file": ("data", "users_file"),
+    "certificate_file": ("data", "certificate_file"),
+    "private_key_file": ("data", "private_key_file"),
+    "trust_proxy": ("server", "trust_proxy"),
+    "webauthn_enabled": ("webauthn", "enabled"),
+    "webauthn_rp_id": ("webauthn", "rp_id"),
+    "webauthn_rp_name": ("webauthn", "rp_name"),
+    "webauthn_expected_origin": ("webauthn", "expected_origin"),
+}
+
+
+def _config_supplied(data_dir: str) -> bool:
+    """Return True if an operator supplied config via file or env var.
+
+    Args:
+        data_dir: The data directory ``create_app`` was given.
+
+    Returns:
+        True when ``config.yaml`` exists in ``data_dir`` or any mapped
+        ``IDP_*``/``SECRET_KEY`` environment variable is set.
+    """
+    from .config import CONFIG_FILENAME, ENV_OVERRIDE_MAP
+
+    if (Path(data_dir) / CONFIG_FILENAME).is_file():
+        return True
+    return any(name in os.environ for name in ENV_OVERRIDE_MAP)
+
+
+def _assert_config_consumed(
+    data_dir: str,
+    cfg: Any,
+    resolved: dict[str, Any],
+) -> None:
+    """Fail closed if a supplied setting was never applied to the app.
+
+    ``create_app`` resolves every entry in ``_CONFIG_FIELD_SOURCES`` from
+    ``cfg`` into ``resolved``. If the operator supplied configuration (a
+    ``config.yaml`` file or any mapped env var) but a mapped field is missing
+    from ``resolved`` — i.e. the loader knows the setting yet nothing threaded
+    it through — the setting would be silently ignored. This guard logs at
+    ERROR and raises so that can never happen.
+
+    A caller override (a CLI launcher passing an explicit value) is NOT an
+    error: the field is still present in ``resolved``, so it is counted as
+    consumed regardless of whether its value matches ``cfg``.
+
+    Args:
+        data_dir: The data directory ``create_app`` was given.
+        cfg: The resolved :class:`~identity_provider_server.config.AppConfig`.
+        resolved: The final values ``create_app`` will use, keyed by the names
+            in ``_CONFIG_FIELD_SOURCES``.
+
+    Raises:
+        ConfigNotConsumedError: If config was supplied but a mapped field was
+            not present in ``resolved``.
+    """
+    if not _config_supplied(data_dir):
+        return
+    missing = [name for name in _CONFIG_FIELD_SOURCES if name not in resolved]
+    if missing:
+        detail = ", ".join(sorted(missing))
+        logger.error(
+            "Configuration supplied but these settings were not applied: %s. "
+            "Refusing to start with silently ignored configuration.",
+            detail,
+        )
+        raise ConfigNotConsumedError(
+            f"Supplied configuration was not consumed: {detail}"
+        )
+    _ = cfg  # cfg reserved for future value-level consistency checks.
+
+
 LOGIN_FORM = """
 <!doctype html>
 <html lang="en">
@@ -1033,36 +1136,49 @@ def _atomic_write_private(path: Path, text: str) -> None:
 def create_app(
     data_dir: str,
     *,
-    host: str = "127.0.0.1",
-    port: int = 5000,
-    provider_name: str = "local-idp",
-    session_duration_hours: int = 1,
-    secret_key: str | None = None,
-    audit_chain_key: str = "",
-    rate_limit_max_attempts: int = 5,
-    rate_limit_window_seconds: int = 60,
-    users_file: str = "users.json",
-    certificate_file: str = "idp.crt",
-    private_key_file: str = "idp.key",
+    host: str | object = _UNSET,
+    port: int | object = _UNSET,
+    provider_name: str | object = _UNSET,
+    session_duration_hours: int | object = _UNSET,
+    secret_key: str | None | object = _UNSET,
+    audit_chain_key: str | object = _UNSET,
+    rate_limit_max_attempts: int | object = _UNSET,
+    rate_limit_window_seconds: int | object = _UNSET,
+    users_file: str | object = _UNSET,
+    certificate_file: str | object = _UNSET,
+    private_key_file: str | object = _UNSET,
     adfs_config: dict[str, str] | None = None,
     group_role_map: dict[str, list[dict[str, str]]] | None = None,
     skip_ldap_ssl_verify: bool = False,
     secure_cookies: bool = True,
-    trust_proxy: bool = False,
-    webauthn_enabled: bool = False,
-    webauthn_rp_id: str = "",
-    webauthn_rp_name: str = "Identity Provider",
-    webauthn_expected_origin: str = "",
+    trust_proxy: bool | object = _UNSET,
+    webauthn_enabled: bool | object = _UNSET,
+    webauthn_rp_id: str | object = _UNSET,
+    webauthn_rp_name: str | object = _UNSET,
+    webauthn_expected_origin: str | object = _UNSET,
 ) -> Flask:
-    """Flask application factory.
+    """Flask application factory and single configuration entry point.
+
+    ``create_app`` loads ``config.yaml`` and ``IDP_*`` environment variables
+    itself via :func:`identity_provider_server.config.load_config`, using the
+    resolved values as the DEFAULTS for every security-relevant parameter.
+    Any keyword argument the caller passes explicitly overrides the config
+    value; omitted arguments (left at the ``_UNSET`` sentinel) fall back to
+    config. This makes the bare production entrypoint
+    ``create_app('/data')`` honor ``config.yaml`` and ``IDP_*`` while the CLI
+    launchers, which pass explicit values for every mapped field, still win.
 
     Args:
-        data_dir: Path to directory containing data files.
-        host: Bind host — used to derive the IdP entity ID.
-        port: Bind port — used to derive the IdP entity ID.
-        provider_name: SAML provider name registered in AWS IAM.
+        data_dir: Path to directory containing data files, ``config.yaml`` and
+            the ``IDP_*`` env vars read from here.
+        host: Bind host — used to derive the IdP entity ID. Defaults to config.
+        port: Bind port — used to derive the IdP entity ID. Defaults to config.
+        provider_name: SAML provider name registered in AWS IAM. Defaults to
+            config.
         session_duration_hours: SAML assertion validity in hours (1–12).
+            Defaults to config.
         secret_key: Flask secret key for CSRF tokens. Auto-generated if None.
+            Defaults to config.
         audit_chain_key: Dedicated key for the audit-log hash chain. When empty,
             a stable per-deployment key is read from (or created in)
             ``data_dir/audit_chain.key``; it is never derived from secret_key so
@@ -1077,16 +1193,105 @@ def create_app(
         skip_ldap_ssl_verify: If True, disable TLS certificate verification for LDAP.
         secure_cookies: If True (default), set the Secure flag on all cookies.
             Set False only for local HTTP development.
-        trust_proxy: If False (default), ignore X-Forwarded-For/Proto headers
-            and key rate limiting on the direct peer address. Enable only when
-            the service runs behind exactly one trusted reverse proxy; trusting
-            these headers on a directly exposed deployment lets a client forge
-            its source IP (rate-limit bypass and audit source-IP forgery).
+        trust_proxy: When False, ignore X-Forwarded-For/Proto headers and key
+            rate limiting on the direct peer address. Defaults to config.
+            Enable only when the service runs behind exactly one trusted
+            reverse proxy; trusting these headers on a directly exposed
+            deployment lets a client forge its source IP (rate-limit bypass
+            and audit source-IP forgery).
         webauthn_enabled: If True, enable passkey (WebAuthn) endpoints and UI.
+            Defaults to config.
         webauthn_rp_id: WebAuthn Relying Party ID (the effective domain).
+            Defaults to config.
         webauthn_rp_name: Human-readable RP name shown by authenticators.
+            Defaults to config.
         webauthn_expected_origin: The full https origin browsers report.
+            Defaults to config.
+
+    Raises:
+        ConfigNotConsumedError: If a setting was supplied via ``config.yaml`` or
+            an ``IDP_*`` env var but could not be applied to the running app.
     """
+    from .config import load_config
+
+    # create_app is the single configuration entry point: load config.yaml and
+    # IDP_* overrides, then use them as defaults for every parameter the caller
+    # left at the _UNSET sentinel. Explicit kwargs (passed by the CLI launchers
+    # with CLI-flag overrides already applied) still win.
+    cfg = load_config(data_dir)
+    host = cfg.server.host if host is _UNSET else host
+    port = cfg.server.port if port is _UNSET else port
+    provider_name = (
+        cfg.saml.provider_name if provider_name is _UNSET else provider_name
+    )
+    session_duration_hours = (
+        cfg.saml.session_duration_hours
+        if session_duration_hours is _UNSET
+        else session_duration_hours
+    )
+    secret_key = (
+        (cfg.security.secret_key or None) if secret_key is _UNSET else secret_key
+    )
+    audit_chain_key = (
+        cfg.security.audit_chain_key if audit_chain_key is _UNSET else audit_chain_key
+    )
+    rate_limit_max_attempts = (
+        cfg.security.rate_limit_max_attempts
+        if rate_limit_max_attempts is _UNSET
+        else rate_limit_max_attempts
+    )
+    rate_limit_window_seconds = (
+        cfg.security.rate_limit_window_seconds
+        if rate_limit_window_seconds is _UNSET
+        else rate_limit_window_seconds
+    )
+    users_file = cfg.data.users_file if users_file is _UNSET else users_file
+    certificate_file = (
+        cfg.data.certificate_file if certificate_file is _UNSET else certificate_file
+    )
+    private_key_file = (
+        cfg.data.private_key_file if private_key_file is _UNSET else private_key_file
+    )
+    trust_proxy = cfg.server.trust_proxy if trust_proxy is _UNSET else trust_proxy
+    webauthn_enabled = (
+        cfg.webauthn.enabled if webauthn_enabled is _UNSET else webauthn_enabled
+    )
+    webauthn_rp_id = (
+        cfg.webauthn.rp_id if webauthn_rp_id is _UNSET else webauthn_rp_id
+    )
+    webauthn_rp_name = (
+        cfg.webauthn.rp_name if webauthn_rp_name is _UNSET else webauthn_rp_name
+    )
+    webauthn_expected_origin = (
+        cfg.webauthn.expected_origin
+        if webauthn_expected_origin is _UNSET
+        else webauthn_expected_origin
+    )
+
+    # Fail closed if any supplied setting could not be threaded through.
+    _assert_config_consumed(
+        data_dir,
+        cfg,
+        {
+            "host": host,
+            "port": port,
+            "provider_name": provider_name,
+            "session_duration_hours": session_duration_hours,
+            "secret_key": secret_key,
+            "audit_chain_key": audit_chain_key,
+            "rate_limit_max_attempts": rate_limit_max_attempts,
+            "rate_limit_window_seconds": rate_limit_window_seconds,
+            "users_file": users_file,
+            "certificate_file": certificate_file,
+            "private_key_file": private_key_file,
+            "trust_proxy": trust_proxy,
+            "webauthn_enabled": webauthn_enabled,
+            "webauthn_rp_id": webauthn_rp_id,
+            "webauthn_rp_name": webauthn_rp_name,
+            "webauthn_expected_origin": webauthn_expected_origin,
+        },
+    )
+
     data = Path(data_dir)
     # Harden the data directory to owner-only (0700) best-effort, so the
     # sensitive files inside (user DB, recovery tokens, audit log) are not
@@ -1340,6 +1545,12 @@ def create_app(
     app.config["IDP_ENTITY_ID"] = idp_entity_id
     app.config["PROVIDER_NAME"] = provider_name
     app.config["SESSION_DURATION_HOURS"] = session_duration_hours
+    # Expose the resolved WebAuthn relying-party settings so operators and
+    # tests can confirm config.yaml / IDP_* actually reached create_app.
+    app.config["WEBAUTHN_ENABLED"] = bool(webauthn_enabled)
+    app.config["WEBAUTHN_RP_ID"] = webauthn_rp_id
+    app.config["WEBAUTHN_RP_NAME"] = webauthn_rp_name
+    app.config["WEBAUTHN_EXPECTED_ORIGIN"] = webauthn_expected_origin
 
     def _generate_csrf_token() -> str:
         """Generate a CSRF token tied to the app secret."""

@@ -6,6 +6,9 @@ metadata:
   labels:
     app.kubernetes.io/name: identity-provider-server
 data:
+  # Mounted at /data/config.yaml and read by create_app('/data'), which is the
+  # single configuration entry point: every value below is actually consumed by
+  # the running app (not just by the dev-server CLI).
   config.yaml: |
     server:
       host: "0.0.0.0"

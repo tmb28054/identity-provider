@@ -13,6 +13,26 @@ All six findings from the AWS Security Agent review `idp-2026-10-06` were
 validated and remediated (five in code, one — resilience — as documentation plus
 a flagged architectural follow-up). See `docs/security-review-20261006-response.md`.
 
+- **`create_app` is now the single configuration entry point** (High, Finding
+  1 — config loader bypass): the application factory now calls `load_config`
+  itself, so the documented production entrypoint
+  `gunicorn "identity_provider_server:create_app('/data')"` honors
+  `/data/config.yaml` and every `IDP_*` environment variable. Previously
+  `create_app` took each setting as a keyword argument that nothing supplied on
+  the gunicorn path, so `config.yaml` and all `IDP_*` vars were silently
+  ignored and every security-relevant setting fell back to the signature's
+  literal defaults. Concretely, the shipped k8s manifest's `IDP_TRUST_PROXY=true`
+  never reached the app: ProxyFix was never installed, so per-IP rate-limit
+  buckets collapsed onto the ingress controller's address (any 5 failures
+  returned HTTP 429 to all users) and every audit record stored the wrong
+  source IP. Overridable parameters now default to an `_UNSET` sentinel and are
+  resolved from the loaded config, so the two CLI launchers (which pass explicit
+  values) still win while the bare `create_app('/data')` path picks up
+  `config.yaml` + `IDP_*`. A startup guard raises `ConfigNotConsumedError` (and
+  logs at ERROR) if a supplied setting could ever be left unconsumed, so an
+  ignored configuration value can never masquerade as applied. The Dockerfile
+  CMD, README, `docs/howto.md`, `docs/configuration.md`, and the k8s
+  manifests/compose file are normalized to this single pattern.
 - **Harden backup restore against unverified/unsafe archives** (High, Finding 1):
   the admin portal restore guard now accepts only integrity-protected
   `.tar.gz.enc` archives (keeping the existing `/` and `..` rejection); the

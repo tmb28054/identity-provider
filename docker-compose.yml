@@ -10,6 +10,8 @@ services:
       # key shorter than 32 chars. Generate one with:
       #   python3 -c "import secrets; print(secrets.token_hex(32))"
       # and set it in a .env file (see docs/howto.md) or your shell.
+      # These IDP_*/SECRET_KEY vars are read by create_app('/data') (the image
+      # CMD), the single configuration entry point, so they are honored here.
       - SECRET_KEY=${SECRET_KEY:?set SECRET_KEY to a real random value}
       # Keep IDP_TRUST_PROXY unset/false here. This compose file publishes
       # :5000 directly with no reverse proxy in front, so X-Forwarded-For/Proto

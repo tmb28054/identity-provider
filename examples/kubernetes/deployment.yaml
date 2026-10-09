@@ -35,6 +35,8 @@ spec:
             # pod and is the only client that reaches the container, so the
             # forwarded headers reflect the real client. This lets rate
             # limiting and the audit trail key on the true source IP.
+            # Consumed by create_app('/data') (the image CMD), which reads IDP_*
+            # itself and installs ProxyFix when this is true.
             - name: IDP_TRUST_PROXY
               value: "true"
           volumeMounts:

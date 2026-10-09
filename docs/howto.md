@@ -136,6 +136,13 @@ identity-provider-server --host 0.0.0.0 --port 5000
 
 The `identity-provider-server` CLI uses Flask's built-in development server which is not suitable for production. Use gunicorn instead:
 
+> `create_app(data_dir)` is the single configuration entry point. It reads
+> `config.yaml` and every `IDP_*` environment variable from the data directory
+> you pass it, so the gunicorn examples below honor your configuration
+> directly — you do not pass settings a second way. Anything in
+> `<data_dir>/config.yaml` or an `IDP_*` env var (for example
+> `IDP_TRUST_PROXY=true`, which installs ProxyFix) takes effect on this path.
+
 ```bash
 # Basic — 2 workers, bind to all interfaces
 gunicorn "identity_provider_server:create_app('data')" -b 0.0.0.0:5000 -w 2

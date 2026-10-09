@@ -41,6 +41,8 @@ identity-provider-server --init
 # 4. Register the IdP in AWS IAM (see docs/installation.md)
 
 # 5. Run (production)
+# create_app loads data/config.yaml and all IDP_* env vars itself, so this
+# entrypoint honors your configuration (e.g. IDP_TRUST_PROXY) directly.
 gunicorn "identity_provider_server:create_app('data')" -b 0.0.0.0:5000
 
 # Or run in development mode (auto-reload, verbose errors)

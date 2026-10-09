@@ -51,6 +51,31 @@ _DEFAULTS: dict[str, Any] = {
 
 CONFIG_FILENAME = "config.yaml"
 
+# Single source of truth mapping each supported environment variable to the
+# (section, key) it overrides in the config dict. ``_apply_env_overrides``
+# iterates this, and ``app.create_app``'s unconsumed-config guard imports it so
+# the loader and the guard can never drift out of sync.
+ENV_OVERRIDE_MAP: dict[str, tuple[str, str]] = {
+    "IDP_HOST": ("server", "host"),
+    "IDP_PORT": ("server", "port"),
+    "IDP_DEBUG": ("server", "debug"),
+    "IDP_TRUST_PROXY": ("server", "trust_proxy"),
+    "IDP_PROVIDER_NAME": ("saml", "provider_name"),
+    "IDP_SESSION_DURATION_HOURS": ("saml", "session_duration_hours"),
+    "IDP_USERS_FILE": ("data", "users_file"),
+    "IDP_CERTIFICATE_FILE": ("data", "certificate_file"),
+    "IDP_PRIVATE_KEY_FILE": ("data", "private_key_file"),
+    "IDP_LOG_LEVEL": ("logging", "level"),
+    "SECRET_KEY": ("security", "secret_key"),
+    "IDP_AUDIT_CHAIN_KEY": ("security", "audit_chain_key"),
+    "IDP_RATE_LIMIT_MAX_ATTEMPTS": ("security", "rate_limit_max_attempts"),
+    "IDP_RATE_LIMIT_WINDOW_SECONDS": ("security", "rate_limit_window_seconds"),
+    "IDP_WEBAUTHN_ENABLED": ("webauthn", "enabled"),
+    "IDP_WEBAUTHN_RP_ID": ("webauthn", "rp_id"),
+    "IDP_WEBAUTHN_RP_NAME": ("webauthn", "rp_name"),
+    "IDP_WEBAUTHN_EXPECTED_ORIGIN": ("webauthn", "expected_origin"),
+}
+
 
 @dataclass
 class ServerConfig:
@@ -175,30 +200,15 @@ def _apply_env_overrides(config: dict) -> dict:
         IDP_USERS_FILE, IDP_CERTIFICATE_FILE, IDP_PRIVATE_KEY_FILE,
         IDP_LOG_LEVEL,
         SECRET_KEY, IDP_AUDIT_CHAIN_KEY,
-        IDP_RATE_LIMIT_MAX_ATTEMPTS, IDP_RATE_LIMIT_WINDOW_SECONDS
-    """
-    env_map = {
-        "IDP_HOST": ("server", "host"),
-        "IDP_PORT": ("server", "port"),
-        "IDP_DEBUG": ("server", "debug"),
-        "IDP_TRUST_PROXY": ("server", "trust_proxy"),
-        "IDP_PROVIDER_NAME": ("saml", "provider_name"),
-        "IDP_SESSION_DURATION_HOURS": ("saml", "session_duration_hours"),
-        "IDP_USERS_FILE": ("data", "users_file"),
-        "IDP_CERTIFICATE_FILE": ("data", "certificate_file"),
-        "IDP_PRIVATE_KEY_FILE": ("data", "private_key_file"),
-        "IDP_LOG_LEVEL": ("logging", "level"),
-        "SECRET_KEY": ("security", "secret_key"),
-        "IDP_AUDIT_CHAIN_KEY": ("security", "audit_chain_key"),
-        "IDP_RATE_LIMIT_MAX_ATTEMPTS": ("security", "rate_limit_max_attempts"),
-        "IDP_RATE_LIMIT_WINDOW_SECONDS": ("security", "rate_limit_window_seconds"),
-        "IDP_WEBAUTHN_ENABLED": ("webauthn", "enabled"),
-        "IDP_WEBAUTHN_RP_ID": ("webauthn", "rp_id"),
-        "IDP_WEBAUTHN_RP_NAME": ("webauthn", "rp_name"),
-        "IDP_WEBAUTHN_EXPECTED_ORIGIN": ("webauthn", "expected_origin"),
-    }
+        IDP_RATE_LIMIT_MAX_ATTEMPTS, IDP_RATE_LIMIT_WINDOW_SECONDS,
+        IDP_WEBAUTHN_ENABLED, IDP_WEBAUTHN_RP_ID, IDP_WEBAUTHN_RP_NAME,
+        IDP_WEBAUTHN_EXPECTED_ORIGIN
 
-    for env_var, (section, key) in env_map.items():
+    The variable-to-field mapping lives in the module-level
+    ``ENV_OVERRIDE_MAP`` so the loader and the app's unconsumed-config guard
+    share a single source of truth.
+    """
+    for env_var, (section, key) in ENV_OVERRIDE_MAP.items():
         value = os.environ.get(env_var)
         if value is not None:
             # Type coercion based on defaults

@@ -101,7 +101,7 @@ Environment variables override config file values. Useful for injecting secrets 
 
 CLI arguments have the highest priority and override both config file and environment variables.
 
-The `identity-provider-server` CLI is intended for development and initialization. For production, use gunicorn:
+The `identity-provider-server` CLI is intended for development and initialization. For production, use gunicorn. `create_app(data_dir)` loads `config.yaml` and all `IDP_*` environment variables from the data directory itself, so this entrypoint honors the full configuration precedence described above (env vars override the config file; both are read by `create_app`):
 
 ```bash
 # Production
