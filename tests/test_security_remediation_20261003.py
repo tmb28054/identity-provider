@@ -778,8 +778,15 @@ def test_disable_user_not_found(tmp_path):
     assert b"not found" in resp.data
 
 
-def test_recover_honours_lockout(tmp_path):
-    """F6: /recover refuses a locked account."""
+def test_recover_does_not_preempt_locked_account(tmp_path):
+    """idp-2026-10-06 F1: a durable lock no longer 429s /recover before MFA.
+
+    The sanctioned in-band recovery for a locked sole admin is a valid
+    single-use recovery token plus MFA, so the lockout pre-check that used to
+    short-circuit with 429 has been removed. A caller holding a valid token now
+    proceeds past the lock (here, into the enrollment path for an unenrolled
+    account) instead of being bounced with 429.
+    """
     from identity_provider_server import admin as admin_mod
     app = _app(tmp_path, [
         {"username": "bob", "password": _hash(), "roles": [], "claims": [],
@@ -801,7 +808,9 @@ def test_recover_honours_lockout(tmp_path):
         "csrf_token": csrf, "new_password": "N3w-Passw0rd!!",
         "confirm_password": "N3w-Passw0rd!!",
     })
-    assert resp.status_code == 429
+    # The lock no longer pre-empts the flow with 429; the request reaches the
+    # MFA/enrollment handling instead.
+    assert resp.status_code != 429
     assert admin_mod is not None
 
 

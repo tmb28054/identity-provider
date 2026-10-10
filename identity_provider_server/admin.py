@@ -1030,14 +1030,45 @@ def register_admin_routes(
             # the IP-independent per-account bucket, AND the durable lockout —
             # so the idpadmin password cannot be guessed by pacing under the
             # window or by rotating the source IP (finding idp-20261003 F6).
+            #
+            # A durable lock is checked FIRST and SEPARATELY (mirroring the SP
+            # path in app.py): it returns 429 but must NOT call
+            # ``_register_auth_failure``, or the lock self-refreshes and an
+            # anonymous caller can hold the sole admin locked forever
+            # (finding idp-2026-10-06 F1).
+            if _account_locked(login_username):
+                if audit_logger:
+                    audit_logger.log(
+                        username=login_username,
+                        ip=request.remote_addr or "unknown",
+                        service="admin",
+                        protocol="admin",
+                        result="failure",
+                        reason="account_locked",
+                        user_agent=request.headers.get("User-Agent", ""),
+                    )
+                token = _csrf_token()
+                question, ch_hash = make_challenge_fn()
+                resp = app.make_response(render_template_string(
+                    ADMIN_LOGIN, error="Too many attempts. Try again later.",
+                    csrf_token=token,
+                    challenge_question=question, challenge_hash=ch_hash,
+                ))
+                resp.set_cookie(
+                    "csrf_token", token, httponly=True, samesite="Strict"
+                )
+                return resp, 429
+
+            # Sliding-window throttle only. Do NOT advance the durable counter
+            # here; it is advanced only after a real credential check fails
+            # (below). The body/status is identical to the lock branch above so
+            # a locked REAL account cannot be told apart from an unknown
+            # username (anti-enumeration).
             if (
                 _rl_limited()
                 or (login_username and _rl_limited(login_username))
                 or _rl_acct_limited(login_username)
-                or _account_locked(login_username)
             ):
-                # Count the throttled attempt toward the durable lockout too.
-                _register_auth_failure(login_username)
                 if audit_logger:
                     audit_logger.log(
                         username=login_username,
@@ -1351,6 +1382,21 @@ def register_admin_routes(
             logger.info("Admin %s reset password for %s", admin_user, target)
             _audit_admin(admin_user, "reset_password", target)
             return _render_panel(auth_token, message=f"Password reset for '{target}'.")
+
+        elif action == "clear_lockout":
+            # Clear a peer admin's durable lockout without a restart or a
+            # hand-edit of users.json (finding idp-2026-10-06 F1). Reuses the
+            # already-wired ``reset_auth_failures_fn`` via the
+            # ``_reset_auth_failures`` wrapper. Must NOT touch any
+            # ``must_set_password`` marker.
+            target = request.form.get("target_user", "")
+            user = users.get(target)
+            if not user:
+                return _render_panel(auth_token, error=f"User '{target}' not found.")
+            _reset_auth_failures(target)
+            logger.info("Admin %s cleared lockout for %s", admin_user, target)
+            _audit_admin(admin_user, "clear_lockout", target)
+            return _render_panel(auth_token, message=f"Lockout cleared for '{target}'.")
 
         elif action == "remove_mfa":
             target = request.form.get("target_user", "")
@@ -1951,8 +1997,26 @@ def register_admin_routes(
 
         if action == "save_backup_config":
             config = bk.load_config(ddir)
-            config.server = request.form.get("server", "").strip()
-            config.share = request.form.get("share", "").strip()
+            # Validate the SMB server/share BEFORE persisting so a malicious
+            # admin-form value cannot be interpolated into a //server/share
+            # UNC path or a mount.cifs invocation (finding idp-2026-10-06 F2).
+            try:
+                config.server = bk.validate_server(
+                    request.form.get("server", "")
+                )
+            except bk.InvalidServerError:
+                return _render_backups(
+                    auth_token,
+                    error="Invalid backup server. Use a hostname or IP address "
+                          "(no path separators, spaces, or backslashes).",
+                )
+            try:
+                config.share = bk.validate_share(request.form.get("share", ""))
+            except bk.InvalidShareError:
+                return _render_backups(
+                    auth_token,
+                    error="Invalid backup share. Use letters, digits, . _ - only.",
+                )
             config.username = request.form.get("username", "").strip()
             # Blank password means "keep existing".
             new_pw = request.form.get("password", "")

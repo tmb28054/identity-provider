@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Fixed** (idp-2026-10-06 F1) — admin login no longer self-sustains a durable
+  account lockout from unauthenticated throttle hits. The `POST /admin` login
+  gate now returns 429 for a locked account WITHOUT re-arming the lock, neither
+  throttle branch advances the durable failure counter, and `locked_until` is
+  stamped exactly once at the threshold crossing instead of sliding forward on
+  every subsequent failure. The recovery route no longer pre-empts a valid
+  single-use recovery token plus MFA with a lockout 429, so a locked sole admin
+  can always recover in-band (the route stays throttled by the per-IP
+  rate-limiter and the MFA-failure counter).
+- **Fixed** (idp-2026-10-06 F2) — backup create and restore never stage
+  plaintext secrets on the SMB share. Both paths build and extract the archive
+  entirely in memory (`io.BytesIO`), closing the previous TOCTOU where the
+  on-share ciphertext was re-read for a separate validate and extract pass.
+  Restore now requires a matching SHA-256 digest sidecar (fail closed), enforces
+  a positive `BACKUP_FILES` member allowlist (rejecting `audit.log` and
+  `audit_chain.key`), and validates the admin-form SMB server/share values.
+
+### Added
+
+- Admin-UI `clear_lockout` action so a second administrator can clear a peer's
+  durable account lockout without a restart or a hand-edit of `users.json`
+  (idp-2026-10-06 F1).
+
 ### Security (code review idp-2026-10-06)
 
 All six findings from the AWS Security Agent review `idp-2026-10-06` were

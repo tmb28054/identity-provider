@@ -3641,19 +3641,10 @@ def create_app(
                 success=None, qr_data_uri="", totp_secret="", mfa_required=False,
             ), 404
 
-        # Honour a durable account lockout on the recovery path too (F6), so a
-        # held account cannot be guessed at via /recover.
-        if _account_locked(username):
-            audit.log(
-                username=username, ip=client_ip, service="user",
-                protocol="recovery", result="failure", reason="rate_limited",
-                user_agent=request.headers.get("User-Agent", ""),
-            )
-            return render_template_string(
-                RECOVERY_PAGE, username="", recovery_token="", csrf_token="",
-                error="Too many attempts. Try again later.",
-                success=None, qr_data_uri="", totp_secret="", mfa_required=False,
-            ), 429
+        # A validated single-use recovery token plus MFA is the sanctioned
+        # in-band recovery for a locked sole admin, so a durable lock must NOT
+        # pre-empt it here; the route stays throttled by the IP rate-limiter
+        # above and the MFA-failure counter below (finding idp-2026-10-06 F1).
 
         new_password = request.form.get("new_password", "")
         confirm_password = request.form.get("confirm_password", "")
@@ -3801,7 +3792,11 @@ def create_app(
         except (TypeError, ValueError):
             count = 1
         user["failed_count"] = count
-        if count >= LOCKOUT_THRESHOLD:
+        # Stamp ``locked_until`` exactly once, at the threshold-crossing moment,
+        # so the hold is a FIXED window from the crossing rather than sliding
+        # forward on every subsequent failure (finding idp-2026-10-06 F1). The
+        # counter keeps climbing but the timestamp is pinned.
+        if count == LOCKOUT_THRESHOLD:
             user["locked_until"] = time.time() + LOCKOUT_DURATION_SECONDS
             logger.warning("Account locked after %d failures: user=%s", count, username)
         try:
