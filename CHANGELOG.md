@@ -25,6 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Restore now requires a matching SHA-256 digest sidecar (fail closed), enforces
   a positive `BACKUP_FILES` member allowlist (rejecting `audit.log` and
   `audit_chain.key`), and validates the admin-form SMB server/share values.
+- **Changed** (idp-2026-10-06 F3) — the app now refuses to start with more than
+  one worker instead of only warning. The worker count is detected from
+  `-w/--workers` and the `WEB_CONCURRENCY`/`GUNICORN_WORKERS` env hints, and
+  from a top-level `workers = N` literal in a `-c`/`--config` gunicorn config
+  file (parsed with `ast`, never executed). The `run-idp` entry point enforces
+  this authoritatively on the parsed `--workers` value before the app is built;
+  a direct `gunicorn` invocation is covered by a gunicorn-scoped backstop in
+  `create_app`. Set `IDP_ALLOW_MULTIWORKER=1` to override (only with a shared
+  store). The multi-worker examples in `docs/howto.md` and
+  `docs/configuration.md` are corrected to a single worker.
+- **Added** (idp-2026-10-06 F4) — admin-provisioned and admin-reset passwords
+  now require a change at next login (`force_password_change`), and an optional
+  password-age rotation knob `IDP_PASSWORD_MAX_AGE_DAYS` (default `0` = disabled;
+  recommended `90`) forces a change once a password is older than the window.
+  Every password write stamps `password_changed_at`; passwordless accounts and
+  legacy records with no timestamp are exempt, and a non-numeric
+  `IDP_PASSWORD_MAX_AGE_DAYS` is a fatal startup error (consistent with other
+  `IDP_*` int knobs).
 
 ### Added
 

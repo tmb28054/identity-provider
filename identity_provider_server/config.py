@@ -40,6 +40,7 @@ _DEFAULTS: dict[str, Any] = {
         "audit_chain_key": "",  # nosec B105
         "rate_limit_max_attempts": 5,
         "rate_limit_window_seconds": 60,
+        "password_max_age_days": 0,
     },
     "webauthn": {
         "enabled": False,
@@ -70,6 +71,7 @@ ENV_OVERRIDE_MAP: dict[str, tuple[str, str]] = {
     "IDP_AUDIT_CHAIN_KEY": ("security", "audit_chain_key"),
     "IDP_RATE_LIMIT_MAX_ATTEMPTS": ("security", "rate_limit_max_attempts"),
     "IDP_RATE_LIMIT_WINDOW_SECONDS": ("security", "rate_limit_window_seconds"),
+    "IDP_PASSWORD_MAX_AGE_DAYS": ("security", "password_max_age_days"),
     "IDP_WEBAUTHN_ENABLED": ("webauthn", "enabled"),
     "IDP_WEBAUTHN_RP_ID": ("webauthn", "rp_id"),
     "IDP_WEBAUTHN_RP_NAME": ("webauthn", "rp_name"),
@@ -109,6 +111,7 @@ class SecurityConfig:
     audit_chain_key: str = ""
     rate_limit_max_attempts: int = 5
     rate_limit_window_seconds: int = 60
+    password_max_age_days: int = 0
 
 
 @dataclass
@@ -201,6 +204,7 @@ def _apply_env_overrides(config: dict) -> dict:
         IDP_LOG_LEVEL,
         SECRET_KEY, IDP_AUDIT_CHAIN_KEY,
         IDP_RATE_LIMIT_MAX_ATTEMPTS, IDP_RATE_LIMIT_WINDOW_SECONDS,
+        IDP_PASSWORD_MAX_AGE_DAYS,
         IDP_WEBAUTHN_ENABLED, IDP_WEBAUTHN_RP_ID, IDP_WEBAUTHN_RP_NAME,
         IDP_WEBAUTHN_EXPECTED_ORIGIN
 

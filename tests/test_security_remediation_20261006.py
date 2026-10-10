@@ -160,9 +160,17 @@ def test_corrupt_tombstone_value_is_ignored(tmp_path):
     _add_user(_admin_client(app), "erin")
     (tmp_path / "deleted_epochs.json").write_text(json.dumps({"erin": "not-an-int"}))
 
+    # Admin-provisioned users are now flagged for a forced password change
+    # (idp-2026-10-06 F4); clear it here so this test exercises only the corrupt
+    # tombstone fallback (not the forced-change reroute).
+    stored = json.loads((tmp_path / "users.json").read_text())
+    for rec in stored:
+        if rec["username"] == "erin":
+            rec.pop("force_password_change", None)
+    (tmp_path / "users.json").write_text(json.dumps(stored))
+
     # A cookie minted at the account's real epoch still verifies: the corrupt
     # tombstone is treated as 0, so the record epoch wins.
-    stored = json.loads((tmp_path / "users.json").read_text())
     erin_epoch = next(u for u in stored if u["username"] == "erin")["session_epoch"]
     client = app.test_client()
     client.set_cookie(

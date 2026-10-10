@@ -1300,6 +1300,14 @@ def register_admin_routes(
                 # Non-zero floor so a recreated username never restarts at epoch
                 # 0, which a stale cookie could still match (idp-2026-10-06 F5).
                 "session_epoch": int(time.time()),
+                # Force the admin-chosen password to be rotated at first login
+                # (idp-2026-10-06 F4). The stamp is a PLACEHOLDER: it bounds how
+                # long the admin-chosen credential can sit, and is overwritten by
+                # ``_stamp_password_change`` when the forced change completes, so
+                # age tracking effectively starts at the user's first self-chosen
+                # password.
+                "force_password_change": True,
+                "password_changed_at": int(time.time()),
             }
             if new_email:
                 new_user["email"] = new_email
@@ -1376,6 +1384,12 @@ def register_admin_routes(
             import bcrypt
             new_hash = bcrypt.hashpw(new_pw.encode(), bcrypt.gensalt()).decode()
             _set_password_with_history(user, new_hash)
+            # Force the target to choose their own password at next login and
+            # start age tracking from this reset (idp-2026-10-06 F4). Leave any
+            # ``must_set_password`` marker (a separate first-login mechanism)
+            # strictly alone.
+            user["force_password_change"] = True
+            user["password_changed_at"] = int(time.time())
             _bump_session_epoch(target)  # revoke the target's live sessions
             if users_path:
                 save_users_fn(users_path, users)

@@ -219,6 +219,7 @@ _CONFIG_FIELD_SOURCES: dict[str, tuple[str, str]] = {
     "audit_chain_key": ("security", "audit_chain_key"),
     "rate_limit_max_attempts": ("security", "rate_limit_max_attempts"),
     "rate_limit_window_seconds": ("security", "rate_limit_window_seconds"),
+    "password_max_age_days": ("security", "password_max_age_days"),
     "users_file": ("data", "users_file"),
     "certificate_file": ("data", "certificate_file"),
     "private_key_file": ("data", "private_key_file"),
@@ -1316,6 +1317,7 @@ def create_app(
     audit_chain_key: str | object = _UNSET,
     rate_limit_max_attempts: int | object = _UNSET,
     rate_limit_window_seconds: int | object = _UNSET,
+    password_max_age_days: int | object = _UNSET,
     users_file: str | object = _UNSET,
     certificate_file: str | object = _UNSET,
     private_key_file: str | object = _UNSET,
@@ -1357,6 +1359,9 @@ def create_app(
             the chain stays verifiable across restarts and secret rotation.
         rate_limit_max_attempts: Max failed login attempts per IP before limiting.
         rate_limit_window_seconds: Rate limit window in seconds.
+        password_max_age_days: Days after which a password must be rotated at
+            next login. ``0`` (default) disables age-based rotation; any
+            positive integer enables it. Defaults to config.
         users_file: Filename or path to users JSON file (relative to data_dir).
         certificate_file: Filename or path to signing certificate (relative to data_dir).
         private_key_file: Filename or path to private key (relative to data_dir).
@@ -1417,6 +1422,11 @@ def create_app(
         if rate_limit_window_seconds is _UNSET
         else rate_limit_window_seconds
     )
+    password_max_age_days = (
+        cfg.security.password_max_age_days
+        if password_max_age_days is _UNSET
+        else password_max_age_days
+    )
     users_file = cfg.data.users_file if users_file is _UNSET else users_file
     certificate_file = (
         cfg.data.certificate_file if certificate_file is _UNSET else certificate_file
@@ -1453,6 +1463,7 @@ def create_app(
             "audit_chain_key": audit_chain_key,
             "rate_limit_max_attempts": rate_limit_max_attempts,
             "rate_limit_window_seconds": rate_limit_window_seconds,
+            "password_max_age_days": password_max_age_days,
             "users_file": users_file,
             "certificate_file": certificate_file,
             "private_key_file": private_key_file,
@@ -1536,24 +1547,23 @@ def create_app(
         max_attempts=rate_limit_max_attempts, window_seconds=rate_limit_window_seconds
     )
 
+    # Password age-based rotation (F4). ``0`` (or any non-positive value)
+    # disables the feature; a positive day count forces a change once a
+    # password is older than the window. Converted to seconds once here so the
+    # per-login check stays a cheap comparison.
+    _password_max_age_seconds = int(password_max_age_days) * 86400
+
     # The rate limiter and the single-use nonce / challenge stores below are
     # per-process. Running multiple workers/replicas without a shared backend
     # silently weakens them (the failed-login budget multiplies and a nonce can
-    # be replayed once per process). Warn loudly if the environment advertises
-    # more than one worker so an operator does not deploy an unsafe topology
-    # by accident. ``WEB_CONCURRENCY`` / ``GUNICORN_WORKERS`` are the usual hints.
-    for _worker_var in ("WEB_CONCURRENCY", "GUNICORN_WORKERS"):
-        try:
-            _worker_count = int(os.environ.get(_worker_var, "1"))
-        except ValueError:  # pragma: no cover - non-numeric env is ignored
-            continue
-        if _worker_count > 1:
-            logger.warning(
-                "%s=%d but the rate limiter and single-use nonce stores are "
-                "per-process; run a single worker or add a shared store, else "
-                "these anti-abuse controls weaken by a factor of the worker count.",
-                _worker_var, _worker_count,
-            )
+    # be replayed once per process). Backstop for a direct `gunicorn -w N ...`
+    # invocation that never goes through run_gunicorn.main. Scoped to gunicorn
+    # so create_app stays safe to construct under pytest / the Flask dev server
+    # / embedding callers that happen to have a -w/--workers token in argv; the
+    # authoritative refusal for the run-idp path lives in run_gunicorn.main,
+    # before this factory is called.
+    if "gunicorn" in os.path.basename(sys.argv[0] if sys.argv else ""):
+        _assert_single_worker(_detected_worker_count())
 
     # Single-use nonce store backing the short-lived MFA "password proven"
     # ticket, so an observed ticket cannot be replayed within its window.
@@ -3278,6 +3288,7 @@ def create_app(
             if user and users_path:
                 _record_password_history(user)
                 user["password"] = hashed
+                _stamp_password_change(user)
                 _bump_session_epoch_local(username)
                 _save_users_and_update_mtime(users_path, users)
                 logger.info("Password changed for user=%s", username)
@@ -3866,6 +3877,7 @@ def create_app(
         if user:
             _record_password_history(user)
             user["password"] = _bcrypt.hashpw(new_password.encode(), _bcrypt.gensalt()).decode()
+            _stamp_password_change(user)
             user.pop("must_set_password", None)
             if mfa_enrolled:
                 user["totp_secret"] = enroll_secret
@@ -4010,19 +4022,47 @@ def create_app(
         # Keep the last N-1 retired hashes; the live hash is the Nth slot.
         user["password_history"] = history[: PASSWORD_HISTORY_SIZE - 1]
 
+    def _stamp_password_change(user: dict[str, Any]) -> None:
+        """Record the current time as the user's last password-change moment.
+
+        Called at every password-write site so password-age tracking (F4)
+        cannot drift between the self-service, forced-change, and recovery
+        paths.
+
+        Args:
+            user: The user record to stamp in place.
+        """
+        user["password_changed_at"] = int(time.time())
+
     def _needs_password_change(username: str) -> bool:
         """True if the account must change its password before proceeding.
 
         A forced password rotation is meaningless for a password-less (passkey-
         only) account — there is no password to change and the forced-change
         page requires the current password — so the gate is skipped for those.
+
+        When age-based rotation is enabled (``password_max_age_days > 0``), an
+        account whose recorded ``password_changed_at`` is older than the window
+        is also forced to change. Records with no ``password_changed_at`` (legacy
+        accounts predating the feature) are exempt so enabling the knob does not
+        mass-lock existing users; age tracking begins at their next password
+        write.
         """
         if use_adfs:
             return False
         user = users.get(username)
-        if not user or not user.get("force_password_change"):
+        if not user:  # pragma: no cover - defensive; every caller passes a known user
             return False
-        return not wf.is_passwordless(user)
+        if user.get("force_password_change"):
+            return not wf.is_passwordless(user)
+        if _password_max_age_seconds > 0:
+            changed = user.get("password_changed_at")
+            if (
+                changed is not None
+                and (time.time() - float(changed)) > _password_max_age_seconds
+            ):
+                return not wf.is_passwordless(user)
+        return False
 
     def _forced_change_response(username: str):
         """Render the forced password-change page instead of issuing credentials.

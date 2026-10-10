@@ -90,6 +90,7 @@ Environment variables override config file values. Useful for injecting secrets 
 | `IDP_AUDIT_CHAIN_KEY` | `security.audit_chain_key` | Dedicated key for the audit-log hash chain. Empty = a stable per-deployment key is read from (or created in) `data/audit_chain.key`. Never derived from `SECRET_KEY`, so the chain stays verifiable across restarts and secret rotation. |
 | `IDP_RATE_LIMIT_MAX_ATTEMPTS` | `security.rate_limit_max_attempts` | Rate limit threshold |
 | `IDP_RATE_LIMIT_WINDOW_SECONDS` | `security.rate_limit_window_seconds` | Rate limit window |
+| `IDP_PASSWORD_MAX_AGE_DAYS` | `security.password_max_age_days` | Days after which a password must be rotated at next login. `0` (default) disables age-based rotation; recommended `90`. A non-numeric value is a fatal startup error. |
 | `IDP_WEBAUTHN_ENABLED` | `webauthn.enabled` | `true`/`false` — enable passkeys |
 | `IDP_WEBAUTHN_RP_ID` | `webauthn.rp_id` | Relying-party ID (effective domain) |
 | `IDP_WEBAUTHN_RP_NAME` | `webauthn.rp_name` | Relying-party display name |
