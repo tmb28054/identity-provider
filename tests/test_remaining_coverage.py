@@ -121,10 +121,12 @@ def test_restore_archive_rejects_traversal(tmp_path, monkeypatch):
     payload = tmp_path / "p"
     payload.write_text("x")
     with tarfile.open(archive, "w:gz") as tar:
-        tar.add(str(payload), arcname="ok.txt")
+        # Use an allowlisted name so validation passes and extraction reaches
+        # the per-member _is_within containment check.
+        tar.add(str(payload), arcname="users.json")
     # Force _is_within to report the member as outside the data dir.
     monkeypatch.setattr(bk, "_is_within", lambda base, target: False)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="outside data dir"):
         bk.restore_archive(archive, tmp_path / "data")
 
 

@@ -23,6 +23,7 @@ Design notes:
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import os
@@ -136,7 +137,9 @@ def create_encrypted_archive(
     ``dest_path`` is the base archive path (e.g. ``idp-...tar.gz``); the
     ciphertext is written to ``dest_path + '.enc'`` and the digest of the
     ciphertext to ``dest_path + '.enc.sha256'``. The plaintext tarball is
-    created in a temporary file and removed immediately after encryption.
+    built entirely in memory and encrypted before anything is written, so no
+    plaintext secrets ever land on the (untrusted) share
+    (finding idp-2026-10-06 F2).
 
     Returns:
         The size of the encrypted archive in bytes.
@@ -144,15 +147,11 @@ def create_encrypted_archive(
     from cryptography.fernet import Fernet
 
     dest_path = Path(dest_path)
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_plain = dest_path.with_suffix(dest_path.suffix + ".plain.tmp")
-    try:
-        create_archive(data_dir, tmp_plain)
-        token = Fernet(key).encrypt(tmp_plain.read_bytes())
-    finally:
-        tmp_plain.unlink(missing_ok=True)
+    plaintext = create_archive_bytes(data_dir)  # in-memory, never on share
+    token = Fernet(key).encrypt(plaintext)
     enc_path = Path(str(dest_path) + ENCRYPTED_SUFFIX)
-    enc_path.write_bytes(token)
+    enc_path.parent.mkdir(parents=True, exist_ok=True)
+    enc_path.write_bytes(token)  # ciphertext only
     Path(str(enc_path) + DIGEST_SUFFIX).write_text(_sha256_hex(token) + "\n")
     return enc_path.stat().st_size
 
@@ -162,12 +161,16 @@ def restore_encrypted_archive(
 ) -> list[str]:
     """Verify, decrypt, validate, and extract an encrypted archive.
 
-    The detached digest (if present) is checked first, then the Fernet
-    authentication tag on decryption, then the inner tarball is validated for
-    unsafe members before extraction.
+    The on-share ciphertext is read exactly once. The detached digest is
+    MANDATORY (fail closed): a missing ``.sha256`` sidecar is an error, not a
+    silent downgrade. The digest is checked first, then the Fernet
+    authentication tag on decryption, then the inner tarball is validated and
+    extracted entirely in memory from the same decrypted bytes — closing the
+    TOCTOU window of re-reading the share (finding idp-2026-10-06 F2).
 
     Raises:
-        ValueError: On digest mismatch, decryption failure, or unsafe member.
+        ValueError: On a missing digest sidecar, digest mismatch, decryption
+            failure, or unsafe member.
     """
     from cryptography.fernet import Fernet, InvalidToken
 
@@ -175,22 +178,19 @@ def restore_encrypted_archive(
     token = archive_path.read_bytes()
 
     digest_path = Path(str(archive_path) + DIGEST_SUFFIX)
-    if digest_path.is_file():
-        expected = digest_path.read_text().strip()
-        if _sha256_hex(token) != expected:
-            raise ValueError("Backup archive digest mismatch — refusing to restore.")
+    if not digest_path.is_file():
+        raise ValueError("Backup digest sidecar missing — refusing to restore.")
+    if _sha256_hex(token) != digest_path.read_text().strip():
+        raise ValueError("Backup archive digest mismatch — refusing to restore.")
 
     try:
         plaintext = Fernet(key).decrypt(token)
     except InvalidToken as exc:
-        raise ValueError("Backup archive failed authentication — refusing to restore.") from exc
+        raise ValueError(
+            "Backup archive failed authentication — refusing to restore."
+        ) from exc
 
-    tmp_plain = archive_path.with_suffix(archive_path.suffix + ".plain.tmp")
-    try:
-        tmp_plain.write_bytes(plaintext)
-        return restore_archive(tmp_plain, data_dir)
-    finally:
-        tmp_plain.unlink(missing_ok=True)
+    return restore_archive_bytes(plaintext, data_dir)
 
 
 @dataclass
@@ -318,8 +318,31 @@ def create_archive(data_dir: str | Path, dest_path: str | Path) -> int:
     Raises:
         FileNotFoundError: If no backup-eligible files are present.
     """
-    data_dir = Path(data_dir)
     dest_path = Path(dest_path)
+    payload = create_archive_bytes(data_dir)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    dest_path.write_bytes(payload)
+    return dest_path.stat().st_size
+
+
+def create_archive_bytes(data_dir: str | Path) -> bytes:
+    """Build a gzip tarball of the rebuild-critical files in memory.
+
+    Builds the same archive as :func:`create_archive` but into an
+    ``io.BytesIO`` buffer so the plaintext tarball never touches disk. This is
+    the create-path primitive used to encrypt backups without staging
+    plaintext on the untrusted SMB share (finding idp-2026-10-06 F2).
+
+    Args:
+        data_dir: Directory containing the IdP data files.
+
+    Returns:
+        The gzip-compressed tarball bytes.
+
+    Raises:
+        FileNotFoundError: If no backup-eligible files are present.
+    """
+    data_dir = Path(data_dir)
     included: list[Path] = []
     for name in BACKUP_FILES:
         # BACKUP_FILES and EXCLUDED_FILES do not overlap, so this is defensive.
@@ -334,12 +357,12 @@ def create_archive(data_dir: str | Path, dest_path: str | Path) -> int:
             f"No backup-eligible files found in {data_dir}"
         )
 
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(dest_path, "w:gz") as tar:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for src in included:
             # arcname is just the filename so restore lands back in data/.
             tar.add(src, arcname=src.name)
-    return dest_path.stat().st_size
+    return buf.getvalue()
 
 
 def archive_name(when: datetime | None = None) -> str:
@@ -530,6 +553,83 @@ def validate_subpath(subpath: str) -> str:
     return candidate
 
 
+# An SMB server is a hostname (RFC-1123 label sequence), a dotted IPv4
+# literal, or a bracketed IPv6 literal. Path separators, whitespace, UNC
+# backslashes, and control chars are all rejected by these grammars.
+_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)"
+    r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)"
+    r"(?:\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$"
+)
+_IPV4_RE = re.compile(
+    r"^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}"
+    r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$"
+)
+_IPV6_RE = re.compile(r"^\[[0-9A-Fa-f:]{2,45}\]$")
+_SERVER_MAX_LEN = 255
+
+# A share name is a single segment of the allowed character set.
+_SHARE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_SHARE_MAX_LEN = 80
+
+
+class InvalidServerError(ValueError):
+    """Raised when a configured SMB server value is unsafe."""
+
+
+class InvalidShareError(ValueError):
+    """Raised when a configured SMB share name is unsafe."""
+
+
+def validate_server(server: str) -> str:
+    """Validate an SMB server (hostname or IPv4/IPv6 literal).
+
+    Rejects path separators, whitespace, UNC backslashes, control chars, and
+    over-length values so a malicious admin-form value cannot be interpolated
+    into a ``//server/share`` UNC path or a ``mount.cifs`` invocation
+    (finding idp-2026-10-06 F2).
+
+    Args:
+        server: The configured SMB server value.
+
+    Returns:
+        The validated, stripped server value.
+
+    Raises:
+        InvalidServerError: If the server value is unsafe.
+    """
+    candidate = (server or "").strip()
+    if not candidate or len(candidate) > _SERVER_MAX_LEN:
+        raise InvalidServerError(f"Invalid backup server: {server!r}")
+    if (
+        _HOSTNAME_RE.match(candidate)
+        or _IPV4_RE.match(candidate)
+        or _IPV6_RE.match(candidate)
+    ):
+        return candidate
+    raise InvalidServerError(f"Invalid backup server: {server!r}")
+
+
+def validate_share(share: str) -> str:
+    """Validate an SMB share name (a single safe segment).
+
+    Args:
+        share: The configured SMB share name.
+
+    Returns:
+        The validated, stripped share name.
+
+    Raises:
+        InvalidShareError: If the share name is unsafe.
+    """
+    candidate = (share or "").strip()
+    if not candidate or len(candidate) > _SHARE_MAX_LEN:
+        raise InvalidShareError(f"Invalid backup share: {share!r}")
+    if not _SHARE_RE.match(candidate):
+        raise InvalidShareError(f"Invalid backup share: {share!r}")
+    return candidate
+
+
 def safe_base(mount_dir: str | Path, subpath: str) -> Path:
     """Join ``subpath`` under ``mount_dir`` with containment enforcement.
 
@@ -551,37 +651,119 @@ def safe_base(mount_dir: str | Path, subpath: str) -> Path:
     return base
 
 
-def validate_archive(archive_path: str | Path) -> list[str]:
-    """Validate an archive is safe to extract and return its member names.
+def validate_archive_fileobj(tar: tarfile.TarFile) -> list[str]:
+    """Validate an open tarball is safe to extract and return its members.
 
     Rejects absolute paths, parent-directory traversal, and non-file
     members (symlinks, devices). Also rejects members whose mode carries
-    dangerous permission bits: setuid, setgid, sticky, group- or
-    other-writable, or other-executable.
+    dangerous permission bits (setuid, setgid, sticky, group- or
+    other-writable, or other-executable) and, authoritatively, any member
+    whose name is NOT in :data:`BACKUP_FILES`. The positive allowlist is the
+    restore gate that rejects ``audit.log`` and ``audit_chain.key`` — the
+    latter is absent from :data:`EXCLUDED_FILES`, so only the allowlist stops
+    it (finding idp-2026-10-06 F2).
+
+    Args:
+        tar: An open ``tarfile.TarFile`` to validate.
+
+    Returns:
+        The list of validated member names.
+
+    Raises:
+        ValueError: If the archive contains an unsafe or disallowed member.
+    """
+    # setuid | setgid | sticky | group/other-write | other-execute.
+    forbidden_mode_bits = 0o4000 | 0o2000 | 0o1000 | 0o0022 | 0o0001
+    names: list[str] = []
+    for member in tar.getmembers():
+        if not member.isfile():
+            raise ValueError(
+                f"Unsafe archive member (not a regular file): {member.name}"
+            )
+        member_path = Path(member.name)
+        if member_path.is_absolute() or ".." in member_path.parts:
+            raise ValueError(
+                f"Unsafe archive member path: {member.name}"
+            )
+        if member.mode & forbidden_mode_bits:
+            raise ValueError(
+                f"Unsafe archive member mode {member.mode:o}: {member.name}"
+            )
+        if member.name not in BACKUP_FILES:
+            raise ValueError(
+                f"Archive member not in backup allowlist: {member.name}"
+            )
+        names.append(member.name)
+    return names
+
+
+def validate_archive(archive_path: str | Path) -> list[str]:
+    """Validate an on-disk archive is safe to extract and return its members.
+
+    Thin file-path wrapper over :func:`validate_archive_fileobj` so the
+    member-safety logic lives in one place.
 
     Raises:
         ValueError: If the archive contains an unsafe member.
         tarfile.TarError / OSError: If the archive cannot be read.
     """
-    # setuid | setgid | sticky | group/other-write | other-execute.
-    forbidden_mode_bits = 0o4000 | 0o2000 | 0o1000 | 0o0022 | 0o0001
-    names: list[str] = []
     with tarfile.open(archive_path, "r:gz") as tar:
-        for member in tar.getmembers():
-            if not member.isfile():
-                raise ValueError(
-                    f"Unsafe archive member (not a regular file): {member.name}"
-                )
-            member_path = Path(member.name)
-            if member_path.is_absolute() or ".." in member_path.parts:
-                raise ValueError(
-                    f"Unsafe archive member path: {member.name}"
-                )
-            if member.mode & forbidden_mode_bits:
-                raise ValueError(
-                    f"Unsafe archive member mode {member.mode:o}: {member.name}"
-                )
-            names.append(member.name)
+        return validate_archive_fileobj(tar)
+
+
+def _extract_validated(tar: tarfile.TarFile, data_dir: Path) -> list[str]:
+    """Validate then extract an open tarball into ``data_dir`` in one pass.
+
+    Runs the validation pass and then the extract pass against the SAME open
+    tar object (re-iterating its cached ``getmembers()`` with no reopen), so
+    the bytes validated are provably the bytes extracted — closing the TOCTOU
+    (finding idp-2026-10-06 F2).
+
+    Returns:
+        The list of restored filenames.
+
+    Raises:
+        ValueError: If the archive contains unsafe or disallowed members.
+    """
+    names = validate_archive_fileobj(tar)  # raises on anything unsafe
+    for member in tar.getmembers():
+        dest = data_dir / member.name
+        if not _is_within(data_dir, dest):
+            raise ValueError(f"Refusing to extract outside data dir: {member.name}")
+        # Members are validated above (regular files only, no absolute paths,
+        # no traversal, safe modes, allowlisted names) and _is_within()
+        # re-checks each. The tarfile ``data`` filter is a second layer that
+        # neutralises traversal, links, device nodes, and setuid/setgid bits
+        # at extraction time.
+        tar.extract(member, path=data_dir, filter="data")
+    return names
+
+
+def restore_archive_bytes(
+    plaintext: bytes,
+    data_dir: str | Path,
+) -> list[str]:
+    """Extract a validated in-memory tarball into the data directory.
+
+    Opens the gzip tarball from ``plaintext`` ONCE and validates then extracts
+    from the same open handle, so no plaintext is staged on disk and the
+    validate/extract passes operate on identical bytes (finding
+    idp-2026-10-06 F2).
+
+    Args:
+        plaintext: The gzip-compressed tarball bytes.
+        data_dir: Destination data directory.
+
+    Returns:
+        The list of restored filenames.
+
+    Raises:
+        ValueError: If the archive contains unsafe or disallowed members.
+    """
+    data_dir = Path(data_dir)
+    with tarfile.open(fileobj=io.BytesIO(plaintext), mode="r:gz") as tar:
+        names = _extract_validated(tar, data_dir)
+    logger.info("Restored %d files from in-memory archive", len(names))
     return names
 
 
@@ -589,7 +771,10 @@ def restore_archive(
     archive_path: str | Path,
     data_dir: str | Path,
 ) -> list[str]:
-    """Extract a validated archive into the data directory (all-or-nothing).
+    """Extract a validated on-disk archive into the data directory.
+
+    Thin file-path wrapper over :func:`restore_archive_bytes`-style logic that
+    shares the member-safety pass via :func:`_extract_validated`.
 
     Args:
         archive_path: Path to the archive to restore.
@@ -599,20 +784,10 @@ def restore_archive(
         The list of restored filenames.
 
     Raises:
-        ValueError: If the archive contains unsafe members.
+        ValueError: If the archive contains unsafe or disallowed members.
     """
     data_dir = Path(data_dir)
-    names = validate_archive(archive_path)  # raises on anything unsafe
     with tarfile.open(archive_path, "r:gz") as tar:
-        for member in tar.getmembers():
-            dest = data_dir / member.name
-            if not _is_within(data_dir, dest):
-                raise ValueError(f"Refusing to extract outside data dir: {member.name}")
-            # Members are validated by validate_archive() (regular files only,
-            # no absolute paths, no traversal, safe modes) and _is_within()
-            # re-checks each. The tarfile ``data`` filter is a second layer
-            # that neutralises traversal, links, device nodes, and setuid/
-            # setgid bits at extraction time.
-            tar.extract(member, path=data_dir, filter="data")
+        names = _extract_validated(tar, data_dir)
     logger.info("Restored %d files from %s", len(names), archive_path)
     return names
