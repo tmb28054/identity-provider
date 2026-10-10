@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
 import hmac
@@ -9,6 +10,7 @@ import os
 import random
 import re
 import secrets
+import sys
 import tempfile
 import time
 from collections import OrderedDict
@@ -41,6 +43,156 @@ logger = logging.getLogger(__name__)
 # the factory can tell "caller omitted this" from "caller passed the literal
 # default" and fall back to the ``load_config`` value only in the former case.
 _UNSET: Any = object()
+
+
+def _env_truthy(value: str | None) -> bool:
+    """Return True for 1/true/yes/on (case-insensitive); False for None/other.
+
+    Args:
+        value: Raw environment-variable string, or None if unset.
+
+    Returns:
+        True when the trimmed, lower-cased value is one of the accepted truthy
+        tokens, otherwise False.
+    """
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _detected_worker_count() -> int:
+    """Best-effort count of configured gunicorn workers from argv/env/config.
+
+    The rate limiter and single-use nonce/challenge stores are per-process, so
+    the single-worker guard needs to know how many workers an operator asked
+    for. gunicorn does not export ``-w/--workers`` into the environment, so this
+    folds together three signals and returns the maximum discovered:
+
+    * the ``WEB_CONCURRENCY`` / ``GUNICORN_WORKERS`` environment hints,
+    * a ``-w N`` / ``--workers N`` / ``--workers=N`` / ``-w=N`` token in
+      ``sys.argv``, and
+    * a top-level ``workers = N`` literal in a ``-c``/``--config`` gunicorn
+      config file, parsed with :mod:`ast` (never executed) so an operator
+      Python file is not run during app construction.
+
+    A non-literal ``workers`` value (e.g. ``workers = cpu_count()``) or an
+    unreadable/invalid config file is conservatively ignored rather than
+    guessed.
+
+    Returns:
+        The maximum worker count discovered, or 1 when nothing indicates more.
+    """
+    count = 1
+    for env_var in ("WEB_CONCURRENCY", "GUNICORN_WORKERS"):
+        raw = os.environ.get(env_var, "")
+        if raw.isdigit():
+            count = max(count, int(raw))
+
+    argv = sys.argv[1:] if len(sys.argv) > 1 else []
+    config_path: str | None = None
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        flag, _, inline = token.partition("=")
+        if flag in ("-w", "--workers"):
+            candidate = inline if inline else _next_argv_value(argv, index)
+            if candidate.isdigit():
+                count = max(count, int(candidate))
+        elif flag in ("-c", "--config"):
+            config_path = inline if inline else _next_argv_value(argv, index)
+        index += 1
+
+    if config_path:
+        count = max(count, _workers_from_config(config_path))
+    return count
+
+
+def _next_argv_value(argv: list[str], index: int) -> str:
+    """Return the argument following ``argv[index]``, or an empty string.
+
+    Args:
+        argv: The argument list being scanned.
+        index: The index of the current flag token.
+
+    Returns:
+        The next token, or ``""`` when the flag is the final token.
+    """
+    return argv[index + 1] if index + 1 < len(argv) else ""
+
+
+def _workers_from_config(config_path: str) -> int:
+    """Parse a top-level ``workers = N`` literal from a gunicorn config file.
+
+    gunicorn config files are Python, but they are parsed with :mod:`ast` and
+    never executed, so an operator-controlled file introduces no code-execution
+    surface during app construction.
+
+    Args:
+        config_path: Path to the ``-c``/``--config`` gunicorn config file.
+
+    Returns:
+        The integer assigned to a top-level ``workers`` target, or 1 when the
+        file is missing, unreadable, syntactically invalid, or assigns a
+        non-literal value.
+    """
+    path = Path(config_path)
+    if not path.is_file():
+        return 1
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, SyntaxError):  # pragma: no cover - defensive
+        logger.debug("Could not parse gunicorn config %s for workers", config_path)
+        return 1
+    for node in tree.body:
+        targets: list[ast.expr] = []
+        value_node: ast.expr | None = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value_node = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value_node = node.value
+        if value_node is None or not any(
+            isinstance(t, ast.Name) and t.id == "workers" for t in targets
+        ):
+            continue
+        try:
+            value = ast.literal_eval(value_node)
+        except (ValueError, SyntaxError):
+            continue
+        if isinstance(value, int):
+            return value
+    return 1
+
+
+def _assert_single_worker(count: int) -> None:
+    """Refuse to start with >1 worker unless ``IDP_ALLOW_MULTIWORKER`` is set.
+
+    Args:
+        count: The resolved worker count from argv/env/config or a parsed
+            ``--workers`` value.
+
+    Raises:
+        RuntimeError: When ``count > 1`` and ``IDP_ALLOW_MULTIWORKER`` is not a
+            truthy value; converts a silent anti-abuse regression into a loud
+            deploy-time failure.
+    """
+    if count <= 1:
+        return
+    msg = (
+        "%d workers detected but the rate limiter and single-use nonce/"
+        "challenge stores are per-process; multi-worker deployment weakens "
+        "these anti-abuse controls by the worker count. Run a single worker, "
+        "add a shared store, or set IDP_ALLOW_MULTIWORKER=1 to override."
+    )
+    if _env_truthy(os.environ.get("IDP_ALLOW_MULTIWORKER")):
+        logger.warning(
+            "%s (overridden by IDP_ALLOW_MULTIWORKER)", msg % count
+        )
+        return
+    logger.error(msg, count)
+    raise RuntimeError(
+        f"Refusing to start with {count} workers; set "
+        "IDP_ALLOW_MULTIWORKER=1 to override (see docs/configuration.md)."
+    )
 
 
 class ConfigNotConsumedError(RuntimeError):
@@ -2931,6 +3083,7 @@ def create_app(
             user["password"] = _bcrypt.hashpw(
                 new_password.encode(), _bcrypt.gensalt()
             ).decode()
+            _stamp_password_change(user)
             user.pop("force_password_change", None)
             user.pop("must_set_password", None)
             _bump_session_epoch_local(username)

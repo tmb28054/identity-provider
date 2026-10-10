@@ -8,6 +8,7 @@ the Flask development server.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from .__main__ import DEFAULT_DATA_DIR, INIT_DATA_DIR, _configure_logging
@@ -126,7 +127,21 @@ def main() -> None:
         if adfs_cfg.get("skip_ssl_verify"):
             skip_ssl = True
 
-    from .app import create_app
+    from .app import _assert_single_worker, create_app
+
+    # Authoritative single-worker refusal for the primary `run-idp` entry point.
+    # It reads the parsed ``--workers`` value (folded with the env hints) and
+    # runs in the gunicorn master BEFORE the app is built, so it fires first and
+    # even when argv has been cleared, independent of the create_app backstop.
+    _env_workers = max(
+        (
+            int(os.environ[var])
+            for var in ("WEB_CONCURRENCY", "GUNICORN_WORKERS")
+            if os.environ.get(var, "").isdigit()
+        ),
+        default=1,
+    )
+    _assert_single_worker(max(args.workers, _env_workers))
 
     app = create_app(
         config.data_dir,

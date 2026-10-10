@@ -104,8 +104,11 @@ CLI arguments have the highest priority and override both config file and enviro
 The `identity-provider-server` CLI is intended for development and initialization. For production, use gunicorn. `create_app(data_dir)` loads `config.yaml` and all `IDP_*` environment variables from the data directory itself, so this entrypoint honors the full configuration precedence described above (env vars override the config file; both are read by `create_app`):
 
 ```bash
-# Production
-gunicorn "identity_provider_server:create_app('data')" -b 0.0.0.0:5000 -w 2
+# Production (single worker is required: the rate limiter and single-use
+# nonce/challenge stores are per-process; see the startup guard. The app
+# refuses to start with more than one worker. Set IDP_ALLOW_MULTIWORKER=1
+# only with a shared store.)
+gunicorn "identity_provider_server:create_app('data')" -b 0.0.0.0:5000 -w 1
 
 # Development
 identity-provider-server --debug -vv

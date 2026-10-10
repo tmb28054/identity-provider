@@ -114,9 +114,13 @@ The directory must contain `users.json`, `idp.crt`, and `idp.key`.
 **Production (gunicorn):**
 
 ```bash
-# Listen on port 8080 with 4 workers
-gunicorn "identity_provider_server:create_app('data')" -b 0.0.0.0:8080 -w 4
+# Listen on port 8080 with a single worker
+gunicorn "identity_provider_server:create_app('data')" -b 0.0.0.0:8080 -w 1
 ```
+
+> Single worker is required: the rate limiter and single-use nonce/challenge
+> stores are per-process; see the startup guard. Set `IDP_ALLOW_MULTIWORKER=1`
+> only with a shared store.
 
 **Development (Flask dev server):**
 
@@ -143,13 +147,17 @@ The `identity-provider-server` CLI uses Flask's built-in development server whic
 > `<data_dir>/config.yaml` or an `IDP_*` env var (for example
 > `IDP_TRUST_PROXY=true`, which installs ProxyFix) takes effect on this path.
 
+> Single worker is required: the rate limiter and single-use nonce/challenge
+> stores are per-process; see the startup guard. The app refuses to start with
+> more than one worker. Set `IDP_ALLOW_MULTIWORKER=1` only with a shared store.
+
 ```bash
-# Basic — 2 workers, bind to all interfaces
-gunicorn "identity_provider_server:create_app('data')" -b 0.0.0.0:5000 -w 2
+# Basic — single worker, bind to all interfaces
+gunicorn "identity_provider_server:create_app('data')" -b 0.0.0.0:5000 -w 1
 
 # With access logging
 gunicorn "identity_provider_server:create_app('data')" \
-  -b 0.0.0.0:5000 -w 2 --access-logfile -
+  -b 0.0.0.0:5000 -w 1 --access-logfile -
 
 # Custom data directory
 gunicorn "identity_provider_server:create_app('/etc/idp')" -b 0.0.0.0:5000
@@ -177,7 +185,10 @@ For production deployments, create a `gunicorn.conf.py`:
 
 ```python
 bind = "0.0.0.0:5000"
-workers = 2
+# Single worker is required: the rate limiter and single-use nonce/challenge
+# stores are per-process; see the startup guard. Set IDP_ALLOW_MULTIWORKER=1
+# only with a shared store.
+workers = 1
 accesslog = "-"
 errorlog = "-"
 loglevel = "info"
@@ -225,7 +236,10 @@ Description=Identity Provider Server
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/gunicorn "identity_provider_server:create_app('/etc/idp')" -b 0.0.0.0:5000 -w 2 --access-logfile -
+# Single worker is required: the rate limiter and single-use nonce/challenge
+# stores are per-process; see the startup guard. Set IDP_ALLOW_MULTIWORKER=1
+# only with a shared store.
+ExecStart=/usr/local/bin/gunicorn "identity_provider_server:create_app('/etc/idp')" -b 0.0.0.0:5000 -w 1 --access-logfile -
 Restart=on-failure
 User=idp
 Environment=SECRET_KEY=your-secret-key-here

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -328,13 +329,27 @@ def test_empty_password_rejected(tmp_path):
     assert resp.status_code == 401
 
 
-# --- F10: multi-worker startup warning --------------------------------------
+# --- F10 / idp-2026-10-06 F3: multi-worker startup guard --------------------
 
-def test_multi_worker_env_warns(tmp_path, caplog, monkeypatch):
+def test_multi_worker_env_under_non_gunicorn_does_not_refuse(
+    tmp_path, caplog, monkeypatch
+):
+    """A ``WEB_CONCURRENCY`` hint under a non-gunicorn program is a no-op.
+
+    The warn-only env scan was replaced by a hard, gunicorn-scoped guard
+    (idp-2026-10-06 F3): ``create_app``'s backstop only fires when ``argv[0]``
+    is gunicorn, so constructing the app under pytest never warns or refuses
+    regardless of ``WEB_CONCURRENCY``. The authoritative refusal lives in
+    ``run_gunicorn.main`` (covered in the phase-6 suite).
+    """
+    monkeypatch.setattr(sys, "argv", ["pytest"])
     monkeypatch.setenv("WEB_CONCURRENCY", "4")
+    monkeypatch.delenv("IDP_ALLOW_MULTIWORKER", raising=False)
     with caplog.at_level("WARNING"):
-        _app(tmp_path, [{"username": "bob", "password": _hash(), "claims": []}])
-    assert any("per-process" in r.message for r in caplog.records)
+        app = _app(tmp_path, [{"username": "bob", "password": _hash(),
+                               "claims": []}])
+    assert app is not None
+    assert not any("per-process" in r.message for r in caplog.records)
 
 
 # --- F12: notification channel ----------------------------------------------
