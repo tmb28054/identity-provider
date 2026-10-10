@@ -3737,6 +3737,7 @@ def create_app(
     @app.get("/recover/<recovery_token>")
     def recover_get(recovery_token: str):
         from .admin import validate_recovery_token
+        # pylint: disable-next=not-callable  # set at runtime by register_admin_routes
         username = validate_recovery_token(recovery_token)
         if not username:
             return render_template_string(
@@ -3796,6 +3797,7 @@ def create_app(
                 success=None, qr_data_uri="", totp_secret="", mfa_required=False,
             ), 429
 
+        # pylint: disable-next=not-callable  # set at runtime by register_admin_routes
         username = validate_recovery_token(recovery_token)
         if not username:
             rate_limiter.record(client_ip)
@@ -3897,6 +3899,7 @@ def create_app(
             )
 
         # Consume the token (single-use)
+        # pylint: disable-next=not-callable  # set at runtime by register_admin_routes
         consume_recovery_token(recovery_token)
 
         mfa_msg = " MFA has been enabled." if mfa_enrolled else ""

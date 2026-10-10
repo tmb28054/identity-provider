@@ -49,6 +49,7 @@ def _mount_smb(config: bk.BackupConfig, mount_dir: Path) -> None:
     table.
     """
     mount_dir.mkdir(parents=True, exist_ok=True)
+    # pylint: disable=consider-using-with  # delete=False; file is closed, chmod'd, and unlinked in finally
     cred_file = tempfile.NamedTemporaryFile(  # noqa: SIM115
         mode="w", prefix="idp-smb-", suffix=".cred", delete=False
     )
@@ -132,7 +133,7 @@ def _record_failure(data_dir: str, message: str) -> None:
     status.result = "failure"
     status.message = message
     status.consecutive_failures += 1
-    status.last_attempt = bk._now().isoformat()
+    status.last_attempt = bk._now().isoformat()  # pylint: disable=protected-access  # bk._now is the package-internal time source (monkeypatched in tests)
     bk.save_status(data_dir, status)
 
 

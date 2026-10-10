@@ -10,7 +10,9 @@ import logging
 import os
 import secrets
 import subprocess  # nosec
+import sys
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -797,7 +799,6 @@ def register_admin_routes(
         if reload_services_fn:
             reload_services_fn()
         # Restart gunicorn to register new/removed routes
-        import os
         import signal
         os.kill(os.getppid(), signal.SIGHUP)
         logger.info("Sent SIGHUP to gunicorn master (pid=%d) to reload routes", os.getppid())
@@ -1587,9 +1588,10 @@ def register_admin_routes(
                 entry: dict[str, Any] = {"url": sp_url, "token_expiry_minutes": sp_duration}
                 # Preserve other fields
                 if isinstance(current, dict):
-                    for k, v in current.items():
-                        if k not in ("url", "token_expiry_minutes"):
-                            entry[k] = v
+                    entry.update({
+                        k: v for k, v in current.items()
+                        if k not in ("url", "token_expiry_minutes")
+                    })
                 data[sp_protocol][sp_path] = entry
             else:
                 duration_hours = max(1, (sp_duration + 59) // 60)
@@ -1600,9 +1602,10 @@ def register_admin_routes(
                     entry = {"url": sp_url, "session_duration_hours": duration_hours}
                     # Preserve other fields
                     if isinstance(current, dict):
-                        for k, v in current.items():
-                            if k not in ("url", "session_duration_hours"):
-                                entry[k] = v
+                        entry.update({
+                            k: v for k, v in current.items()
+                            if k not in ("url", "session_duration_hours")
+                        })
                     data[sp_protocol][sp_path] = entry
 
             _save_services_yaml(data)
@@ -2221,12 +2224,16 @@ def register_admin_routes(
 
         return _render_user_detail(target_username, auth_token)
 
-    # Expose recovery token functions at module level for use by app.py
-    import identity_provider_server.admin as _admin_module
-    _admin_module.validate_recovery_token = _validate_recovery_token
-    _admin_module.consume_recovery_token = _consume_recovery_token
+    # Expose recovery token functions at module level for use by app.py.
+    # Bind them on this module object so app.py's recovery routes can read
+    # admin.validate_recovery_token / consume_recovery_token after registration.
+    _this_module = sys.modules[__name__]
+    _this_module.validate_recovery_token = _validate_recovery_token
+    _this_module.consume_recovery_token = _consume_recovery_token
 
 
 # Module-level references set by register_admin_routes for use by recovery routes
-validate_recovery_token = None
-consume_recovery_token = None
+# Populated by register_admin_routes before the recovery routes that call them
+# can run; the None default is only a pre-registration placeholder.
+validate_recovery_token: Callable[..., Any] | None = None
+consume_recovery_token: Callable[..., Any] | None = None

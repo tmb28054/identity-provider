@@ -58,6 +58,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   durable account lockout without a restart or a hand-edit of `users.json`
   (idp-2026-10-06 F1).
 
+### Changed
+
+- Resolved all pylint findings to reach a clean 10/10 lint score; no behavior
+  change.
+
 ### Security (code review idp-2026-10-06)
 
 All six findings from the AWS Security Agent review `idp-2026-10-06` were

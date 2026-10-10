@@ -250,7 +250,7 @@ def load_config(data_dir: str | Path) -> BackupConfig:
     except (OSError, json.JSONDecodeError):
         logger.warning("Could not read %s; using defaults", CONFIG_FILENAME)
         return BackupConfig()
-    known = {f for f in BackupConfig().__dataclass_fields__}  # type: ignore[attr-defined]
+    known = set(BackupConfig.__dataclass_fields__)  # pylint: disable=no-member  # dataclass-generated attribute
     return BackupConfig(**{k: v for k, v in raw.items() if k in known})
 
 
@@ -274,7 +274,7 @@ def load_status(data_dir: str | Path) -> BackupStatus:
         raw = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return BackupStatus()
-    known = {f for f in BackupStatus().__dataclass_fields__}  # type: ignore[attr-defined]
+    known = set(BackupStatus.__dataclass_fields__)  # pylint: disable=no-member  # dataclass-generated attribute
     return BackupStatus(**{k: v for k, v in raw.items() if k in known})
 
 

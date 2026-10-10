@@ -170,6 +170,7 @@ def main() -> None:
 
     from gunicorn.app.base import BaseApplication
 
+    # pylint: disable-next=abstract-method  # gunicorn BaseApplication subclasses override load/load_config, not the abstract init
     class _IdpApplication(BaseApplication):  # type: ignore[misc]
         def __init__(self, flask_app, options=None):  # type: ignore[no-untyped-def]
             self.flask_app = flask_app

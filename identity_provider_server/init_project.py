@@ -18,6 +18,7 @@ def _extract_cn_from_cert(cert_path: Path) -> str:
             ["openssl", "x509", "-in", str(cert_path), "-noout", "-subject"],
             capture_output=True,
             text=True,
+            check=False,
         )
         if result.returncode == 0:
             subject = result.stdout.strip()
@@ -83,6 +84,7 @@ def run_init(data_dir: str) -> None:
             ],
             capture_output=True,
             text=True,
+            check=False,
         )
         if result.returncode != 0:
             print(f"  ERROR: openssl failed:\n{result.stderr}", file=sys.stderr)
