@@ -34,6 +34,66 @@ The append-only access log (`audit.log`) and the backup bookkeeping files
 > sensitive as the live server. Restrict access to the SMB share accordingly —
 > anyone who can read the archive can impersonate the IdP.
 
+## Recovery objectives (RPO / RTO) and capacity
+
+### Recovery Point Objective (RPO) ≈ 24 hours
+
+The nightly timer runs once per day at **02:30** (server time, see *How it
+works* above). The worst-case data loss is therefore **about one day** of
+changes — accounts added, passwords or MFA re-enrolled, or service/claim config
+edits — made between the last successful 02:30 archive and the incident.
+
+Any config or user change made *after* a nightly run is at risk until the next
+run. To shrink the RPO on demand, an operator can trigger **Run backup now** on
+the Backups page immediately after a significant change; that produces a fresh
+archive outside the nightly cadence.
+
+### Recovery Time Objective (RTO) ≤ 15 minutes
+
+RTO is the time to bring the service back from the most recent archive via the
+documented *Restoring* procedure below:
+
+1. Select the archive in the portal and provide a fresh MFA code (or captcha).
+2. The root `idp-restore@` unit mounts the share, snapshots current data,
+   verifies the SHA-256 digest and the Fernet authentication tag, and extracts
+   the allow-listed files.
+3. The `identity-provider` service restarts so the restored key and routes take
+   effect.
+
+A realistic target for an operator with portal access and the backup key present
+is **≤ 15 minutes**. Meeting it depends on these prerequisites being in place
+*before* an incident:
+
+- the SMB share is reachable and the stored credentials still mount it;
+- the backup key is available — `IDP_BACKUP_KEY` in the environment or
+  `backup.key` on the host (restore fails closed without it);
+- the restoring admin has MFA enrolled (or a captcha fallback) to authorise the
+  high-impact restore.
+
+### Capacity under stress
+
+A single replica running a single worker is **intentional**, not an oversight.
+The rate limiter, the MFA/captcha/WebAuthn nonce stores, the enrol-secret store,
+and the audit chain cursor are all **per-process in-memory state**. Under a
+demand spike or partial infrastructure loss the service degrades toward
+*unavailable* rather than scaling out; recovery is a pod restart. Raising
+capacity (more replicas or workers) is unsafe until that per-process state is
+externalised to a shared backend first — doing so earlier would multiply the
+failed-login budget and allow single-use nonces to be replayed once per process.
+
+### Risk acceptance — single replica / single worker
+
+The single-replica, single-worker topology is **accepted as a reasoned risk**,
+consistent with the security-review response (see
+`docs/security-review-20261006-response.md:190-215`, Finding 6, recorded there
+as *accepted-with-a-plan*). The near-term control is documentation (these
+objectives); the deferred architectural follow-up is to externalise the
+per-process security state and audit cursor into a shared backend (e.g. Redis),
+after which `replicas` / `--workers` can be raised and the
+`PodDisruptionBudget` and `topologySpreadConstraints` templates in
+`examples/kubernetes/` become effective. That change needs a product decision on
+the shared-store dependency before implementation.
+
 ## Configuring backups
 
 1. Sign in to the admin panel and open **Backups** (`/admin/backups`).

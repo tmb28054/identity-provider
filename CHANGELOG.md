@@ -43,6 +43,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   legacy records with no timestamp are exempt, and a non-numeric
   `IDP_PASSWORD_MAX_AGE_DAYS` is a fatal startup error (consistent with other
   `IDP_*` int knobs).
+- **Docs/Manifests** (idp-2026-10-06 F5) — `docs/backups.md` now documents the
+  recovery objectives (RPO ≈ 24 h bounded by the nightly 02:30 cadence, RTO
+  ≤ 15 min from the restore procedure) and a capacity-under-stress section, and
+  records the single-replica/single-worker topology as a reasoned risk
+  acceptance aligned with `docs/security-review-20261006-response.md`. Added
+  `PodDisruptionBudget` + `topologySpreadConstraints` templates under
+  `examples/kubernetes/` with a note that raising `replicas` requires
+  externalising the per-process security state first.
 
 ### Added
 

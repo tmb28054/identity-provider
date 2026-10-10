@@ -10,6 +10,13 @@ spec:
   # per-process (in-memory). Running more than one replica without a shared
   # store multiplies the failed-login budget and lets a nonce be replayed once
   # per replica. Keep this at 1 unless a shared backend is introduced.
+  #
+  # WARNING — raising `replicas` requires externalising the per-process
+  # security state FIRST (see the startup guard in `app.py` ~1383-1420 and the
+  # RPO/RTO/capacity section in `docs/backups.md`). The PodDisruptionBudget
+  # (poddisruptionbudget.yaml) and the topologySpreadConstraints below provide
+  # no real availability benefit at `replicas: 1`; they are templates for the
+  # post-Redis future.
   replicas: 1
   selector:
     matchLabels:
@@ -19,6 +26,17 @@ spec:
       labels:
         app.kubernetes.io/name: identity-provider-server
     spec:
+      # Spread pods across availability zones once replicas > 1. Template only:
+      # effective only after the per-process security state is externalised and
+      # replicas are raised (see the `replicas: 1` note above). `ScheduleAnyway`
+      # keeps scheduling best-effort so a single-zone cluster still schedules.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: identity-provider-server
       containers:
         - name: idp
           image: identity-provider-server:latest

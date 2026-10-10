@@ -1,0 +1,23 @@
+# PodDisruptionBudget template.
+#
+# WARNING — this is a TEMPLATE for a future, horizontally scaled deployment.
+# It has NO real availability benefit today because the Deployment runs
+# `replicas: 1` on purpose. Raising `replicas` requires externalising the
+# per-process security state FIRST (the rate limiter, MFA/captcha/WebAuthn
+# nonce stores, enrol-secret store, and audit chain cursor are all in-memory,
+# per-process). See the startup guard in `app.py` (~1383-1420) and the
+# RPO/RTO/capacity section in `docs/backups.md`. `maxUnavailable: 1` only
+# becomes meaningful once a shared backend (e.g. Redis) is in place and
+# replicas > 1.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: identity-provider-server
+  namespace: identity-provider
+  labels:
+    app.kubernetes.io/name: identity-provider-server
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: identity-provider-server
