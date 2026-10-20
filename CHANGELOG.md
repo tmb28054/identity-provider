@@ -62,6 +62,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Resolved all pylint findings to reach a clean 10/10 lint score; no behavior
   change.
+- Fixed the CI dependency-audit step, which invoked `pip-audit -c` (an
+  unsupported flag that failed the job on every run). It now uses the correct
+  `pip-audit -r constraints.txt`.
+- Bumped pinned dependencies to clear newly published advisories flagged by
+  `pip-audit`: `cryptography` 49.0.0 -> 50.0.0 (PYSEC-2026-3552), `lxml` 5.4.0
+  -> 6.1.0 (PYSEC-2026-87), `requests` 2.32.5 -> 2.33.0 (PYSEC-2026-2275). The
+  `pyproject.toml` lxml range is widened to `<7.0` to admit the fix. Full test
+  suite passes at 100% coverage against the upgraded versions (including the
+  SAML signing path affected by the lxml major bump).
 
 ### Security (code review idp-2026-10-06)
 

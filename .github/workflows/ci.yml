@@ -49,7 +49,7 @@ jobs:
           bandit -r scripts -q --severity-level medium
 
       - name: Dependency vulnerability audit
-        run: pip-audit -c constraints.txt
+        run: pip-audit -r constraints.txt
 
       - name: Secret scan (gitleaks)
         uses: gitleaks/gitleaks-action@v2
