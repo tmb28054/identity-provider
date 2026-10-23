@@ -22,5 +22,5 @@ PyOTP==2.10.0
 PyYAML==6.0.3
 qrcode==8.2
 requests==2.33.0
-signxml==4.4.0
+signxml==5.2.0
 webauthn==3.0.1
